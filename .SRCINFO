@@ -1,6 +1,6 @@
 pkgbase = hyprloom
 	pkgdesc = Save, restore, and reconcile Hyprland window sessions
-	pkgver = 0.3.0
+	pkgver = 0.3.1
 	pkgrel = 1
 	url = https://github.com/thethracian/hyprloom
 	arch = x86_64
@@ -10,7 +10,7 @@ pkgbase = hyprloom
 	provides = hyprflow
 	conflicts = hyprflow
 	replaces = hyprflow
-	source = hyprloom-0.3.0.tar.gz::https://github.com/thethracian/hyprloom/releases/download/v0.3.0/hyprloom-0.3.0.tar.gz
+	source = hyprloom-0.3.1.tar.gz::https://github.com/thethracian/hyprloom/releases/download/v0.3.1/hyprloom-0.3.1.tar.gz
 	sha256sums = 63df8a828bd7c0ddb9d3f94b60624fb69c5a6f5d77601ad98bb7613bbc6a9e76
 
 pkgname = hyprloom

@@ -1,6 +1,6 @@
 # Maintainer: Thethracian
 pkgname=hyprloom
-pkgver=0.3.0
+pkgver=0.3.1
 pkgrel=1
 pkgdesc="Save, restore, and reconcile Hyprland window sessions"
 arch=('x86_64')

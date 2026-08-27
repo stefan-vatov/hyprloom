@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.1] - 2026-08-27
+
+### Fixed
+
+- Safely correlate browser windows when Chromium or Brave reuses an existing process by requiring a focused, newly appeared window
+- Skip legacy Brave windows without positive profile identity instead of moving a guessed profile
+- Fail fast when a launched browser window cannot be correlated, leaving it untouched
+
 ## [0.3.0] - 2026-08-27
 
 ### Added
