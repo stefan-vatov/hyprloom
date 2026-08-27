@@ -322,10 +322,11 @@ fn is_brave_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("brave-browser")
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DesktopLaunch {
     command: String,
     args: Vec<String>,
+    specificity: u8,
 }
 
 const OMARCHY_WEBAPP_LAUNCHERS: [&str; 3] = [
@@ -356,6 +357,7 @@ fn find_webapp_launch_info_in_directories(
     directories: &[PathBuf],
 ) -> Option<LaunchInfo> {
     let identities = [class, initial_class];
+    let mut matches = Vec::new();
     for directory in directories {
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
@@ -371,16 +373,30 @@ fn find_webapp_launch_info_in_directories(
                 Err(_) => continue,
             };
             if let Some(launch) = parse_webapp_desktop_file(&contents, &identities) {
-                return Some(LaunchInfo {
-                    command: launch.command,
-                    args: launch.args,
-                    hint: None,
-                });
+                matches.push(launch);
             }
         }
     }
 
-    None
+    let strongest_specificity = matches.iter().map(|launch| launch.specificity).max()?;
+    let strongest = matches
+        .into_iter()
+        .filter(|launch| launch.specificity == strongest_specificity)
+        .collect::<Vec<_>>();
+    let mut unique = Vec::new();
+    for launch in strongest {
+        if !unique.iter().any(|existing: &DesktopLaunch| {
+            existing.command == launch.command && existing.args == launch.args
+        }) {
+            unique.push(launch);
+        }
+    }
+    let launch = (unique.len() == 1).then(|| unique.pop().expect("one launch"))?;
+    Some(LaunchInfo {
+        command: launch.command,
+        args: launch.args,
+        hint: None,
+    })
 }
 
 fn desktop_application_directories() -> Vec<PathBuf> {
@@ -500,9 +516,18 @@ fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<Desk
         return None;
     }
 
+    let specificity = if class_argument_matches {
+        3
+    } else if startup_class_matches {
+        2
+    } else {
+        1
+    };
+
     Some(DesktopLaunch {
         command: tokens[0].clone(),
         args: tokens.into_iter().skip(1).collect(),
+        specificity,
     })
 }
 
@@ -622,13 +647,7 @@ fn webapp_url_route(url: &str) -> Option<&str> {
         .find(['/', '?', '#'])
         .map(|index| &authority[index..])
         .unwrap_or("");
-    if route.contains('?') {
-        // Chromium's class route encoding is not stable for arbitrary query
-        // strings.  Refuse to guess rather than map two different web apps to
-        // the same launcher.
-        return None;
-    }
-    Some(route.split('#').next()?.trim_matches('/'))
+    Some(route.split(['?', '#']).next()?.trim_matches('/'))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -953,6 +972,7 @@ mod tests {
 
         assert_eq!(launch.command, "omarchy-launch-webapp");
         assert_eq!(launch.args, vec!["https://chatgpt.com/"]);
+        assert_eq!(launch.specificity, 1);
     }
 
     #[test]
@@ -962,6 +982,10 @@ mod tests {
         assert!(webapp_class_matches_url(
             class,
             "https://discord.com/channels/@me"
+        ));
+        assert!(webapp_class_matches_url(
+            class,
+            "https://discord.com/channels/@me?view=unread"
         ));
         assert!(!webapp_class_matches_url(
             class,
@@ -995,6 +1019,53 @@ mod tests {
             launch.args,
             vec!["chrome-chatgpt.com__-Default", "https://chatgpt.com/"]
         );
+    }
+
+    #[test]
+    fn test_find_webapp_launch_info_rejects_ambiguous_lossy_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("Slash.desktop"),
+            "[Desktop Entry]\nExec=omarchy-launch-webapp https://example.com/foo/bar\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Underscore.desktop"),
+            "[Desktop Entry]\nExec=omarchy-launch-webapp https://example.com/foo_bar\n",
+        )
+        .unwrap();
+
+        assert!(find_webapp_launch_info_in_directories(
+            "chrome-example.com__foo_bar-Default",
+            "",
+            &[directory.path().to_path_buf()],
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_find_webapp_launch_info_prefers_explicit_class_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("Direct.desktop"),
+            "[Desktop Entry]\nExec=omarchy-launch-webapp https://example.com/\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("Explicit.desktop"),
+            "[Desktop Entry]\nExec=omarchy-launch-or-focus-webapp chrome-example.com__-Default https://example.com/\n",
+        )
+        .unwrap();
+
+        let launch = find_webapp_launch_info_in_directories(
+            "chrome-example.com__-Default",
+            "",
+            &[directory.path().to_path_buf()],
+        )
+        .expect("explicit class launcher should win over a generic URL entry");
+
+        assert_eq!(launch.command, "omarchy-launch-or-focus-webapp");
+        assert_eq!(launch.args[0], "chrome-example.com__-Default");
     }
 
     #[test]

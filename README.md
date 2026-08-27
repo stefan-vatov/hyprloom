@@ -123,6 +123,13 @@ keeps a safety autosnapshot named with the `autosave-` prefix.
 Replace closes every current Hyprland client, including clients excluded by
 the capture filters; use reconciliation when extras should remain untouched.
 
+Omarchy web apps are restored from their identity-bearing `chrome-*` window
+class and matching desktop entry. If Chromium reports a window only as the
+generic `chromium` class, Hyprland does not expose that window's URL; Hyprloom
+keeps it as a normal browser window instead of guessing a site and launching
+the wrong app. Use Omarchy's `omarchy-launch-or-focus-webapp` desktop entries
+when a web app needs reliable snapshot identity.
+
 ### Brave Profile Support
 
 Hyprloom captures and restores Brave browser profiles individually. Since Brave
