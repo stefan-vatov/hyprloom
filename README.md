@@ -39,7 +39,7 @@ shortcuts and autosave references keep working while the fork uses the
 `hyprloom` name.
 
 The release workflow publishes the verified AUR metadata after a `v*` tag is
-published from the fork. This checkout includes the matching `v0.3.3` package
+published from the fork. This checkout includes the matching `v0.3.4` package
 checksum and a local tag for testing; the GitHub/AUR publication step still
 requires the fork and tag to be pushed publicly.
 

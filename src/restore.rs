@@ -36,6 +36,8 @@ pub enum RestoreError {
     Transaction(String),
     #[error("replacement session has no restorable windows")]
     NoRestorableTargets,
+    #[error("safety snapshot cannot be recovered safely: {reason}")]
+    UnsafeRecoverySnapshot { reason: String },
     #[error(
         "reconciliation is limited to {limit} saved/current windows (got {targets} saved and {current} current)"
     )]
@@ -347,6 +349,19 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
 
     let mut score = 1_000;
     let mut kind = MatchKind::ClassFallback;
+    if target
+        .address
+        .as_deref()
+        .is_some_and(|address| same_nonempty(address, &current.address))
+    {
+        // Hyprland's address identifies the exact live window.  Prefer it
+        // over geometry when two windows share the same app/title and one has
+        // moved since capture.  A missing address remains a normal legacy
+        // fallback so a closed/reopened application can still be restored by
+        // its app identity.
+        score += 5_000;
+        kind = MatchKind::ExactIdentity;
+    }
     if is_generic_chromium_client(target) {
         score += 2_000;
         kind = MatchKind::ExactIdentity;
@@ -510,6 +525,27 @@ fn brave_client_has_no_safe_profile_identity(client: &SessionClient) -> bool {
                 .profile_directory
                 .as_deref()
                 .is_none_or(str::is_empty))
+}
+
+/// Ensure a safety snapshot can be used before a destructive replacement
+/// starts.  A Brave process can own several windows while exposing several
+/// profile flags, but Hyprland does not tell us which flag belongs to which
+/// window.  Starting replacement in that state would make recovery guess and
+/// could silently lose windows, so fail before closing anything.
+pub fn validate_safety_snapshot(session: &Session) -> Result<(), RestoreError> {
+    if let Some(client) = session
+        .clients
+        .iter()
+        .find(|client| brave_client_has_no_safe_profile_identity(client))
+    {
+        return Err(RestoreError::UnsafeRecoverySnapshot {
+            reason: format!(
+                "Brave window '{}' has no unique profile identity",
+                client.title
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn is_generic_chromium_client(client: &SessionClient) -> bool {
@@ -3273,6 +3309,50 @@ mod tests {
     }
 
     #[test]
+    fn test_matching_prefers_saved_address_for_same_app_windows_after_one_moves() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xintended".to_string());
+
+        let mut intended = make_reconcile_window(
+            "0xintended",
+            "kitty",
+            "Project",
+            1,
+            0,
+            [900, 500],
+            [800, 600],
+        );
+        intended.initial_title = "Project".to_string();
+        let mut same_title =
+            make_reconcile_window("0xother", "kitty", "Project", 1, 0, [10, 20], [800, 600]);
+        same_title.initial_title = "Project".to_string();
+
+        let observed = vec![
+            ObservedClient::from_hypr_client(intended, None, None),
+            ObservedClient::from_hypr_client(same_title, None, None),
+        ];
+        let plan = plan_reconciliation(&[target], &observed);
+
+        assert_eq!(plan[0].map(|pair| pair.current_index), Some(0));
+        assert_eq!(
+            plan[0].map(|pair| pair.kind),
+            Some(MatchKind::ExactIdentity)
+        );
+    }
+
+    #[test]
     fn test_matching_duplicate_generic_chromium_titles_uses_captured_address() {
         let mut target = make_client(
             "chromium",
@@ -5621,6 +5701,30 @@ mod tests {
         assert_eq!(report.skipped, 1);
         assert_eq!(report.extras, 1);
         assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_safety_snapshot_rejects_ambiguous_brave_windows_before_replace() {
+        let mut first = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+        first.title = "Personal".to_string();
+        first.profile_identity_ambiguous = true;
+        let mut second = first.clone();
+        second.title = "Work".to_string();
+
+        let error = validate_safety_snapshot(&make_session(vec![first, second]))
+            .expect_err("an ambiguous Brave safety snapshot must block replacement");
+
+        assert!(matches!(error, RestoreError::UnsafeRecoverySnapshot { .. }));
     }
 
     #[test]

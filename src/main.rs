@@ -8,11 +8,11 @@ use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::{
     recover_session, recover_session_safely, replace_session_with_marker,
     replacement_target_is_complete, restore_session, validate_replacement_targets,
-    ReplaceMarkerContext,
+    validate_safety_snapshot, ReplaceMarkerContext,
 };
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
-    migrate_legacy_sessions, replace_marker, save_session, session_exists,
+    migrate_legacy_sessions, replace_marker, rotate_autosaves, save_session, session_exists,
     validate_user_session_name, OperationLock, ReplacePhase,
 };
 use std::path::Path;
@@ -347,6 +347,10 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
+            if let Err(error) = validate_safety_snapshot(&backup) {
+                eprintln!("Replace cancelled: {error}");
+                std::process::exit(1);
+            }
             if let Err(error) = save_session(&backup, &sessions_dir) {
                 eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
@@ -357,6 +361,11 @@ fn main() {
                 &sessions_dir,
             ) {
                 eprintln!("Replace cancelled: could not record recovery marker: {error}");
+                std::process::exit(1);
+            }
+            if let Err(error) = rotate_autosaves(&sessions_dir, config.general.autosave_retain) {
+                eprintln!("Replace cancelled: could not rotate autosaves: {error}");
+                clear_recovery_marker(&sessions_dir);
                 std::process::exit(1);
             }
 
@@ -399,11 +408,17 @@ fn main() {
                             &config,
                             cli.verbose,
                         ) {
-                            clear_recovery_marker(&sessions_dir);
+                            clear_recovery_marker_and_rotate(
+                                &sessions_dir,
+                                config.general.autosave_retain,
+                            );
                         }
                         std::process::exit(1);
                     } else {
-                        if !clear_recovery_marker(&sessions_dir) {
+                        if !clear_recovery_marker_and_rotate(
+                            &sessions_dir,
+                            config.general.autosave_retain,
+                        ) {
                             eprintln!(
                                 "Replacement completed, but its recovery marker could not be cleared; retry after checking the session store."
                             );
@@ -425,14 +440,20 @@ fn main() {
                                 &config,
                                 cli.verbose,
                             ) {
-                                clear_recovery_marker(&sessions_dir);
+                                clear_recovery_marker_and_rotate(
+                                    &sessions_dir,
+                                    config.general.autosave_retain,
+                                );
                             }
                         }
                         Some(false) => {
                             eprintln!(
                                 "Replacement did not start closing windows; leaving the desktop unchanged."
                             );
-                            clear_recovery_marker(&sessions_dir);
+                            clear_recovery_marker_and_rotate(
+                                &sessions_dir,
+                                config.general.autosave_retain,
+                            );
                         }
                         None => {
                             eprintln!(
@@ -662,6 +683,17 @@ fn clear_recovery_marker(sessions_dir: &Path) -> bool {
     true
 }
 
+fn clear_recovery_marker_and_rotate(sessions_dir: &Path, retain: usize) -> bool {
+    if !clear_recovery_marker(sessions_dir) {
+        return false;
+    }
+    if let Err(error) = rotate_autosaves(sessions_dir, retain) {
+        eprintln!("Warning: could not rotate autosaves after replacement: {error}");
+        return false;
+    }
+    true
+}
+
 fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Config) -> bool {
     let marker = match replace_marker(sessions_dir) {
         Ok(Some(marker)) => marker,
@@ -676,13 +708,13 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
         eprintln!(
             "Found a completed desktop replacement; finalizing its recovery marker without replaying the old snapshot."
         );
-        return clear_recovery_marker(sessions_dir);
+        return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
     if marker.phase == ReplacePhase::Prepared {
         eprintln!(
             "Found a replacement that was prepared but never started; leaving the current desktop unchanged."
         );
-        return clear_recovery_marker(sessions_dir);
+        return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
     if marker.phase == ReplacePhase::Closing {
         let Some(closing_address) = marker.closing_address.as_deref() else {
@@ -697,7 +729,10 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
                 eprintln!(
                     "Found a replacement that had not confirmed its first close; leaving the current desktop unchanged."
                 );
-                return clear_recovery_marker(sessions_dir);
+                return clear_recovery_marker_and_rotate(
+                    sessions_dir,
+                    config.general.autosave_retain,
+                );
             }
             None => {
                 eprintln!(
@@ -723,7 +758,10 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
                         eprintln!(
                             "Found a replacement whose target windows are already present; preserving the current desktop and finalizing its recovery marker."
                         );
-                        return clear_recovery_marker(sessions_dir);
+                        return clear_recovery_marker_and_rotate(
+                            sessions_dir,
+                            config.general.autosave_retain,
+                        );
                     }
                     Ok(false) => {}
                     Err(error) => eprintln!(
@@ -755,7 +793,7 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
         report_safety_recovery(&backup, &hyprctl, &process_info, config, false)
     };
     if recovered {
-        return clear_recovery_marker(sessions_dir);
+        return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
     false
 }

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.4] - 2026-08-27
+
+### Fixed
+
+- Prefer captured Hyprland window addresses when reconciling same-app windows
+- Refuse destructive replacement when a Brave safety snapshot has no unique profile identity
+- Rotate replacement safety autosaves while preserving the active recovery backup
+
 ## [0.3.3] - 2026-08-27
 
 ### Fixed
