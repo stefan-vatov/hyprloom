@@ -39,7 +39,7 @@ shortcuts and autosave references keep working while the fork uses the
 `hyprloom` name.
 
 The release workflow publishes the verified AUR metadata after a `v*` tag is
-published from the fork. This checkout includes the matching `v0.3.1` package
+published from the fork. This checkout includes the matching `v0.3.2` package
 checksum and a local tag for testing; the GitHub/AUR publication step still
 requires the fork and tag to be pushed publicly.
 
@@ -184,7 +184,7 @@ Configure retention in `config.toml`:
 
 ```toml
 [general]
-autosave_retain = 5   # keep last 5 autosave sessions (default)
+autosave_retain = 5   # keep last 5 autosave sessions (0 removes all autosaves)
 ```
 
 If an older hyprflow autosave timer exists, `hyprloom autosave --install`

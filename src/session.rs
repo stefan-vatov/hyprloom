@@ -751,9 +751,6 @@ pub fn list_autosave_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>
 /// Returns the count of sessions deleted. Non-autosave sessions are untouched.
 pub fn rotate_autosaves(sessions_dir: &Path, retain: usize) -> Result<usize, SessionError> {
     let retain = retain.min(MAX_AUTOSAVE_RETAIN);
-    if retain == 0 {
-        return Ok(0);
-    }
     let pending_backup = pending_replace_backup(sessions_dir)?;
     let autosaves = list_autosave_sessions(sessions_dir)?;
     let mut pruned = 0;
@@ -1542,13 +1539,13 @@ mod tests {
     }
 
     #[test]
-    fn test_rotate_autosaves_retain_zero_is_noop() {
+    fn test_rotate_autosaves_retain_zero_removes_all_autosaves() {
         let dir = tempfile::tempdir().unwrap();
         save_session(&make_test_session("autosave-20260309T100000"), dir.path()).unwrap();
 
         let pruned = rotate_autosaves(dir.path(), 0).unwrap();
-        assert_eq!(pruned, 0);
-        assert_eq!(list_autosave_sessions(dir.path()).unwrap().len(), 1);
+        assert_eq!(pruned, 1);
+        assert!(list_autosave_sessions(dir.path()).unwrap().is_empty());
     }
 
     #[test]

@@ -187,12 +187,14 @@ pub fn plan_reconciliation(
     for (target_index, target) in targets.iter().enumerate() {
         for (current_index, observed) in current.iter().enumerate() {
             if let Some((score, kind)) = match_score(target, observed) {
-                candidates[target_index][current_index] = Some(ReconcilePair {
-                    target_index,
-                    current_index,
-                    score,
-                    kind,
-                });
+                if generic_chromium_match_is_safe(target, observed, current) {
+                    candidates[target_index][current_index] = Some(ReconcilePair {
+                        target_index,
+                        current_index,
+                        score,
+                        kind,
+                    });
+                }
             }
         }
     }
@@ -313,12 +315,13 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if !classes_match(target, current) {
         return None;
     }
-    if is_generic_chromium_client(target) {
-        // Hyprland reports ordinary Chromium windows with the same class, and
-        // Chromium commonly shares one PID across them.  Its current and
-        // initial titles are not a stable per-window identity: two tabs can
-        // both be "New Tab" or show the same page title.  Leave generic
-        // Chromium unmatched rather than moving an unrelated browser tab.
+    if is_generic_chromium_client(target) && !same_nonempty(&target.title, &current.title) {
+        // Ordinary Chromium windows share one class and commonly one PID.
+        // The current title is the only window-level identity Hyprland
+        // exposes here, so require an exact title rather than consuming a
+        // same-class window with a different page.  Duplicate titles remain
+        // intentionally distinguishable only by the normal assignment
+        // scoring and are never accepted on a title mismatch.
         return None;
     }
     if is_brave_client(target)
@@ -525,6 +528,55 @@ fn is_brave_class(class: &str) -> bool {
 
 fn is_generic_chromium_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("chromium")
+}
+
+fn generic_chromium_match_is_safe(
+    target: &SessionClient,
+    observed: &ObservedClient,
+    candidates: &[ObservedClient],
+) -> bool {
+    if !is_generic_chromium_client(target) {
+        return true;
+    }
+
+    let matching = candidates
+        .iter()
+        .filter(|candidate| {
+            classes_match(target, &candidate.client)
+                && same_nonempty(&target.title, &candidate.client.title)
+        })
+        .collect::<Vec<_>>();
+    if matching.len() <= 1 {
+        return true;
+    }
+
+    // A duplicated browser title is not a unique identity.  Reuse it only
+    // when one and only one candidate is already in the saved placement; that
+    // preserves the idempotent fast path while never moving an arbitrary
+    // same-title extra.  If both candidates are misplaced, Chromium gives us
+    // no further window-level identity and the safe result is to leave them
+    // alone rather than guess.
+    let in_place = matching
+        .iter()
+        .filter(|candidate| {
+            build_reconcile_dispatch_commands(
+                target,
+                &candidate.client,
+                candidate.monitor_name.as_deref(),
+            )
+            .is_empty()
+        })
+        .count();
+    in_place == 1
+        && matching.iter().any(|candidate| {
+            candidate.client.address == observed.client.address
+                && build_reconcile_dispatch_commands(
+                    target,
+                    &candidate.client,
+                    candidate.monitor_name.as_deref(),
+                )
+                .is_empty()
+        })
 }
 
 fn same_nonempty(left: &str, right: &str) -> bool {
@@ -988,7 +1040,7 @@ fn find_existing_restore_match_with_policy(
     config: &Config,
     allow_ambiguous_identity: bool,
 ) -> Option<usize> {
-    existing
+    let available = existing
         .iter()
         .enumerate()
         .filter(|(_, current)| {
@@ -999,7 +1051,17 @@ fn find_existing_restore_match_with_policy(
                     &config.filters.ignore_classes,
                 )
         })
+        .collect::<Vec<_>>();
+    let available_clients = available
+        .iter()
+        .map(|(_, current)| (*current).clone())
+        .collect::<Vec<_>>();
+    available
+        .into_iter()
         .filter_map(|(index, current)| {
+            if !generic_chromium_match_is_safe(target, current, &available_clients) {
+                return None;
+            }
             allowed_match(target, current, allow_ambiguous_identity)
                 .map(|(score, _)| (score, current.client.address.clone(), index))
         })
@@ -2465,6 +2527,20 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
                 // that intentionally share one process across windows.
                 continue;
             }
+            if candidates.len() != 1 {
+                // Active focus cannot identify the launched window when two
+                // or more compatible windows appeared in the same interval:
+                // one of them may have been opened independently by the
+                // user.  Wait briefly for the set to settle, then fail
+                // closed rather than moving an arbitrary browser window.
+                active_candidate_at = None;
+                if candidate_seen_at.elapsed() >= candidate_settle {
+                    return Err(RestoreError::UncorrelatedWindow {
+                        class: client.class.clone(),
+                    });
+                }
+                continue;
+            }
             // Chromium-based browsers commonly hand a launch request to an
             // existing browser process, so the new window's PID is not
             // related to the short-lived process we spawned.  Hyprland's
@@ -3170,7 +3246,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matching_does_not_consume_identical_title_generic_chromium_window() {
+    fn test_matching_allows_exact_title_generic_chromium_window() {
         let mut target = make_client(
             "chromium",
             1,
@@ -3197,7 +3273,100 @@ mod tests {
         current.initial_title = "Chromium".to_string();
 
         let observed = ObservedClient::from_hypr_client(current, None, None);
-        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+        assert_eq!(
+            plan_reconciliation(&[target], &[observed])[0].map(|pair| pair.kind),
+            Some(MatchKind::ExactIdentity)
+        );
+    }
+
+    #[test]
+    fn test_matching_duplicate_generic_chromium_titles_uses_only_unique_in_place_window() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.title = "New Tab".to_string();
+        target.initial_title = "Chromium".to_string();
+
+        let mut in_place = make_reconcile_window(
+            "0xin-place",
+            "chromium",
+            "New Tab",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        in_place.initial_title = "Chromium".to_string();
+        let mut extra = make_reconcile_window(
+            "0xextra-same-title",
+            "chromium",
+            "New Tab",
+            1,
+            0,
+            [900, 20],
+            [800, 600],
+        );
+        extra.initial_title = "Chromium".to_string();
+
+        let observed = vec![
+            ObservedClient::from_hypr_client(in_place, None, None),
+            ObservedClient::from_hypr_client(extra, None, None),
+        ];
+        let plan = plan_reconciliation(&[target], &observed);
+
+        assert_eq!(plan[0].map(|pair| pair.current_index), Some(0));
+    }
+
+    #[test]
+    fn test_matching_duplicate_misplaced_generic_chromium_titles_fails_closed() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.title = "New Tab".to_string();
+        target.initial_title = "Chromium".to_string();
+
+        let mut first = make_reconcile_window(
+            "0xfirst-same-title",
+            "chromium",
+            "New Tab",
+            1,
+            0,
+            [300, 20],
+            [800, 600],
+        );
+        first.initial_title = "Chromium".to_string();
+        let mut second = make_reconcile_window(
+            "0xsecond-same-title",
+            "chromium",
+            "New Tab",
+            1,
+            0,
+            [900, 20],
+            [800, 600],
+        );
+        second.initial_title = "Chromium".to_string();
+
+        let observed = vec![
+            ObservedClient::from_hypr_client(first, None, None),
+            ObservedClient::from_hypr_client(second, None, None),
+        ];
+        assert_eq!(plan_reconciliation(&[target], &observed), vec![None]);
     }
 
     #[test]
@@ -5755,6 +5924,78 @@ mod tests {
 
         assert_eq!(result.address, "0xnew");
         assert!(!mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_browser_launch_rejects_multiple_new_active_candidates() {
+        let mut target = make_client(
+            "brave-browser",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.profile_directory = Some("Default".to_string());
+        let existing = make_reconcile_window(
+            "0xexisting",
+            "brave-browser",
+            "Existing",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut first_new = make_reconcile_window(
+            "0xnew-a",
+            "brave-browser",
+            "First new window",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut second_new = make_reconcile_window(
+            "0xnew-b",
+            "brave-browser",
+            "Second new window",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        first_new.pid = existing.pid;
+        second_new.pid = existing.pid;
+        let mock = MockHyprctl::new(vec![
+            vec![existing.clone()],
+            vec![existing, first_new, second_new],
+        ])
+        .with_active_addresses(vec![Some("0xnew-b".to_string())]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.window_detect_timeout_ms = 500;
+        config.general.restore_delay_ms = 0;
+
+        let result = restore_single_client_with_launcher_and_process_info_with_address(
+            &target,
+            &mock,
+            &SharedBraveProfileProcessInfo,
+            &config,
+            &launcher,
+            true,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]

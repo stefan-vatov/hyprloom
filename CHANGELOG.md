@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.2] - 2026-08-27
+
+### Fixed
+
+- Reuse generic Chromium windows by exact current title while failing closed on duplicate-title ambiguity
+- Reject ambiguous browser launch candidates instead of moving a user-created window
+- Make zero autosave retention remove all eligible autosaves
+
 ## [0.3.1] - 2026-08-27
 
 ### Fixed
