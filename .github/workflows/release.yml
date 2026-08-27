@@ -41,7 +41,7 @@ jobs:
         run: |
           tag_version="${{ steps.version.outputs.version }}"
           git archive --format=tar --prefix="hyprloom-${tag_version}/" \
-            --mtime="1970-01-01" HEAD | gzip -n > "hyprloom-${tag_version}.tar.gz"
+            --mtime="1970-01-01 00:00:00 UTC" HEAD^{tree} | gzip -n > "hyprloom-${tag_version}.tar.gz"
           test -s "hyprloom-${tag_version}.tar.gz"
           tar -tzf "hyprloom-${tag_version}.tar.gz" >/dev/null
 
