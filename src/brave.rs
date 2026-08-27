@@ -56,7 +56,10 @@ pub fn parse_profiles_from_local_state(
 }
 
 /// Filter profiles to only include those with a workspace mapping.
-/// When `profile_workspaces` is `None`, all profiles are kept (backward compat).
+/// When `profile_workspaces` is `None`, the inventory is returned unchanged;
+/// callers that do not have an explicit mapping should apply
+/// [`filter_profiles_by_active_directories`] instead of restoring every
+/// profile listed in Local State.
 pub fn filter_profiles_by_config(
     profiles: Vec<BraveProfile>,
     profile_workspaces: Option<&HashMap<String, i32>>,
@@ -68,6 +71,24 @@ pub fn filter_profiles_by_config(
             .collect(),
         None => profiles,
     }
+}
+
+/// Keep only profiles that were positively observed in the current session.
+/// Local State contains profiles that may never have an open window, so using
+/// the complete inventory as a restore target would unexpectedly launch all
+/// of them when no workspace mapping was configured.
+pub fn filter_profiles_by_active_directories(
+    profiles: Vec<BraveProfile>,
+    active_directories: &[String],
+) -> Vec<BraveProfile> {
+    profiles
+        .into_iter()
+        .filter(|profile| {
+            active_directories
+                .iter()
+                .any(|directory| directory.eq_ignore_ascii_case(&profile.directory))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -158,5 +179,25 @@ mod tests {
         ];
         let filtered = filter_profiles_by_config(profiles, None);
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn test_filter_profiles_by_active_directories_does_not_restore_closed_profiles() {
+        let profiles = vec![
+            BraveProfile {
+                directory: "Default".to_string(),
+                name: "Credifit".to_string(),
+            },
+            BraveProfile {
+                directory: "Profile 1".to_string(),
+                name: "LinkPJ".to_string(),
+            },
+        ];
+        let active = vec!["default".to_string()];
+
+        let filtered = filter_profiles_by_active_directories(profiles, &active);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].directory, "Default");
     }
 }

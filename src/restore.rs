@@ -512,6 +512,15 @@ fn restore_session_with_process_info(
     // Detect if profile-based Brave restore applies.
     let has_brave_profiles =
         !session.brave_profiles.is_empty() && app_config_for(config, "brave-browser", "").is_some();
+    let brave_target_count = if has_brave_profiles {
+        session.brave_profiles.len()
+    } else {
+        0
+    };
+    let mut brave_windows_accounted = existing_clients
+        .iter()
+        .filter(|client| is_brave_hypr_client(&client.client))
+        .count();
 
     // Group by workspace (BTreeMap gives us sorted workspace order for free).
     let mut by_workspace: BTreeMap<i32, Vec<&SessionClient>> = BTreeMap::new();
@@ -734,12 +743,14 @@ fn restore_session_with_process_info(
                 continue;
             }
 
-            if has_ambiguous_profile_candidate(
-                &target.client,
-                &existing_clients,
-                &consumed_existing,
-                config,
-            ) {
+            if brave_windows_accounted >= brave_target_count
+                && has_ambiguous_profile_candidate(
+                    &target.client,
+                    &existing_clients,
+                    &consumed_existing,
+                    config,
+                )
+            {
                 report.details.push(format!(
                     "SKIP: {} could not be safely matched because Brave profile identity is ambiguous",
                     target.label
@@ -766,7 +777,7 @@ fn restore_session_with_process_info(
                 continue;
             }
 
-            match restore_single_client_with_launcher_and_process_info(
+            match restore_single_client_with_launcher_and_process_info_with_address(
                 &target.client,
                 hyprctl,
                 process_info,
@@ -774,9 +785,12 @@ fn restore_session_with_process_info(
                 &launcher,
                 target_monitor_available,
             ) {
-                Ok(message) => {
+                Ok(restored) => {
+                    if is_brave_client(&target.client) {
+                        brave_windows_accounted += 1;
+                    }
                     if verbose {
-                        report.details.push(message);
+                        report.details.push(restored.message);
                     }
                     report.restored += 1;
                 }
@@ -842,14 +856,12 @@ fn dispatch_existing_repairs(
     commands: &[String],
     hyprctl: &dyn HyprctlClient,
 ) -> Result<(), RestoreError> {
-    for command in commands {
-        if !window_is_present(&current.address, hyprctl)? {
-            return Err(RestoreError::WindowDisappeared {
-                address: current.address.clone(),
-            });
-        }
-        hyprctl.dispatch(command)?;
+    if !window_is_present(&current.address, hyprctl)? {
+        return Err(RestoreError::WindowDisappeared {
+            address: current.address.clone(),
+        });
     }
+    hyprctl.dispatch_batch(commands)?;
     Ok(())
 }
 
@@ -1133,6 +1145,14 @@ pub fn reconcile_session_with_launcher(
 
     let mut report = ReconcileReport::default();
     let mut used_current_addresses = HashSet::new();
+    let brave_target_count = targets
+        .iter()
+        .filter(|target| is_brave_client(&target.client))
+        .count();
+    let mut brave_windows_accounted = observed
+        .iter()
+        .filter(|client| is_brave_hypr_client(&client.client))
+        .count();
 
     for (target_index, target) in targets.iter().enumerate() {
         let target_client = &target_clients[target_index];
@@ -1291,12 +1311,14 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
-        if has_ambiguous_profile_candidate(
-            target_client,
-            &observed,
-            &used_current_addresses,
-            config,
-        ) {
+        if brave_windows_accounted >= brave_target_count
+            && has_ambiguous_profile_candidate(
+                target_client,
+                &observed,
+                &used_current_addresses,
+                config,
+            )
+        {
             report.skipped += 1;
             report.details.push(format!(
                 "SKIP: {} could not be safely matched because Brave profile identity is ambiguous",
@@ -1315,6 +1337,9 @@ pub fn reconcile_session_with_launcher(
         ) {
             Ok(restored) => {
                 used_current_addresses.insert(restored.address);
+                if is_brave_client(target_client) {
+                    brave_windows_accounted += 1;
+                }
                 report.launched += 1;
                 if verbose {
                     report
@@ -1945,11 +1970,12 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
     target_monitor_available: bool,
 ) -> Result<RestoredWindow, RestoreError> {
     // 1. Snapshot existing window addresses before launching.
-    let before: HashSet<String> = hyprctl
-        .get_clients()?
-        .into_iter()
-        .map(|c| c.address)
+    let before_clients = hyprctl.get_clients()?;
+    let before: HashSet<String> = before_clients
+        .iter()
+        .map(|client| client.address.clone())
         .collect();
+    let before_pids: HashSet<u32> = before_clients.iter().map(|client| client.pid).collect();
 
     // 2. Build and spawn the launch command.
     let launch_cmd = build_launch_command(client);
@@ -1985,31 +2011,26 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             .filter(|window| {
                 !before.contains(&window.address)
                     && classes_match(client, window)
-                    && candidate_matches_profile(client, window, process_info)
+                    && candidate_matches_profile(client, window, process_info, &before_pids)
             })
             .collect();
         if !candidates.is_empty() {
-            if client.profile_directory.is_some() && candidates.len() > 1 {
-                return Err(RestoreError::AmbiguousWindow {
-                    class: client.class.clone(),
-                    addresses: candidates
-                        .iter()
-                        .map(|candidate| candidate.address.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                });
-            }
             let candidate_seen_at = first_candidate_at.get_or_insert_with(Instant::now);
             let process_related = launched.pid.is_some()
                 && candidates.iter().any(|candidate| {
                     process_info.is_process_related(launched.pid.unwrap(), candidate.pid)
                 });
-            if launched.pid.is_some() && !process_related {
+            let browser_reuse_allowed = is_brave_client(client)
+                && candidates.len() == 1
+                && before_pids.contains(&candidates[0].pid);
+            if launched.pid.is_some() && !process_related && !browser_reuse_allowed {
                 // A same-class window can be opened by the user while the
                 // requested application is starting.  Never move that window
                 // just because it was the only candidate seen during the
                 // settle period; wait for a descendant of the process we
-                // actually launched or fail without changing it.
+                // actually launched or fail without changing it.  Brave is
+                // the deliberate exception: its launcher commonly hands the
+                // request to an already-running browser process.
                 continue;
             }
             if candidates.len() > 1 && !process_related {
@@ -2028,7 +2049,13 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             {
                 continue;
             }
-            break choose_launched_window(client, candidates, launched, process_info)?;
+            break choose_launched_window(
+                client,
+                candidates,
+                launched,
+                process_info,
+                &before_pids,
+            )?;
         }
     };
 
@@ -2052,14 +2079,12 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             .unwrap_or(0);
         commands.splice(insertion..insertion, monitor_commands);
     }
-    for command in commands {
-        if !window_is_present(&new_window.address, hyprctl)? {
-            return Err(RestoreError::WindowDisappeared {
-                address: new_window.address.clone(),
-            });
-        }
-        hyprctl.dispatch(&command)?;
+    if !window_is_present(&new_window.address, hyprctl)? {
+        return Err(RestoreError::WindowDisappeared {
+            address: new_window.address.clone(),
+        });
     }
+    hyprctl.dispatch_batch(&commands)?;
 
     // 7. Throttle subsequent launches to give the compositor time to settle.
     thread::sleep(Duration::from_millis(
@@ -2082,13 +2107,22 @@ fn candidate_matches_profile(
     target: &SessionClient,
     candidate: &HyprClient,
     process_info: &dyn ProcessInfoProvider,
+    existing_pids: &HashSet<u32>,
 ) -> bool {
     let Some(target_profile) = &target.profile_directory else {
         return true;
     };
-    find_profile_directory(process_info, candidate.pid)
-        .map(|candidate_profile| candidate_profile.eq_ignore_ascii_case(target_profile))
-        .unwrap_or(false)
+    match find_profile_directory(process_info, candidate.pid) {
+        Some(candidate_profile) => {
+            candidate_profile.eq_ignore_ascii_case(target_profile)
+                || (is_brave_client(target) && existing_pids.contains(&candidate.pid))
+        }
+        // A shared Brave browser process can advertise the profile of a
+        // different window.  For a newly-created Brave candidate, the
+        // single-candidate/settle checks provide the remaining correlation;
+        // never apply this unknown-profile fallback to other applications.
+        None => is_brave_client(target),
+    }
 }
 
 fn choose_launched_window(
@@ -2096,10 +2130,13 @@ fn choose_launched_window(
     candidates: Vec<HyprClient>,
     launched: LaunchedProcess,
     process_info: &dyn ProcessInfoProvider,
+    existing_pids: &HashSet<u32>,
 ) -> Result<HyprClient, RestoreError> {
     let candidates: Vec<HyprClient> = candidates
         .into_iter()
-        .filter(|candidate| candidate_matches_profile(target, candidate, process_info))
+        .filter(|candidate| {
+            candidate_matches_profile(target, candidate, process_info, existing_pids)
+        })
         .collect();
     let related: Vec<HyprClient> = launched
         .pid
@@ -2606,6 +2643,25 @@ mod tests {
         fn get_cmdline(&self, pid: u32) -> Result<String, ProcessError> {
             match pid {
                 1000 => Ok("brave --profile-directory=Default".to_string()),
+                _ => Err(ProcessError::NotFound(pid)),
+            }
+        }
+    }
+
+    struct SharedBraveProfileProcessInfo;
+
+    impl ProcessInfoProvider for SharedBraveProfileProcessInfo {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, _pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Ok(vec![])
+        }
+
+        fn get_cmdline(&self, pid: u32) -> Result<String, ProcessError> {
+            match pid {
+                1000 => Ok("brave --profile-directory=Profile 1".to_string()),
                 _ => Err(ProcessError::NotFound(pid)),
             }
         }
@@ -3945,6 +4001,64 @@ mod tests {
         assert_eq!(report.restored, 0);
         assert_eq!(report.failed, 0);
         assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_brave_launch_accepts_a_new_window_reusing_an_existing_browser_pid() {
+        let mut target = make_client(
+            "brave-browser",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.profile_directory = Some("Default".to_string());
+        let existing = make_reconcile_window(
+            "0xexisting",
+            "brave-browser",
+            "Work",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut new_window = make_reconcile_window(
+            "0xnew",
+            "brave-browser",
+            "Personal",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        new_window.pid = existing.pid;
+        let mock = MockHyprctl::new(vec![vec![existing.clone()], vec![existing, new_window]]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        let restored = restore_single_client_with_launcher_and_process_info_with_address(
+            &target,
+            &mock,
+            &SharedBraveProfileProcessInfo,
+            &config,
+            &launcher,
+            true,
+        )
+        .expect("a browser-reused Brave window is still a valid new candidate");
+
+        assert_eq!(restored.address, "0xnew");
+        assert!(mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch.contains("0xnew")));
     }
 
     #[test]

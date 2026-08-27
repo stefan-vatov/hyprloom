@@ -621,6 +621,9 @@ mod tests {
         symlink(outside.path(), dir.path().join(TRANSACTION_MARKER_NAME)).unwrap();
 
         assert!(recover_install_transaction(dir.path()).is_err());
-        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), "prepared\n");
+        assert_eq!(
+            std::fs::read_to_string(outside.path()).unwrap(),
+            "prepared\n"
+        );
     }
 }

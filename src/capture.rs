@@ -75,7 +75,23 @@ pub fn capture_session(
         });
         let profile_ws =
             app_config_for(config, "brave-browser", "").and_then(|c| c.profile_workspaces.as_ref());
-        crate::brave::filter_profiles_by_config(all_profiles, profile_ws)
+        match profile_ws {
+            Some(mappings) => crate::brave::filter_profiles_by_config(all_profiles, Some(mappings)),
+            None => {
+                let active_directories: Vec<String> = clients
+                    .iter()
+                    .filter(|client| {
+                        client.class.eq_ignore_ascii_case("brave-browser")
+                            || client.initial_class.eq_ignore_ascii_case("brave-browser")
+                    })
+                    .filter_map(|client| client.profile_directory.clone())
+                    .collect();
+                crate::brave::filter_profiles_by_active_directories(
+                    all_profiles,
+                    &active_directories,
+                )
+            }
+        }
     } else {
         vec![]
     };

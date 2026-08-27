@@ -70,6 +70,16 @@ pub trait HyprctlClient {
     /// Dispatch a Hyprland command; `args` is the full argument string
     /// (e.g. `"workspace 2"`).
     fn dispatch(&self, args: &str) -> Result<(), HyprctlError>;
+    /// Dispatch several commands in one compositor request.  The default
+    /// implementation preserves test-double behavior; the real client
+    /// overrides it with Hyprland's atomic `--batch` request so a focus-based
+    /// sequence cannot be interrupted by another focus change.
+    fn dispatch_batch(&self, commands: &[String]) -> Result<(), HyprctlError> {
+        for command in commands {
+            self.dispatch(command)?;
+        }
+        Ok(())
+    }
     /// Return the Hyprland version string (e.g. `"0.54.1"`).
     fn get_hyprland_version(&self) -> Result<String, HyprctlError>;
 }
@@ -114,6 +124,30 @@ impl HyprctlClient for RealHyprctl {
         Ok(())
     }
 
+    fn dispatch_batch(&self, commands: &[String]) -> Result<(), HyprctlError> {
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let mut batch = String::new();
+        for (index, command) in commands.iter().enumerate() {
+            // Validate each command with the same parser used by the single
+            // dispatch path before handing it to Hyprland's batch parser.
+            parse_dispatch_args(command).map_err(HyprctlError::CommandFailed)?;
+            if index > 0 {
+                batch.push_str(" ; ");
+            }
+            batch.push_str("dispatch ");
+            batch.push_str(&escape_batch_command(command));
+        }
+        let output = Command::new("hyprctl").args(["--batch", &batch]).output()?;
+        if !output.status.success() {
+            return Err(HyprctlError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
         let output = Command::new("hyprctl").arg("version").output()?;
         if !output.status.success() {
@@ -129,6 +163,10 @@ impl HyprctlClient for RealHyprctl {
             .unwrap_or("unknown")
             .to_string())
     }
+}
+
+fn escape_batch_command(command: &str) -> String {
+    command.replace('\\', "\\\\").replace(';', "\\;")
 }
 
 /// Parse the argument string accepted by `HyprctlClient::dispatch` without

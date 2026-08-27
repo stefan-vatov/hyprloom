@@ -125,11 +125,15 @@ the capture filters; use reconciliation when extras should remain untouched.
 ### Brave Profile Support
 
 Hyprloom captures and restores Brave browser profiles individually. Since Brave
-runs all windows in a single process, profiles are detected from Brave's
-`Local State` file rather than from window processes.
+runs all windows in a single process, profile names come from Brave's `Local
+State` file and are matched to profiles observed in the current windows when
+no explicit mapping is configured.
 
-Only profiles listed in `profile_workspaces` are captured and restored. Use
-`hyprloom config` to see detected profiles and their mapping status.
+With `profile_workspaces`, only the mapped profiles are captured and restored.
+Without that mapping, only profiles positively observed in currently open Brave
+windows are saved and restored; closed profiles in Local State are not launched
+unexpectedly. Use `hyprloom config` to see detected profiles and their mapping
+status.
 
 ```toml
 [apps.brave-browser]
@@ -138,8 +142,10 @@ default_workspace = 1
 profile_workspaces = { "Default" = 1, "Profile 1" = 6, "Profile 2" = 7 }
 ```
 
-On restore, one Brave window is launched per mapped profile and moved to its
-configured workspace. Profiles not in `profile_workspaces` are skipped.
+On restore, one Brave window is launched per captured profile and moved to its
+configured workspace (or `default_workspace` when no per-profile mapping
+exists). Profiles not in `profile_workspaces` are skipped when a mapping is
+present.
 
 ### Autosave
 

@@ -15,6 +15,8 @@ use hyprloom::session::{
     validate_user_session_name, OperationLock, ReplacePhase,
 };
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -403,7 +405,7 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("Error replacing desktop: {error}");
-                    match replacement_has_started(&sessions_dir, &hyprctl) {
+                    match replacement_has_started(&sessions_dir, &hyprctl, &config) {
                         Some(true) => {
                             eprintln!(
                                 "Attempting safety recovery from '{backup_name}' before giving up."
@@ -677,24 +679,20 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             return false;
         };
         let hyprctl = RealHyprctl;
-        match hyprctl.get_clients() {
-            Ok(clients)
-                if clients
-                    .iter()
-                    .any(|client| client.address == closing_address) =>
-            {
+        match replacement_close_started(closing_address, &hyprctl, config) {
+            Some(false) => {
                 eprintln!(
                     "Found a replacement that had not confirmed its first close; leaving the current desktop unchanged."
                 );
                 return clear_recovery_marker(sessions_dir);
             }
-            Ok(_) => {}
-            Err(error) => {
+            None => {
                 eprintln!(
-                    "Warning: could not determine whether the first replacement close was applied: {error}"
+                    "Warning: could not determine whether the first replacement close was applied; leaving the recovery marker for manual recovery."
                 );
                 return false;
             }
+            Some(true) => {}
         }
     }
     let backup_name = marker.backup_name;
@@ -716,16 +714,18 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
     false
 }
 
-fn replacement_has_started(sessions_dir: &Path, hyprctl: &dyn HyprctlClient) -> Option<bool> {
+fn replacement_has_started(
+    sessions_dir: &Path,
+    hyprctl: &dyn HyprctlClient,
+    config: &hyprloom::config::Config,
+) -> Option<bool> {
     match replace_marker(sessions_dir) {
         Ok(Some(marker)) => match marker.phase {
             ReplacePhase::InProgress => Some(true),
-            ReplacePhase::Closing => marker.closing_address.as_deref().and_then(|address| {
-                hyprctl
-                    .get_clients()
-                    .ok()
-                    .map(|clients| !clients.iter().any(|client| client.address == address))
-            }),
+            ReplacePhase::Closing => marker
+                .closing_address
+                .as_deref()
+                .and_then(|address| replacement_close_started(address, hyprctl, config)),
             ReplacePhase::Prepared | ReplacePhase::Committed => Some(false),
         },
         Ok(None) => Some(false),
@@ -733,6 +733,42 @@ fn replacement_has_started(sessions_dir: &Path, hyprctl: &dyn HyprctlClient) -> 
             eprintln!("Warning: could not inspect replacement recovery marker: {error}");
             None
         }
+    }
+}
+
+/// A close dispatch is asynchronous: `hyprctl dispatch closewindow` can
+/// succeed before the client disappears from `hyprctl clients -j`.  When a
+/// replacement marker is in its first-close phase, wait for that address to
+/// disappear before deciding whether recovery is necessary.  If it remains
+/// for the normal detection window, the close was not confirmed and it is
+/// safer to leave the user's desktop alone than to replay a full backup.
+fn replacement_close_started(
+    address: &str,
+    hyprctl: &dyn HyprctlClient,
+    config: &hyprloom::config::Config,
+) -> Option<bool> {
+    let timeout = Duration::from_millis(config.general.window_detect_timeout_ms.clamp(
+        hyprloom::config::MIN_WINDOW_DETECT_TIMEOUT_MS,
+        hyprloom::config::MAX_WINDOW_DETECT_TIMEOUT_MS,
+    ));
+    let started = Instant::now();
+    loop {
+        let clients = match hyprctl.get_clients() {
+            Ok(clients) => clients,
+            Err(error) => {
+                eprintln!(
+                    "Warning: could not determine whether the first replacement close was applied: {error}"
+                );
+                return None;
+            }
+        };
+        if !clients.iter().any(|client| client.address == address) {
+            return Some(true);
+        }
+        if started.elapsed() >= timeout {
+            return Some(false);
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 
