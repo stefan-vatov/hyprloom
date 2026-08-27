@@ -36,5 +36,6 @@ check() {
 package() {
     cd "$pkgname-$pkgver"
     install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$pkgname"
+    ln -s hyprloom "$pkgdir/usr/bin/hyprflow"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

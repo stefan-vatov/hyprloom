@@ -114,6 +114,18 @@ pub struct SessionSummary {
     pub client_count: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacePhase {
+    InProgress,
+    Committed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplaceMarker {
+    pub backup_name: String,
+    pub phase: ReplacePhase,
+}
+
 /// Process-wide lock for all CLI operations that can observe or mutate the
 /// desktop/session store.  Keeping this in the helper means the UI, systemd
 /// autosave, and manually invoked commands share one serialization boundary.
@@ -254,8 +266,16 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
                     if validate_session_structure(&session).is_err() {
                         continue;
                     }
+                    let Some(file_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                        continue;
+                    };
+                    if session.name != file_stem {
+                        // A payload name must not redirect rotation or deletion
+                        // to a different filename in the session directory.
+                        continue;
+                    }
                     summaries.push(SessionSummary {
-                        name: session.name.clone(),
+                        name: file_stem.to_string(),
                         created_at: session.created_at,
                         client_count: session.clients.len(),
                     });
@@ -314,6 +334,18 @@ pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(SessionError::InvalidName(name.to_string()));
+    }
+    Ok(())
+}
+
+/// Validate a name supplied by a user.  Autosave names are reserved for the
+/// helper so retention can never prune a manually saved session by accident.
+pub fn validate_user_session_name(name: &str) -> Result<(), SessionError> {
+    validate_session_name(name)?;
+    if name.starts_with(AUTOSAVE_PREFIX) {
+        return Err(SessionError::InvalidName(format!(
+            "{name} (the '{AUTOSAVE_PREFIX}' prefix is reserved for autosaves)"
+        )));
     }
     Ok(())
 }
@@ -393,15 +425,33 @@ pub fn mark_replace_in_progress(
 ) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
     ensure_sessions_dir(sessions_dir)?;
-    atomic_write(
-        &sessions_dir.join(REPLACE_MARKER_NAME),
-        backup_name.as_bytes(),
+    write_replace_marker(
+        &ReplaceMarker {
+            backup_name: backup_name.to_string(),
+            phase: ReplacePhase::InProgress,
+        },
+        sessions_dir,
     )
 }
 
-pub fn pending_replace_backup(
+pub fn mark_replace_committed(
+    backup_name: &str,
     sessions_dir: &std::path::Path,
-) -> Result<Option<String>, SessionError> {
+) -> Result<(), SessionError> {
+    validate_session_name(backup_name)?;
+    ensure_sessions_dir(sessions_dir)?;
+    write_replace_marker(
+        &ReplaceMarker {
+            backup_name: backup_name.to_string(),
+            phase: ReplacePhase::Committed,
+        },
+        sessions_dir,
+    )
+}
+
+pub fn replace_marker(
+    sessions_dir: &std::path::Path,
+) -> Result<Option<ReplaceMarker>, SessionError> {
     if !existing_sessions_dir(sessions_dir)? {
         return Ok(None);
     }
@@ -412,8 +462,9 @@ pub fn pending_replace_backup(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(SessionError::Io(error)),
     }
+    ensure_private_file(&path, REPLACE_MARKER_NAME)?;
     let content = read_limited_file(&path, REPLACE_MARKER_NAME)?;
-    let name = std::str::from_utf8(&content)
+    let text = std::str::from_utf8(&content)
         .map_err(|error| {
             SessionError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -422,8 +473,44 @@ pub fn pending_replace_backup(
         })?
         .trim()
         .to_string();
-    validate_session_name(&name)?;
-    Ok(Some(name))
+    let mut lines = text.lines();
+    let first = lines.next().unwrap_or_default();
+    let (phase, name) = match first {
+        // Older builds wrote only the backup name.  Treat that format as an
+        // interrupted replacement so upgrading cannot silently skip recovery.
+        "in-progress" => (ReplacePhase::InProgress, lines.next().unwrap_or_default()),
+        "committed" => (ReplacePhase::Committed, lines.next().unwrap_or_default()),
+        legacy_name => (ReplacePhase::InProgress, legacy_name),
+    };
+    if lines.next().is_some() {
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "replacement marker has unexpected extra lines",
+        )));
+    }
+    validate_session_name(name)?;
+    Ok(Some(ReplaceMarker {
+        backup_name: name.to_string(),
+        phase,
+    }))
+}
+
+pub fn pending_replace_backup(
+    sessions_dir: &std::path::Path,
+) -> Result<Option<String>, SessionError> {
+    Ok(replace_marker(sessions_dir)?.map(|marker| marker.backup_name))
+}
+
+fn write_replace_marker(
+    marker: &ReplaceMarker,
+    sessions_dir: &std::path::Path,
+) -> Result<(), SessionError> {
+    let phase = match marker.phase {
+        ReplacePhase::InProgress => "in-progress",
+        ReplacePhase::Committed => "committed",
+    };
+    let content = format!("{phase}\n{}", marker.backup_name);
+    atomic_write(&sessions_dir.join(REPLACE_MARKER_NAME), content.as_bytes())
 }
 
 pub fn clear_replace_marker(sessions_dir: &std::path::Path) -> Result<(), SessionError> {
@@ -523,8 +610,9 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
             return Err(SessionError::Io(error));
         }
         #[cfg(unix)]
-        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
-            let _ = directory.sync_all();
+        {
+            let directory = OpenOptions::new().read(true).open(parent)?;
+            directory.sync_all()?;
         }
         return Ok(());
     }
@@ -1030,8 +1118,37 @@ mod tests {
             pending_replace_backup(dir.path()).unwrap().as_deref(),
             Some("autosave-recovery")
         );
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::InProgress,
+            })
+        );
+        mark_replace_committed("autosave-recovery", dir.path()).unwrap();
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::Committed,
+            })
+        );
         clear_replace_marker(dir.path()).unwrap();
         assert_eq!(pending_replace_backup(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_list_ignores_payload_filename_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        save_session(&make_test_session("target"), dir.path()).unwrap();
+        let mismatched = serde_json::to_vec(&make_test_session("target")).unwrap();
+        let path = dir.path().join("autosave-old.json");
+        std::fs::write(&path, mismatched).unwrap();
+        ensure_private_file(&path, "autosave-old").unwrap();
+
+        let sessions = list_sessions(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "target");
     }
 
     #[test]

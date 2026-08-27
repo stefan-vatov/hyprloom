@@ -24,7 +24,7 @@ When you reboot or after a power loss, hyprloom restores your applications to th
 ### From source
 
 ```bash
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ### Arch Linux (AUR)
@@ -33,6 +33,10 @@ cargo install --path .
 # Using your preferred AUR helper
 yay -S hyprloom
 ```
+
+The package installs `hyprflow` as a compatibility symlink, so existing
+shortcuts and autosave references keep working while the fork uses the
+`hyprloom` name.
 
 The release workflow publishes the verified AUR metadata after a `v*` tag is
 published from the fork. This checkout includes the matching `v0.3.0` package
@@ -164,6 +168,9 @@ Configure retention in `config.toml`:
 [general]
 autosave_retain = 5   # keep last 5 autosave sessions (default)
 ```
+
+If an older hyprflow autosave timer exists, `hyprloom autosave --install`
+migrates it to the hyprloom unit and preserves whether it was enabled.
 
 ### Restore on Login
 

@@ -146,15 +146,42 @@ pub fn is_plain_shell(cmdline: &str) -> bool {
     let Some(command) = parts.next() else {
         return false;
     };
-    if parts.next().is_some() {
-        return false;
-    }
-
-    matches!(
+    if !matches!(
         Path::new(command)
             .file_name()
             .and_then(|name| name.to_str()),
         Some("zsh" | "bash" | "fish" | "sh")
+    ) {
+        return false;
+    }
+
+    // Login and interactive flags still describe the shell itself.  Any
+    // command-string flag, positional argument, or argument after `--` means
+    // this process is being used as a command runner rather than the user's
+    // terminal shell.
+    for argument in parts {
+        if argument == "--" || argument == "-c" || argument == "--command" {
+            return false;
+        }
+        if argument.starts_with("--command=")
+            || (argument.starts_with('-') && argument.len() > 1 && argument[1..].contains('c'))
+        {
+            return false;
+        }
+        if argument.starts_with('-') || argument.starts_with('+') {
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn is_terminal_wrapper(cmdline: &str) -> bool {
+    matches!(
+        Path::new(cmdline.split_whitespace().next().unwrap_or(""))
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("tmux" | "screen" | "zellij")
     )
 }
 
@@ -168,12 +195,24 @@ pub fn is_helper_process(cmdline: &str) -> bool {
 }
 
 /// Pick a likely terminal shell deterministically.  A plain shell is
-/// preferred over helper/command processes; PID is the stable tie-breaker.
+/// preferred over application commands, and terminal multiplexers are kept
+/// as a last resort; PID is the stable tie-breaker.
 pub fn select_terminal_child(children: &[ChildProcess]) -> Option<&ChildProcess> {
     children
         .iter()
         .filter(|child| !child.cwd.as_os_str().is_empty() && !is_helper_process(&child.cmdline))
-        .min_by_key(|child| (!is_plain_shell(&child.cmdline), child.pid))
+        .min_by_key(|child| {
+            (
+                if is_plain_shell(&child.cmdline) {
+                    0
+                } else if is_terminal_wrapper(&child.cmdline) {
+                    2
+                } else {
+                    1
+                },
+                child.pid,
+            )
+        })
 }
 
 /// Select a likely interactive shell from the complete terminal process tree.
@@ -337,6 +376,9 @@ mod tests {
         ];
 
         assert!(is_plain_shell("/usr/bin/zsh"));
+        assert!(is_plain_shell("zsh -l"));
+        assert!(is_plain_shell("bash --login"));
+        assert!(!is_plain_shell("bash -lc pwd"));
         assert!(!is_plain_shell("zsh -c pwd"));
         assert_eq!(select_terminal_child(&children).unwrap().pid, 10);
     }

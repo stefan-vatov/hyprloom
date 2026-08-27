@@ -5,11 +5,14 @@ use hyprloom::config::{
 };
 use hyprloom::hyprctl::RealHyprctl;
 use hyprloom::process::RealProcessInfo;
-use hyprloom::restore::{replace_session, restore_session, validate_replacement_targets};
+use hyprloom::restore::{
+    recover_session, replace_session_with_marker, restore_session, validate_replacement_targets,
+    ReplaceMarkerContext,
+};
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
-    mark_replace_in_progress, migrate_legacy_sessions, pending_replace_backup, save_session,
-    session_exists, OperationLock,
+    mark_replace_in_progress, migrate_legacy_sessions, replace_marker, save_session,
+    session_exists, validate_user_session_name, OperationLock, ReplacePhase,
 };
 use std::path::Path;
 
@@ -97,8 +100,13 @@ fn main() {
     if let Err(error) = migrate_legacy_sessions(&sessions_dir, &legacy_sessions_dir()) {
         eprintln!("Warning: could not migrate legacy hyprflow sessions: {error}");
     }
-    let recovery_ready = recover_pending_replace(&sessions_dir, &config);
-    if !recovery_ready && command_requires_clean_recovery(&cli.command) {
+    let requires_clean_recovery = command_requires_clean_recovery(&cli.command);
+    let recovery_ready = if requires_clean_recovery {
+        recover_pending_replace(&sessions_dir, &config)
+    } else {
+        true
+    };
+    if !recovery_ready && requires_clean_recovery {
         eprintln!(
             "A previous desktop replacement still needs recovery; retry after Hyprland is available."
         );
@@ -108,6 +116,11 @@ fn main() {
     match cli.command {
         Commands::Save { name, force } => {
             let name = name.unwrap_or_else(|| config.general.default_session.clone());
+
+            if let Err(error) = validate_user_session_name(&name) {
+                eprintln!("Error: {error}");
+                std::process::exit(1);
+            }
 
             if !force && session_exists(&name, &sessions_dir) && name != "latest" {
                 eprintln!(
@@ -208,6 +221,15 @@ fn main() {
                 match hyprloom::session::parse_max_age(age_str) {
                     Ok(max_duration) => {
                         let age = chrono::Utc::now() - session.created_at;
+                        if age < chrono::Duration::zero() {
+                            println!(
+                                "Session '{}' has a future timestamp (created {}).",
+                                session.name,
+                                session.created_at.format("%Y-%m-%d %H:%M")
+                            );
+                            println!("Skipping restore (max age: {}).", age_str);
+                            return;
+                        }
                         if age > max_duration {
                             println!(
                                 "Session '{}' is too old (created {}).",
@@ -254,7 +276,7 @@ fn main() {
                         for detail in &report.details {
                             println!("  {}", detail);
                         }
-                        if report.failed > 0 {
+                        if report.failed > 0 || report.skipped > 0 {
                             std::process::exit(1);
                         }
                     }
@@ -329,13 +351,17 @@ fn main() {
                 std::process::exit(1);
             }
 
-            match replace_session(
+            match replace_session_with_marker(
                 &session,
                 &hyprctl,
                 &process_info,
                 &config,
-                false,
-                cli.verbose,
+                ReplaceMarkerContext {
+                    dry_run: false,
+                    verbose: cli.verbose,
+                    backup_name: &backup_name,
+                    sessions_dir: &sessions_dir,
+                },
             ) {
                 Ok(report) => {
                     println!(
@@ -532,11 +558,22 @@ fn main() {
                         }
 
                         let retain = config.general.autosave_retain;
-                        let total_before = hyprloom::session::list_autosave_sessions(&sessions_dir)
-                            .map(|s| s.len())
-                            .unwrap_or(0);
+                        let total_before =
+                            match hyprloom::session::list_autosave_sessions(&sessions_dir) {
+                                Ok(sessions) => sessions.len(),
+                                Err(error) => {
+                                    eprintln!("Error listing autosaves for rotation: {error}");
+                                    std::process::exit(1);
+                                }
+                            };
                         let pruned =
-                            hyprloom::session::rotate_autosaves(&sessions_dir, retain).unwrap_or(0);
+                            match hyprloom::session::rotate_autosaves(&sessions_dir, retain) {
+                                Ok(pruned) => pruned,
+                                Err(error) => {
+                                    eprintln!("Error rotating autosaves: {error}");
+                                    std::process::exit(1);
+                                }
+                            };
                         let retained = total_before.saturating_sub(pruned);
 
                         println!(
@@ -595,14 +632,21 @@ fn clear_recovery_marker(sessions_dir: &Path) -> bool {
 }
 
 fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Config) -> bool {
-    let backup_name = match pending_replace_backup(sessions_dir) {
-        Ok(Some(name)) => name,
+    let marker = match replace_marker(sessions_dir) {
+        Ok(Some(marker)) => marker,
         Ok(None) => return true,
         Err(error) => {
             eprintln!("Warning: could not inspect replacement recovery marker: {error}");
             return false;
         }
     };
+    if marker.phase == ReplacePhase::Committed {
+        eprintln!(
+            "Found a completed desktop replacement; finalizing its recovery marker without replaying the old snapshot."
+        );
+        return clear_recovery_marker(sessions_dir);
+    }
+    let backup_name = marker.backup_name;
     eprintln!(
         "Found an interrupted desktop replacement; attempting recovery from '{backup_name}'."
     );
@@ -622,10 +666,18 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
 }
 
 fn command_requires_clean_recovery(command: &Commands) -> bool {
-    !matches!(
-        command,
-        Commands::List | Commands::Config | Commands::Restore { on_login: true, .. }
-    )
+    match command {
+        Commands::List | Commands::Config => false,
+        Commands::Restore {
+            dry_run, on_login, ..
+        } => !dry_run && !on_login,
+        Commands::Autosave {
+            now: false,
+            install: false,
+            uninstall: false,
+        } => false,
+        _ => true,
+    }
 }
 
 fn report_safety_recovery(
@@ -636,7 +688,7 @@ fn report_safety_recovery(
     verbose: bool,
 ) -> bool {
     let recovery_config = safety_recovery_config(config);
-    match hyprloom::restore::reconcile_session(
+    match recover_session(
         backup,
         hyprctl,
         process_info,

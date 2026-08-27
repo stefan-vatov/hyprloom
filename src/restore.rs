@@ -7,7 +7,7 @@ use crate::session::{Monitor, Session, SessionClient};
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,7 +30,21 @@ pub enum RestoreError {
     MissingLaunchBinary { target: String, command: String },
     #[error("timed out waiting for existing windows to close")]
     ReplaceTimeout,
+    #[error("replacement transaction could not be recorded: {0}")]
+    Transaction(String),
+    #[error("replacement session has no restorable windows")]
+    NoRestorableTargets,
+    #[error(
+        "reconciliation is limited to {limit} saved/current windows (got {targets} saved and {current} current)"
+    )]
+    TooManyWindows {
+        targets: usize,
+        current: usize,
+        limit: usize,
+    },
 }
+
+pub const MAX_RECONCILIATION_WINDOWS: usize = 512;
 
 // ── Report ──────────────────────────────────────────────────────────────────
 
@@ -168,17 +182,18 @@ pub fn plan_reconciliation(
         }
     }
 
-    // Add dummy rows and columns so a target may remain unmatched when no
-    // suitable window exists, and an existing window may remain an extra.  A
-    // valid match always has a positive score; dummy edges have weight zero.
-    let size = targets.len() + current.len();
+    // Pad the smaller side with zero-weight dummy rows or columns.  A valid
+    // match always has a positive score, so zero-weight real/real edges are
+    // the optional-unmatched representation: they may be selected by the
+    // assignment solver, but are ignored below because there is no candidate.
+    // Using max(n, m), instead of adding n+m dummy vertices, keeps the
+    // cubic Hungarian pass practical for the bounded reconciliation input.
+    let size = targets.len().max(current.len());
     let mut weights = vec![vec![0_i64; size]; size];
-    let impossible = -1_000_000_000_000_i64;
     for (target_index, row) in candidates.iter().enumerate() {
         for (current_index, candidate) in row.iter().enumerate() {
-            weights[target_index][current_index] = candidate
-                .map(|pair| i64::from(pair.score))
-                .unwrap_or(impossible);
+            weights[target_index][current_index] =
+                candidate.map(|pair| i64::from(pair.score)).unwrap_or(0);
         }
     }
 
@@ -283,6 +298,9 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if !classes_match(target, current) {
         return None;
     }
+    if strong_identity_conflict(target, observed) {
+        return None;
+    }
 
     let mut score = 1_000;
     let mut kind = MatchKind::ClassFallback;
@@ -295,10 +313,10 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
             score += 1_200;
             kind = MatchKind::ProfileIdentity;
         } else {
-            // Profile flags are not always visible from a browser window's
-            // PID.  Keep the candidate usable, but make a known profile beat
-            // an unknown one whenever another piece of identity agrees.
-            score -= 250;
+            // A known profile must never consume an unknown Brave window: the
+            // browser commonly shares one process across profiles, so a
+            // class-only match could silently put the wrong profile in place.
+            return None;
         }
     }
 
@@ -359,6 +377,25 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     }
 
     Some((score, kind))
+}
+
+/// Reject the combinations which are positively identified as different
+/// windows.  A title or working-directory change on its own is common, so the
+/// fallback remains available; two independent conflicts are enough evidence
+/// to avoid consuming an unrelated same-class extra.
+fn strong_identity_conflict(target: &SessionClient, observed: &ObservedClient) -> bool {
+    let current = &observed.client;
+    let title_conflict = !target.title.is_empty()
+        && !current.title.is_empty()
+        && !same_nonempty(&target.title, &current.title)
+        && !same_nonempty(&target.initial_title, &current.initial_title)
+        && !titles_similar(&target.title, &current.title);
+    let cwd_conflict = matches!(
+        (launch_cwd(target), observed.cwd.as_ref()),
+        (Some(target_cwd), Some(current_cwd)) if target_cwd != *current_cwd
+    );
+
+    title_conflict && cwd_conflict
 }
 
 fn classes_match(target: &SessionClient, current: &HyprClient) -> bool {
@@ -490,14 +527,13 @@ fn restore_session_with_process_info(
                 }
                 continue;
             }
-            let restore_client = adapt_client_geometry(
-                client,
-                &session.monitors,
-                find_monitor_by_name(&current_monitors, &client.monitor),
-            );
+            let target_monitor = find_monitor_by_name(&current_monitors, &client.monitor);
+            let target_monitor_available = client.monitor.is_empty() || target_monitor.is_some();
+            let restore_client = adapt_client_geometry(client, &session.monitors, target_monitor);
 
             if dry_run {
-                let cmds = build_dispatch_commands(&restore_client);
+                let cmds =
+                    build_dispatch_commands_for_monitor(&restore_client, target_monitor_available);
                 report.details.push(format!(
                     "[dry-run] ws={} {} → {}",
                     ws, client.class, client.launch.command
@@ -518,10 +554,13 @@ fn restore_session_with_process_info(
             {
                 let current = existing_clients[existing_index].clone();
                 consumed_existing.insert(current.client.address.clone());
-                let commands = build_reconcile_dispatch_commands(
+                let commands = build_reconcile_dispatch_commands_with_geometry(
                     &restore_client,
                     &current.client,
                     current.monitor_name.as_deref(),
+                    restore_client.at,
+                    restore_client.size,
+                    target_monitor_available,
                 );
                 if commands.is_empty() {
                     report.details.push(format!(
@@ -580,6 +619,7 @@ fn restore_session_with_process_info(
                 process_info,
                 config,
                 &RealProcessLauncher,
+                target_monitor_available,
             ) {
                 Ok(msg) => {
                     if verbose {
@@ -610,17 +650,19 @@ fn restore_session_with_process_info(
         let launcher = RealProcessLauncher;
 
         for mut target in profile_targets {
-            target.client = adapt_client_geometry(
-                &target.client,
-                &session.monitors,
-                find_monitor_by_name(&current_monitors, &target.client.monitor),
-            );
+            let target_monitor = find_monitor_by_name(&current_monitors, &target.client.monitor);
+            let target_monitor_available =
+                target.client.monitor.is_empty() || target_monitor.is_some();
+            target.client =
+                adapt_client_geometry(&target.client, &session.monitors, target_monitor);
             if dry_run {
                 report.details.push(format!(
                     "[dry-run] {} → ws={}",
                     target.label, target.client.workspace
                 ));
-                for command in build_dispatch_commands(&target.client) {
+                for command in
+                    build_dispatch_commands_for_monitor(&target.client, target_monitor_available)
+                {
                     report.details.push(format!("  hyprctl dispatch {command}"));
                 }
                 report.restored += 1;
@@ -651,6 +693,7 @@ fn restore_session_with_process_info(
                 process_info,
                 config,
                 &launcher,
+                target_monitor_available,
             ) {
                 Ok(message) => {
                     if verbose {
@@ -720,7 +763,18 @@ pub fn validate_replacement_targets(
     session: &Session,
     config: &Config,
 ) -> Result<(), RestoreError> {
-    for target in build_reconcile_targets(session, config) {
+    let targets = build_reconcile_targets(session, config);
+    if !session.clients.is_empty() && targets.is_empty() {
+        return Err(RestoreError::NoRestorableTargets);
+    }
+    if targets.len() > MAX_RECONCILIATION_WINDOWS {
+        return Err(RestoreError::TooManyWindows {
+            targets: targets.len(),
+            current: 0,
+            limit: MAX_RECONCILIATION_WINDOWS,
+        });
+    }
+    for target in targets {
         let launch_command = build_launch_command(&target.client);
         if !launch_command_is_trusted(&target.client, config) {
             return Err(RestoreError::UntrustedLaunch {
@@ -750,9 +804,105 @@ pub fn replace_session(
     dry_run: bool,
     verbose: bool,
 ) -> Result<ReconcileReport, RestoreError> {
-    validate_replacement_targets(session, config)?;
-    if dry_run {
-        return reconcile_session(session, hyprctl, process_info, config, true, verbose);
+    replace_session_inner(
+        session,
+        hyprctl,
+        process_info,
+        config,
+        ReplaceOptions {
+            dry_run,
+            verbose,
+            validate_targets: true,
+            marker: None,
+        },
+    )
+}
+
+/// Marker information for a replacement transaction managed by the CLI.
+pub struct ReplaceMarkerContext<'a> {
+    pub dry_run: bool,
+    pub verbose: bool,
+    pub backup_name: &'a str,
+    pub sessions_dir: &'a Path,
+}
+
+/// Replacement entry point used by the CLI after it has persisted a safety
+/// snapshot and an in-progress marker.  A clean pass advances the marker to a
+/// committed phase before returning, so a crash between restore completion and
+/// marker cleanup cannot replay the old desktop over the new one.
+pub fn replace_session_with_marker(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    marker: ReplaceMarkerContext<'_>,
+) -> Result<ReconcileReport, RestoreError> {
+    replace_session_inner(
+        session,
+        hyprctl,
+        process_info,
+        config,
+        ReplaceOptions {
+            dry_run: marker.dry_run,
+            verbose: marker.verbose,
+            validate_targets: true,
+            marker: Some((marker.backup_name, marker.sessions_dir)),
+        },
+    )
+}
+
+/// Exact recovery used after an interrupted replacement.  It closes every
+/// currently visible client first, including windows created by the failed
+/// replacement, then restores the safety snapshot.  This avoids the mixed
+/// desktop that an additive reconcile would leave behind.
+pub fn recover_session(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<ReconcileReport, RestoreError> {
+    replace_session_inner(
+        session,
+        hyprctl,
+        process_info,
+        config,
+        ReplaceOptions {
+            dry_run,
+            verbose,
+            validate_targets: false,
+            marker: None,
+        },
+    )
+}
+
+struct ReplaceOptions<'a> {
+    dry_run: bool,
+    verbose: bool,
+    validate_targets: bool,
+    marker: Option<(&'a str, &'a Path)>,
+}
+
+fn replace_session_inner(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    options: ReplaceOptions<'_>,
+) -> Result<ReconcileReport, RestoreError> {
+    if options.validate_targets {
+        validate_replacement_targets(session, config)?;
+    }
+    if options.dry_run {
+        return reconcile_session(
+            session,
+            hyprctl,
+            process_info,
+            config,
+            true,
+            options.verbose,
+        );
     }
 
     let current = hyprctl.get_clients()?;
@@ -777,7 +927,21 @@ pub fn replace_session(
         thread::sleep(Duration::from_millis(50));
     }
 
-    reconcile_session(session, hyprctl, process_info, config, false, verbose)
+    let report = reconcile_session(
+        session,
+        hyprctl,
+        process_info,
+        config,
+        false,
+        options.verbose,
+    )?;
+    if let Some((backup_name, sessions_dir)) = options.marker {
+        if report.failed == 0 && report.skipped == 0 {
+            crate::session::mark_replace_committed(backup_name, sessions_dir)
+                .map_err(|error| RestoreError::Transaction(error.to_string()))?;
+        }
+    }
+    Ok(report)
 }
 
 #[derive(Debug, Clone)]
@@ -826,6 +990,13 @@ pub fn reconcile_session_with_launcher(
     let targets = build_reconcile_targets(session, config);
     let current_monitors = hyprctl.get_monitors()?;
     let observed = observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
+    if targets.len() > MAX_RECONCILIATION_WINDOWS || observed.len() > MAX_RECONCILIATION_WINDOWS {
+        return Err(RestoreError::TooManyWindows {
+            targets: targets.len(),
+            current: observed.len(),
+            limit: MAX_RECONCILIATION_WINDOWS,
+        });
+    }
     let target_clients: Vec<SessionClient> = targets
         .iter()
         .map(|target| {
@@ -839,51 +1010,74 @@ pub fn reconcile_session_with_launcher(
     let plan = plan_reconciliation(&target_clients, &observed);
 
     let mut report = ReconcileReport::default();
-    let mut used_current = HashSet::new();
+    let mut used_current_addresses = HashSet::new();
 
     for (target_index, target) in targets.iter().enumerate() {
-        if let Some(pair) = plan[target_index] {
-            let current = if dry_run {
-                observed[pair.current_index].clone()
-            } else {
-                match observe_client_by_address(
-                    &observed[pair.current_index].client.address,
-                    hyprctl,
-                    process_info,
-                    config,
-                ) {
-                    Ok(Some(current)) => current,
-                    Ok(None) => {
-                        report.failed += 1;
-                        report.details.push(format!(
-                            "FAIL: {} — window {} disappeared before repair",
-                            target.label, observed[pair.current_index].client.address
-                        ));
-                        continue;
-                    }
-                    Err(error) => {
-                        report.failed += 1;
-                        report
-                            .details
-                            .push(format!("FAIL: {} — {error}", target.label));
-                        continue;
-                    }
-                }
-            };
-            used_current.insert(pair.current_index);
+        let target_client = &target_clients[target_index];
+        let matched = if dry_run {
+            plan[target_index].and_then(|pair| {
+                observed
+                    .get(pair.current_index)
+                    .cloned()
+                    .map(|current| (current, pair.kind))
+            })
+        } else {
+            // The initial assignment is only a plan.  Re-read the compositor
+            // immediately before each target so a window that appeared after
+            // planning is matched instead of launching a duplicate.
+            let refreshed =
+                observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
+            if refreshed.len() > MAX_RECONCILIATION_WINDOWS {
+                return Err(RestoreError::TooManyWindows {
+                    targets: targets.len(),
+                    current: refreshed.len(),
+                    limit: MAX_RECONCILIATION_WINDOWS,
+                });
+            }
+            let planned_address = plan[target_index]
+                .and_then(|pair| observed.get(pair.current_index))
+                .map(|current| current.client.address.clone());
+            let selected_index = planned_address
+                .and_then(|address| {
+                    refreshed.iter().enumerate().find_map(|(index, current)| {
+                        (!used_current_addresses.contains(&address)
+                            && current.client.address == address
+                            && match_score(target_client, current).is_some())
+                        .then_some(index)
+                    })
+                })
+                .or_else(|| {
+                    find_existing_restore_match(
+                        target_client,
+                        &refreshed,
+                        &used_current_addresses,
+                        config,
+                    )
+                });
+            selected_index.map(|index| {
+                let current = refreshed[index].clone();
+                let kind = match_score(target_client, &current)
+                    .map(|(_, kind)| kind)
+                    .unwrap_or(MatchKind::ClassFallback);
+                (current, kind)
+            })
+        };
+
+        if let Some((current, match_kind)) = matched {
+            used_current_addresses.insert(current.client.address.clone());
             report.matched += 1;
 
             let current_target_monitor =
-                find_monitor_by_name(&current_monitors, &target.client.monitor).cloned();
-            let command_target = adapt_client_geometry(
-                &target.client,
-                &session.monitors,
-                current_target_monitor.as_ref(),
-            );
-            let commands = build_reconcile_dispatch_commands(
-                &command_target,
+                find_monitor_by_name(&current_monitors, &target_client.monitor).cloned();
+            let target_monitor_available =
+                target_client.monitor.is_empty() || current_target_monitor.is_some();
+            let commands = build_reconcile_dispatch_commands_with_geometry(
+                target_client,
                 &current.client,
                 current.monitor_name.as_deref(),
+                target_client.at,
+                target_client.size,
+                target_monitor_available,
             );
 
             if commands.is_empty() {
@@ -893,7 +1087,7 @@ pub fn reconcile_session_with_launcher(
                         "{}: {} already in place (matched {})",
                         if dry_run { "[dry-run]" } else { "OK" },
                         target.label,
-                        match_kind_label(pair.kind)
+                        match_kind_label(match_kind)
                     ));
                 }
                 continue;
@@ -905,7 +1099,7 @@ pub fn reconcile_session_with_launcher(
                     "[dry-run] repair {} at address {} (matched {})",
                     target.label,
                     current.client.address,
-                    match_kind_label(pair.kind)
+                    match_kind_label(match_kind)
                 ));
                 for command in &commands {
                     report.details.push(format!("  hyprctl dispatch {command}"));
@@ -913,45 +1107,20 @@ pub fn reconcile_session_with_launcher(
                 continue;
             }
 
-            let mut applied = true;
-            for command in &commands {
-                match window_is_present(&current.client.address, hyprctl) {
-                    Ok(true) => {}
-                    Ok(false) => {
+            match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
+                Ok(()) => {
+                    report.moved += 1;
+                    if verbose {
                         report.details.push(format!(
-                            "FAIL: {} at address {} — window disappeared before '{command}'",
+                            "OK: repaired {} at address {}",
                             target.label, current.client.address
                         ));
-                        report.failed += 1;
-                        applied = false;
-                        break;
-                    }
-                    Err(error) => {
-                        report.details.push(format!(
-                            "FAIL: {} at address {} — could not verify window before '{command}': {error}",
-                            target.label, current.client.address
-                        ));
-                        report.failed += 1;
-                        applied = false;
-                        break;
                     }
                 }
-                if let Err(error) = hyprctl.dispatch(command) {
+                Err(error) => {
+                    report.failed += 1;
                     report.details.push(format!(
                         "FAIL: {} at address {} — {error}",
-                        target.label, current.client.address
-                    ));
-                    report.failed += 1;
-                    applied = false;
-                    break;
-                }
-            }
-
-            if applied {
-                report.moved += 1;
-                if verbose {
-                    report.details.push(format!(
-                        "OK: repaired {} at address {}",
                         target.label, current.client.address
                     ));
                 }
@@ -959,7 +1128,6 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
-        let target_client = &target_clients[target_index];
         let launch_command = build_launch_command(target_client);
         if !launch_command_is_trusted(target_client, config) {
             report.failed += 1;
@@ -984,29 +1152,36 @@ pub fn reconcile_session_with_launcher(
                 target.label,
                 launch_command.join(" ")
             ));
-            for command in build_dispatch_commands(target_client) {
+            let target_monitor_available = target_client.monitor.is_empty()
+                || find_monitor_by_name(&current_monitors, &target_client.monitor).is_some();
+            for command in
+                build_dispatch_commands_for_monitor(target_client, target_monitor_available)
+            {
                 report.details.push(format!("  hyprctl dispatch {command}"));
             }
             continue;
         }
 
         if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
-            report.skipped += 1;
+            report.failed += 1;
             report.details.push(format!(
-                "SKIP: binary '{}' not found for {}",
+                "FAIL: binary '{}' not found for {}",
                 launch_command[0], target.label
             ));
             continue;
         }
 
-        match restore_single_client_with_launcher_and_process_info(
+        match restore_single_client_with_launcher_and_process_info_with_address(
             target_client,
             hyprctl,
             process_info,
             config,
             launcher,
+            target_client.monitor.is_empty()
+                || find_monitor_by_name(&current_monitors, &target_client.monitor).is_some(),
         ) {
-            Ok(_) => {
+            Ok(restored) => {
+                used_current_addresses.insert(restored.address);
                 report.launched += 1;
                 if verbose {
                     report
@@ -1023,10 +1198,13 @@ pub fn reconcile_session_with_launcher(
         }
     }
 
-    report.extras = observed.len().saturating_sub(used_current.len());
+    report.extras = observed
+        .iter()
+        .filter(|window| !used_current_addresses.contains(&window.client.address))
+        .count();
     if verbose {
-        for (index, window) in observed.iter().enumerate() {
-            if !used_current.contains(&index) {
+        for window in &observed {
+            if !used_current_addresses.contains(&window.client.address) {
                 report.details.push(format!(
                     "EXTRA: {} '{}' at address {} on ws={} left untouched",
                     window.client.class,
@@ -1163,15 +1341,6 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
     targets
 }
 
-fn observe_clients(
-    hyprctl: &dyn HyprctlClient,
-    process_info: &dyn ProcessInfoProvider,
-    config: &Config,
-) -> Result<Vec<ObservedClient>, RestoreError> {
-    let monitors = hyprctl.get_monitors()?;
-    observe_clients_with_monitors(hyprctl, process_info, config, &monitors)
-}
-
 fn observe_clients_with_monitors(
     hyprctl: &dyn HyprctlClient,
     process_info: &dyn ProcessInfoProvider,
@@ -1200,17 +1369,6 @@ fn observe_clients_with_monitors(
         .collect();
     clients.sort_by(|left, right| left.client.address.cmp(&right.client.address));
     Ok(clients)
-}
-
-fn observe_client_by_address(
-    address: &str,
-    hyprctl: &dyn HyprctlClient,
-    process_info: &dyn ProcessInfoProvider,
-    config: &Config,
-) -> Result<Option<ObservedClient>, RestoreError> {
-    Ok(observe_clients(hyprctl, process_info, config)?
-        .into_iter()
-        .find(|observed| observed.client.address == address))
 }
 
 fn window_is_present(address: &str, hyprctl: &dyn HyprctlClient) -> Result<bool, RestoreError> {
@@ -1266,23 +1424,126 @@ fn adapt_client_geometry(
         return target.clone();
     }
 
-    let scale_x = current_monitor.width as f64 / saved_monitor.width as f64;
-    let scale_y = current_monitor.height as f64 / saved_monitor.height as f64;
-    let width = scaled_extent(target.size[0], scale_x, current_monitor.width);
-    let height = scaled_extent(target.size[1], scale_y, current_monitor.height);
-    let relative_x = i64::from(target.at[0]) - i64::from(saved_x);
-    let relative_y = i64::from(target.at[1]) - i64::from(saved_y);
-    let proposed_x = i64::from(current_x) + scale_coordinate(relative_x, scale_x);
-    let proposed_y = i64::from(current_y) + scale_coordinate(relative_y, scale_y);
+    let (relative_at, relative_size) = if supported_rotation(saved_monitor.transform)
+        && supported_rotation(current_monitor.transform)
+    {
+        let saved_relative_at = [
+            i64::from(target.at[0]) - i64::from(saved_x),
+            i64::from(target.at[1]) - i64::from(saved_y),
+        ];
+        let (canonical_at, canonical_size) = rotate_rect_to_canonical(
+            saved_relative_at,
+            target.size,
+            saved_monitor.width,
+            saved_monitor.height,
+            saved_monitor.transform,
+        );
+        let scale_x = current_monitor.width as f64 / saved_monitor.width as f64;
+        let scale_y = current_monitor.height as f64 / saved_monitor.height as f64;
+        let scaled_at = [
+            scale_coordinate(canonical_at[0], scale_x),
+            scale_coordinate(canonical_at[1], scale_y),
+        ];
+        let scaled_size = [
+            scaled_extent(canonical_size[0], scale_x, current_monitor.width),
+            scaled_extent(canonical_size[1], scale_y, current_monitor.height),
+        ];
+        rotate_rect_from_canonical(
+            scaled_at,
+            scaled_size,
+            current_monitor.width,
+            current_monitor.height,
+            current_monitor.transform,
+        )
+    } else {
+        let scale_x = current_monitor.width as f64 / saved_monitor.width as f64;
+        let scale_y = current_monitor.height as f64 / saved_monitor.height as f64;
+        (
+            [
+                scale_coordinate(i64::from(target.at[0]) - i64::from(saved_x), scale_x),
+                scale_coordinate(i64::from(target.at[1]) - i64::from(saved_y), scale_y),
+            ],
+            [
+                scaled_extent(target.size[0], scale_x, current_monitor.width),
+                scaled_extent(target.size[1], scale_y, current_monitor.height),
+            ],
+        )
+    };
+    let (relative_x, relative_y) = (relative_at[0], relative_at[1]);
+    let width = relative_size[0];
+    let height = relative_size[1];
+    let (current_width, current_height) = displayed_monitor_dimensions(current_monitor);
+    let proposed_x = i64::from(current_x) + relative_x;
+    let proposed_y = i64::from(current_y) + relative_y;
     let at = [
-        clamp_coordinate(proposed_x, current_x, current_monitor.width, width),
-        clamp_coordinate(proposed_y, current_y, current_monitor.height, height),
+        clamp_coordinate(proposed_x, current_x, current_width, width),
+        clamp_coordinate(proposed_y, current_y, current_height, height),
     ];
 
     let mut adapted = target.clone();
     adapted.at = at;
     adapted.size = [width, height];
     adapted
+}
+
+fn supported_rotation(transform: u32) -> bool {
+    transform < 4
+}
+
+fn displayed_monitor_dimensions(monitor: &HyprMonitor) -> (u32, u32) {
+    if monitor.transform % 2 == 1 {
+        (monitor.height, monitor.width)
+    } else {
+        (monitor.width, monitor.height)
+    }
+}
+
+fn rotate_rect_to_canonical(
+    at: [i64; 2],
+    size: [i32; 2],
+    base_width: u32,
+    base_height: u32,
+    transform: u32,
+) -> ([i64; 2], [i32; 2]) {
+    let x = at[0];
+    let y = at[1];
+    let width = i64::from(size[0].max(1));
+    let height = i64::from(size[1].max(1));
+    let base_width = i64::from(base_width);
+    let base_height = i64::from(base_height);
+    match transform {
+        1 => ([y, base_width - x - width], [height as i32, width as i32]),
+        2 => (
+            [base_width - x - width, base_height - y - height],
+            [width as i32, height as i32],
+        ),
+        3 => ([base_height - y - height, x], [height as i32, width as i32]),
+        _ => ([x, y], [width as i32, height as i32]),
+    }
+}
+
+fn rotate_rect_from_canonical(
+    at: [i64; 2],
+    size: [i32; 2],
+    base_width: u32,
+    base_height: u32,
+    transform: u32,
+) -> ([i64; 2], [i32; 2]) {
+    let x = at[0];
+    let y = at[1];
+    let width = i64::from(size[0].max(1));
+    let height = i64::from(size[1].max(1));
+    let base_width = i64::from(base_width);
+    let base_height = i64::from(base_height);
+    match transform {
+        1 => ([base_height - y - height, x], [height as i32, width as i32]),
+        2 => (
+            [base_width - x - width, base_height - y - height],
+            [width as i32, height as i32],
+        ),
+        3 => ([y, base_width - x - width], [height as i32, width as i32]),
+        _ => ([x, y], [width as i32, height as i32]),
+    }
 }
 
 fn scale_coordinate(value: i64, scale: f64) -> i64 {
@@ -1368,6 +1629,19 @@ fn quote_dispatch_token(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "'\\''"))
 }
 
+fn monitor_move_commands(monitor: &str, address: &str) -> Vec<String> {
+    // Hyprland's monitor-aware move dispatcher operates on the active window,
+    // while address selectors are supported by focuswindow.  Focus the exact
+    // matched client first, then move it silently to the named monitor.
+    vec![
+        format!("focuswindow address:{address}"),
+        format!(
+            "movewindow {} silent",
+            quote_dispatch_token(&format!("mon:{monitor}"))
+        ),
+    ]
+}
+
 /// Return only the compositor operations needed to make an existing window
 /// agree with the saved placement.  An empty result is the important fast
 /// path: it means the window is already correct and should be left alone.
@@ -1382,6 +1656,7 @@ pub fn build_reconcile_dispatch_commands(
         current_monitor,
         target.at,
         target.size,
+        true,
     )
 }
 
@@ -1391,8 +1666,10 @@ fn build_reconcile_dispatch_commands_with_geometry(
     current_monitor: Option<&str>,
     desired_at: [i32; 2],
     desired_size: [i32; 2],
+    target_monitor_available: bool,
 ) -> Vec<String> {
-    let monitor_mismatch = !target.monitor.is_empty()
+    let monitor_mismatch = target_monitor_available
+        && !target.monitor.is_empty()
         && current_monitor
             .map(|monitor| !monitor.eq_ignore_ascii_case(&target.monitor))
             // A successful monitor query can still lack a name for a stale
@@ -1412,11 +1689,7 @@ fn build_reconcile_dispatch_commands_with_geometry(
         commands.push(format!("fullscreenstate 0 0,address:{}", current.address));
     }
     if monitor_mismatch {
-        commands.push(format!(
-            "movetomonitor {},address:{}",
-            quote_dispatch_token(&target.monitor),
-            current.address
-        ));
+        commands.extend(monitor_move_commands(&target.monitor, &current.address));
     }
     if workspace_mismatch {
         commands.push(format!(
@@ -1474,6 +1747,7 @@ fn restore_single_client_with_launcher(
         &process_info,
         config,
         launcher,
+        false,
     )
 }
 
@@ -1483,7 +1757,33 @@ fn restore_single_client_with_launcher_and_process_info(
     process_info: &dyn ProcessInfoProvider,
     config: &Config,
     launcher: &dyn ProcessLauncher,
+    target_monitor_available: bool,
 ) -> Result<String, RestoreError> {
+    restore_single_client_with_launcher_and_process_info_with_address(
+        client,
+        hyprctl,
+        process_info,
+        config,
+        launcher,
+        target_monitor_available,
+    )
+    .map(|restored| restored.message)
+}
+
+#[derive(Debug)]
+struct RestoredWindow {
+    address: String,
+    message: String,
+}
+
+fn restore_single_client_with_launcher_and_process_info_with_address(
+    client: &SessionClient,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    launcher: &dyn ProcessLauncher,
+    target_monitor_available: bool,
+) -> Result<RestoredWindow, RestoreError> {
     // 1. Snapshot existing window addresses before launching.
     let before: HashSet<String> = hyprctl
         .get_clients()?
@@ -1534,6 +1834,16 @@ fn restore_single_client_with_launcher_and_process_info(
                 && candidates.iter().any(|candidate| {
                     process_info.is_process_related(launched.pid.unwrap(), candidate.pid)
                 });
+            if candidates.len() > 1 && !process_related {
+                return Err(RestoreError::AmbiguousWindow {
+                    class: client.class.clone(),
+                    addresses: candidates
+                        .iter()
+                        .map(|candidate| candidate.address.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
             if candidates.len() == 1
                 && !process_related
                 && candidate_seen_at.elapsed() < candidate_settle
@@ -1547,16 +1857,17 @@ fn restore_single_client_with_launcher_and_process_info(
     // 4. Use the same minimal repair logic as reconciliation.  The launch
     // PID/window correlation above prevents this address from belonging to a
     // different same-class window that appeared during startup.
-    let mut commands = build_reconcile_dispatch_commands(client, &new_window, None);
-    if !client.monitor.is_empty() {
-        commands.insert(
-            0,
-            format!(
-                "movetomonitor {},address:{}",
-                quote_dispatch_token(&client.monitor),
-                new_window.address
-            ),
-        );
+    let mut commands = build_reconcile_dispatch_commands_with_geometry(
+        client,
+        &new_window,
+        None,
+        client.at,
+        client.size,
+        false,
+    );
+    if target_monitor_available && !client.monitor.is_empty() {
+        let monitor_commands = monitor_move_commands(&client.monitor, &new_window.address);
+        commands.splice(0..0, monitor_commands);
     }
     for command in commands {
         if !window_is_present(&new_window.address, hyprctl)? {
@@ -1575,10 +1886,13 @@ fn restore_single_client_with_launcher_and_process_info(
             .min(crate::config::MAX_RESTORE_DELAY_MS),
     ));
 
-    Ok(format!(
-        "OK: {} → ws={} at {:?}",
-        client.class, client.workspace, client.at
-    ))
+    Ok(RestoredWindow {
+        address: new_window.address,
+        message: format!(
+            "OK: {} → ws={} at {:?}",
+            client.class, client.workspace, client.at
+        ),
+    })
 }
 
 fn candidate_matches_profile(
@@ -1591,7 +1905,7 @@ fn candidate_matches_profile(
     };
     find_profile_directory(process_info, candidate.pid)
         .map(|candidate_profile| candidate_profile.eq_ignore_ascii_case(target_profile))
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn choose_launched_window(
@@ -1768,16 +2082,19 @@ fn is_ghostty_class(client: &SessionClient) -> bool {
 /// Build the list of `hyprctl dispatch` argument strings that would be
 /// issued for a given client.  Used both by the dry-run path and by tests.
 pub fn build_dispatch_commands(client: &SessionClient) -> Vec<String> {
+    build_dispatch_commands_for_monitor(client, true)
+}
+
+fn build_dispatch_commands_for_monitor(
+    client: &SessionClient,
+    target_monitor_available: bool,
+) -> Vec<String> {
     let addr = "address:0xNEW";
     let launch = build_launch_command(client);
 
     let mut cmds = vec![format!("exec {}", launch.join(" "))];
-    if !client.monitor.is_empty() {
-        cmds.push(format!(
-            "movetomonitor {},{}",
-            quote_dispatch_token(&client.monitor),
-            addr
-        ));
+    if target_monitor_available && !client.monitor.is_empty() {
+        cmds.extend(monitor_move_commands(&client.monitor, addr));
     }
     cmds.extend([
         format!(
@@ -1910,6 +2227,28 @@ mod tests {
     }
 
     #[test]
+    fn test_matching_rejects_two_independent_same_class_identity_conflicts() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec!["--directory".to_string(), "/project-a".to_string()],
+            None,
+        );
+        target.title = "Project A".to_string();
+        let current =
+            make_reconcile_window("0xother", "kitty", "Project B", 1, 0, [10, 20], [800, 600]);
+        let observed =
+            ObservedClient::from_hypr_client(current, None, Some(PathBuf::from("/project-b")));
+
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
     fn test_geometry_adapts_to_changed_monitor_origin_and_resolution() {
         let target = make_client(
             "kitty",
@@ -1944,6 +2283,43 @@ mod tests {
 
         assert_eq!(adapted.at, [2053, 67]);
         assert_eq!(adapted.size, [1280, 720]);
+    }
+
+    #[test]
+    fn test_geometry_rotates_relative_window_when_monitor_transform_changes() {
+        let target = make_client(
+            "kitty",
+            1,
+            [100, 50],
+            [400, 300],
+            true,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        let saved_monitor = Monitor {
+            name: "DP-1".to_string(),
+            width: 1920,
+            height: 1080,
+            transform: 0,
+            x: Some(0),
+            y: Some(0),
+        };
+        let current_monitor = HyprMonitor {
+            id: 0,
+            name: "DP-1".to_string(),
+            width: 1920,
+            height: 1080,
+            transform: 1,
+            x: Some(0),
+            y: Some(0),
+        };
+
+        let adapted = adapt_client_geometry(&target, &[saved_monitor], Some(&current_monitor));
+
+        assert_eq!(adapted.at, [730, 100]);
+        assert_eq!(adapted.size, [300, 400]);
     }
 
     #[test]
@@ -2640,6 +3016,7 @@ mod tests {
             &process_info,
             &config,
             &launcher,
+            false,
         )
         .unwrap();
 
@@ -3288,6 +3665,32 @@ mod tests {
     }
 
     #[test]
+    fn test_replace_rejects_a_session_with_no_restorable_targets() {
+        let target = make_client(
+            "waybar",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "waybar",
+            vec![],
+            None,
+        );
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig {
+                ignore_classes: vec!["waybar".to_string()],
+            },
+            apps: HashMap::new(),
+        };
+
+        let error = validate_replacement_targets(&make_session(vec![target]), &config)
+            .expect_err("replace must not clear the desktop for an empty target set");
+        assert!(matches!(error, RestoreError::NoRestorableTargets));
+    }
+
+    #[test]
     fn test_restore_repairs_existing_window_on_the_wrong_workspace() {
         let mut target = make_client(
             "kitty",
@@ -3364,6 +3767,49 @@ mod tests {
         assert_eq!(report.unchanged, 1);
         assert_eq!(report.moved, 0);
         assert_eq!(report.failed, 0);
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_refreshes_before_launch_and_uses_window_that_just_appeared() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [100, 100],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Just appeared".to_string();
+        let appeared = make_reconcile_window(
+            "0xappeared",
+            "kitty",
+            "Just appeared",
+            1,
+            0,
+            [100, 100],
+            [800, 600],
+        );
+        let mock = MockHyprctl::new(vec![vec![], vec![appeared]]);
+        let launcher = RecordingLauncher::default();
+
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+        )
+        .unwrap();
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.launched, 0);
+        assert!(launcher.launches.borrow().is_empty());
         assert!(mock.dispatches().is_empty());
     }
 
@@ -3506,6 +3952,7 @@ mod tests {
         );
         let initial_state = vec![existing, extra];
         let mock = MockHyprctl::new(vec![
+            initial_state.clone(),
             initial_state.clone(),
             initial_state.clone(),
             initial_state,
@@ -3672,8 +4119,9 @@ mod tests {
 
         let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-2"));
 
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0], "movetomonitor DP-1,address:0xwrong-monitor");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0], "focuswindow address:0xwrong-monitor");
+        assert_eq!(commands[1], "movewindow mon:DP-1 silent");
     }
 
     #[test]
@@ -3752,7 +4200,10 @@ mod tests {
 
         assert_eq!(
             commands,
-            vec!["movetomonitor 'Desk \\\\ A',address:0xmonitor"]
+            vec![
+                "focuswindow address:0xmonitor",
+                "movewindow 'mon:Desk \\\\ A' silent"
+            ]
         );
     }
 
