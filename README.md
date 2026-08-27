@@ -34,6 +34,11 @@ cargo install --path .
 yay -S hyprloom
 ```
 
+The release workflow publishes the verified AUR metadata after a `v*` tag is
+published from the fork. This checkout includes the matching `v0.3.0` package
+checksum and a local tag for testing; the GitHub/AUR publication step still
+requires the fork and tag to be pushed publicly.
+
 ## Usage
 
 ```bash
