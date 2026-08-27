@@ -11,6 +11,6 @@ pkgbase = hyprloom
 	conflicts = hyprflow
 	replaces = hyprflow
 	source = hyprloom-0.3.0.tar.gz::https://github.com/thethracian/hyprloom/releases/download/v0.3.0/hyprloom-0.3.0.tar.gz
-	sha256sums = 3d04b692530d6056c059fba36e2dc6167b5ef53870d99bf3147f6079bc40923a
+	sha256sums = 38041ad367f9aab9a77b9c794fc44b941aa8d68512149e077ebf94b0b2f9cbb5
 
 pkgname = hyprloom
