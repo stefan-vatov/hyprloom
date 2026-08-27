@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.6] - 2026-08-27
+
+### Fixed
+
+- Recognize safely relaunched windows during interrupted replacement recovery
+- Report missing Brave profile binaries as restore failures
+- Keep recovery completion checks fail-closed for ambiguous browser identity
+
 ## [0.3.5] - 2026-08-27
 
 ### Fixed

@@ -38,6 +38,8 @@ pub enum RestoreError {
     NoRestorableTargets,
     #[error("safety snapshot cannot be recovered safely: {reason}")]
     UnsafeRecoverySnapshot { reason: String },
+    #[error("replacement target cannot be recovered safely: {reason}")]
+    UnsafeReplacementTarget { reason: String },
     #[error(
         "reconciliation is limited to {limit} saved/current windows (got {targets} saved and {current} current)"
     )]
@@ -180,6 +182,21 @@ pub fn plan_reconciliation(
     targets: &[SessionClient],
     current: &[ObservedClient],
 ) -> Vec<Option<ReconcilePair>> {
+    plan_reconciliation_with_policy(targets, current, MatchPolicy::Normal, false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchPolicy {
+    Normal,
+    ReplacementCompletion,
+}
+
+fn plan_reconciliation_with_policy(
+    targets: &[SessionClient],
+    current: &[ObservedClient],
+    policy: MatchPolicy,
+    require_strong_identity: bool,
+) -> Vec<Option<ReconcilePair>> {
     if targets.is_empty() {
         return vec![];
     }
@@ -188,8 +205,13 @@ pub fn plan_reconciliation(
 
     for (target_index, target) in targets.iter().enumerate() {
         for (current_index, observed) in current.iter().enumerate() {
-            if let Some((score, kind)) = match_score(target, observed) {
-                if generic_chromium_match_is_safe(target, observed, current) {
+            let candidate = if require_strong_identity {
+                allowed_match_with_policy(target, observed, false, policy)
+            } else {
+                match_score_with_policy(target, observed, policy)
+            };
+            if let Some((score, kind)) = candidate {
+                if generic_chromium_match_is_safe_with_policy(target, observed, current, policy) {
                     candidates[target_index][current_index] = Some(ReconcilePair {
                         target_index,
                         current_index,
@@ -313,6 +335,14 @@ fn maximum_weight_assignment(weights: &[Vec<i64>]) -> Vec<Option<usize>> {
 }
 
 fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32, MatchKind)> {
+    match_score_with_policy(target, observed, MatchPolicy::Normal)
+}
+
+fn match_score_with_policy(
+    target: &SessionClient,
+    observed: &ObservedClient,
+    policy: MatchPolicy,
+) -> Option<(i32, MatchKind)> {
     let current = &observed.client;
     if !classes_match(target, current) {
         return None;
@@ -321,7 +351,18 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
         .address
         .as_deref()
         .is_some_and(|address| same_nonempty(address, &current.address));
-    if is_generic_chromium_client(target) && !generic_chromium_identity_matches(target, current) {
+    let captured_cwd_matches = matches!(
+        (launch_cwd(target), observed.cwd.as_ref()),
+        (Some(target_cwd), Some(current_cwd)) if target_cwd == *current_cwd
+    );
+    let captured_profile_matches = matches!(
+        (&target.profile_directory, &observed.profile_directory),
+        (Some(target_profile), Some(current_profile))
+            if same_nonempty(target_profile, current_profile)
+    );
+    if is_generic_chromium_client(target)
+        && !generic_chromium_identity_matches_with_policy(target, current, policy)
+    {
         // Ordinary Chromium windows share one class and commonly one PID.
         // A title is not window ownership: two tabs can show the same title,
         // and a page title can change after capture.  Reuse only a compositor
@@ -329,10 +370,13 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
         // remain safely unmatched.
         return None;
     }
-    if target
-        .address
-        .as_deref()
-        .is_some_and(|address| !address.is_empty() && !saved_address_matches)
+    if policy == MatchPolicy::Normal
+        && target.address.as_deref().is_some_and(|address| {
+            !address.is_empty()
+                && !saved_address_matches
+                && !captured_cwd_matches
+                && !captured_profile_matches
+        })
     {
         // A saved address identifies a specific live window.  Once that
         // window is gone, same-class/title evidence is not enough to move a
@@ -360,6 +404,7 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     }
     if target.profile_directory.is_none()
         && !saved_address_matches
+        && !captured_cwd_matches
         && strong_identity_conflict(target, observed)
     {
         return None;
@@ -509,7 +554,21 @@ fn allowed_match(
     observed: &ObservedClient,
     allow_ambiguous_identity: bool,
 ) -> Option<(i32, MatchKind)> {
-    let (score, kind) = match_score(target, observed)?;
+    allowed_match_with_policy(
+        target,
+        observed,
+        allow_ambiguous_identity,
+        MatchPolicy::Normal,
+    )
+}
+
+fn allowed_match_with_policy(
+    target: &SessionClient,
+    observed: &ObservedClient,
+    allow_ambiguous_identity: bool,
+    policy: MatchPolicy,
+) -> Option<(i32, MatchKind)> {
+    let (score, kind) = match_score_with_policy(target, observed, policy)?;
     if !allow_ambiguous_identity
         && (kind == MatchKind::ClassFallback || ambiguous_title_identity(target, observed))
     {
@@ -585,23 +644,50 @@ fn is_generic_chromium_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("chromium")
 }
 
-fn generic_chromium_identity_matches(target: &SessionClient, current: &HyprClient) -> bool {
+fn generic_chromium_identity_matches_with_policy(
+    target: &SessionClient,
+    current: &HyprClient,
+    policy: MatchPolicy,
+) -> bool {
     let Some(target_address) = target.address.as_deref() else {
-        return target.focus_history_id > 0 && target.focus_history_id == current.focus_history_id;
+        return match policy {
+            MatchPolicy::Normal => {
+                target.focus_history_id > 0 && target.focus_history_id == current.focus_history_id
+            }
+            // A browser relaunch gets a new address and focus history.  During
+            // interrupted-replacement recovery, the old snapshot addresses
+            // have already been checked and a unique current title is the
+            // remaining window-level evidence we can use without launching a
+            // duplicate.  Ordinary reconciliation stays fail-closed.
+            MatchPolicy::ReplacementCompletion => {
+                !target.title.is_empty() && same_nonempty(&target.title, &current.title)
+            }
+        };
     };
-    if target_address.is_empty() || !same_nonempty(target_address, &current.address) {
-        return false;
+    if !target_address.is_empty() && same_nonempty(target_address, &current.address) {
+        return true;
     }
-    // The compositor address is the window identity.  Focus history changes
-    // whenever the user focuses another window, so it is not an additional
-    // ownership constraint once the address matches.
-    true
+    match policy {
+        MatchPolicy::Normal => false,
+        MatchPolicy::ReplacementCompletion => {
+            !target.title.is_empty() && same_nonempty(&target.title, &current.title)
+        }
+    }
 }
 
 fn generic_chromium_match_is_safe(
     target: &SessionClient,
     observed: &ObservedClient,
     candidates: &[ObservedClient],
+) -> bool {
+    generic_chromium_match_is_safe_with_policy(target, observed, candidates, MatchPolicy::Normal)
+}
+
+fn generic_chromium_match_is_safe_with_policy(
+    target: &SessionClient,
+    observed: &ObservedClient,
+    candidates: &[ObservedClient],
+    policy: MatchPolicy,
 ) -> bool {
     if !is_generic_chromium_client(target) {
         return true;
@@ -611,7 +697,7 @@ fn generic_chromium_match_is_safe(
         .iter()
         .filter(|candidate| {
             classes_match(target, &candidate.client)
-                && generic_chromium_identity_matches(target, &candidate.client)
+                && generic_chromium_identity_matches_with_policy(target, &candidate.client, policy)
         })
         .collect::<Vec<_>>();
     matching.len() == 1 && matching[0].client.address == observed.client.address
@@ -1043,10 +1129,13 @@ fn restore_session_with_process_info(
             }
             if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
                 report.details.push(format!(
-                    "SKIP: binary '{}' not found for {}",
+                    "FAIL: binary '{}' not found for {}",
                     launch_command[0], target.label
                 ));
-                report.skipped += 1;
+                // A profile target that cannot be launched is not an
+                // intentional safety skip: the requested window is missing
+                // and the caller must receive a failing exit status.
+                report.failed += 1;
                 continue;
             }
 
@@ -1182,6 +1271,18 @@ pub fn validate_replacement_targets(
     session: &Session,
     config: &Config,
 ) -> Result<(), RestoreError> {
+    if let Some(client) = session.clients.iter().find(|client| {
+        !is_ignored_class(&client.class, &config.filters.ignore_classes)
+            && !is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
+            && brave_client_has_no_safe_profile_identity(client)
+    }) {
+        return Err(RestoreError::UnsafeReplacementTarget {
+            reason: format!(
+                "Brave window '{}' has no unique profile identity",
+                client.title
+            ),
+        });
+    }
     let targets = build_reconcile_targets(session, config);
     if !session.clients.is_empty() && targets.is_empty() {
         return Err(RestoreError::NoRestorableTargets);
@@ -1521,15 +1622,55 @@ pub fn replacement_target_is_complete_with_backup(
         // replace validated.  Keep the conservative recovery path instead.
         return Ok(false);
     }
-    let target_count = build_reconcile_targets(session, config).len();
-    if target_count == 0 {
+    if session
+        .clients
+        .iter()
+        .any(brave_client_has_no_safe_profile_identity)
+    {
+        // The replacement validator rejects this for new transactions.  Keep
+        // recovery conservative for an older marker or a hand-edited target;
+        // otherwise the profile-aware target builder could silently omit a
+        // Brave window and falsely declare the replacement complete.
         return Ok(false);
     }
-    let report = recover_session_safely(session, hyprctl, process_info, config, true, false)?;
-    Ok(report.matched == target_count
-        && report.launched == 0
-        && report.skipped == 0
-        && report.failed == 0)
+    let target_count = build_reconcile_targets(session, config).len();
+    if target_count == 0 {
+        // An intentionally empty replacement is complete once the desktop is
+        // empty.  Treating it as incomplete would restore the old safety
+        // snapshot after a crash even though the requested target was reached.
+        return Ok(hyprctl.get_clients()?.is_empty());
+    }
+    if target_count > MAX_RECONCILIATION_WINDOWS {
+        return Ok(false);
+    }
+
+    let current_monitors = hyprctl.get_monitors()?;
+    let observed = observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
+    if observed.len() > MAX_RECONCILIATION_WINDOWS {
+        return Ok(false);
+    }
+    let target_clients: Vec<SessionClient> = build_reconcile_targets(session, config)
+        .into_iter()
+        .map(|target| {
+            adapt_client_geometry(
+                &target.client,
+                &session.monitors,
+                find_monitor_by_name(&current_monitors, &target.client.monitor),
+            )
+        })
+        .collect();
+    let plan = plan_reconciliation_with_policy(
+        &target_clients,
+        &observed,
+        MatchPolicy::ReplacementCompletion,
+        true,
+    );
+
+    // This is a read-only proof used to decide whether replaying the safety
+    // snapshot would be destructive.  It deliberately accepts a relaunched
+    // target with a new compositor address only when strong identity evidence
+    // still exists; it never launches or moves anything itself.
+    Ok(plan.iter().all(Option::is_some))
 }
 
 /// Testable reconciliation entry point with process creation injected.
@@ -4081,6 +4222,112 @@ mod tests {
         .unwrap());
     }
 
+    #[test]
+    fn test_replacement_completion_accepts_relaunched_window_with_new_address() {
+        let mut target = make_client(
+            "kitty",
+            2,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xtarget-before-crash".to_string());
+
+        let mut relaunched = make_reconcile_window(
+            "0xtarget-after-relaunch",
+            "kitty",
+            "Project",
+            1,
+            0,
+            [900, 100],
+            [700, 500],
+        );
+        relaunched.initial_title = "Project".to_string();
+
+        let mut backup_client = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        backup_client.address = Some("0xold-safety-window".to_string());
+
+        let mock = MockHyprctl::new(vec![vec![relaunched]]);
+
+        assert!(replacement_target_is_complete_with_backup(
+            &make_session(vec![target]),
+            Some(&make_session(vec![backup_client])),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_replacement_completion_accepts_generic_chromium_relaunch_by_unique_title() {
+        let mut target = make_client(
+            "chromium",
+            2,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.title = "Project dashboard".to_string();
+        target.initial_title = "Chromium".to_string();
+        target.address = Some("0xbrowser-before-crash".to_string());
+
+        let mut relaunched = make_reconcile_window(
+            "0xbrowser-after-relaunch",
+            "chromium",
+            "Project dashboard",
+            1,
+            0,
+            [900, 100],
+            [700, 500],
+        );
+        relaunched.initial_title = "Chromium".to_string();
+
+        let mock = MockHyprctl::new(vec![vec![relaunched]]);
+
+        assert!(replacement_target_is_complete(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_empty_replacement_target_is_complete_when_desktop_is_empty() {
+        let mock = MockHyprctl::new(vec![vec![]]);
+
+        assert!(replacement_target_is_complete_with_backup(
+            &make_session(vec![]),
+            None,
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
     // ── MockHyprctl ───────────────────────────────────────────────────────────
 
     /// A mock that returns pre-programmed client snapshots on successive
@@ -5344,6 +5591,52 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_brave_profile_missing_binary_is_a_failure() {
+        let session = Session {
+            name: "test".to_string(),
+            created_at: Utc::now(),
+            hyprland_version: "0.54.1".to_string(),
+            monitors: vec![],
+            clients: vec![],
+            brave_profiles: vec![BraveProfile {
+                directory: "Default".to_string(),
+                name: "Personal".to_string(),
+            }],
+        };
+        let config = Config {
+            apps: HashMap::from([(
+                "brave-browser".to_string(),
+                AppConfig {
+                    binary: Some("missing_brave_binary_xyz".to_string()),
+                    capture_cwd: None,
+                    capture_last_command: None,
+                    hint_template: None,
+                    profile_workspaces: Some(HashMap::from([("Default".to_string(), 1)])),
+                    default_workspace: None,
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let report = restore_session(
+            &session,
+            &MockHyprctl::new(vec![vec![]]),
+            &config,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.failed, 1);
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("missing_brave_binary_xyz")));
+    }
+
+    #[test]
     fn test_restore_brave_profile_with_explicit_mapping_skips_unmapped_profile() {
         let session = Session {
             name: "test".to_string(),
@@ -5896,6 +6189,43 @@ mod tests {
             .expect_err("an ambiguous Brave safety snapshot must block replacement");
 
         assert!(matches!(error, RestoreError::UnsafeRecoverySnapshot { .. }));
+    }
+
+    #[test]
+    fn test_replacement_rejects_ambiguous_brave_target_even_with_other_targets() {
+        let mut brave = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+        brave.title = "Work".to_string();
+        brave.profile_identity_ambiguous = true;
+        let other = make_client(
+            "kitty",
+            2,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+
+        let error =
+            validate_replacement_targets(&make_session(vec![brave, other]), &Config::default())
+                .expect_err("replacement must not silently drop an ambiguous Brave target");
+
+        assert!(matches!(
+            error,
+            RestoreError::UnsafeReplacementTarget { .. }
+        ));
     }
 
     #[test]
