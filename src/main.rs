@@ -3,7 +3,7 @@ use hyprloom::capture::capture_session;
 use hyprloom::config::{
     app_config_for, config_path, legacy_sessions_dir, load_config, sessions_dir,
 };
-use hyprloom::hyprctl::RealHyprctl;
+use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::{
     recover_session, replace_session_with_marker, restore_session, validate_replacement_targets,
@@ -403,7 +403,7 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("Error replacing desktop: {error}");
-                    match replacement_has_started(&sessions_dir) {
+                    match replacement_has_started(&sessions_dir, &hyprctl) {
                         Some(true) => {
                             eprintln!(
                                 "Attempting safety recovery from '{backup_name}' before giving up."
@@ -669,6 +669,34 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
         );
         return clear_recovery_marker(sessions_dir);
     }
+    if marker.phase == ReplacePhase::Closing {
+        let Some(closing_address) = marker.closing_address.as_deref() else {
+            eprintln!(
+                "Warning: replacement marker is missing the window address for its closing phase."
+            );
+            return false;
+        };
+        let hyprctl = RealHyprctl;
+        match hyprctl.get_clients() {
+            Ok(clients)
+                if clients
+                    .iter()
+                    .any(|client| client.address == closing_address) =>
+            {
+                eprintln!(
+                    "Found a replacement that had not confirmed its first close; leaving the current desktop unchanged."
+                );
+                return clear_recovery_marker(sessions_dir);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!(
+                    "Warning: could not determine whether the first replacement close was applied: {error}"
+                );
+                return false;
+            }
+        }
+    }
     let backup_name = marker.backup_name;
     eprintln!(
         "Found an interrupted desktop replacement; attempting recovery from '{backup_name}'."
@@ -688,9 +716,18 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
     false
 }
 
-fn replacement_has_started(sessions_dir: &Path) -> Option<bool> {
+fn replacement_has_started(sessions_dir: &Path, hyprctl: &dyn HyprctlClient) -> Option<bool> {
     match replace_marker(sessions_dir) {
-        Ok(Some(marker)) => Some(marker.phase == ReplacePhase::InProgress),
+        Ok(Some(marker)) => match marker.phase {
+            ReplacePhase::InProgress => Some(true),
+            ReplacePhase::Closing => marker.closing_address.as_deref().and_then(|address| {
+                hyprctl
+                    .get_clients()
+                    .ok()
+                    .map(|clients| !clients.iter().any(|client| client.address == address))
+            }),
+            ReplacePhase::Prepared | ReplacePhase::Committed => Some(false),
+        },
         Ok(None) => Some(false),
         Err(error) => {
             eprintln!("Warning: could not inspect replacement recovery marker: {error}");

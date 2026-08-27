@@ -108,6 +108,9 @@ pub struct ObservedClient {
     pub monitor_name: Option<String>,
     pub cwd: Option<PathBuf>,
     pub profile_directory: Option<String>,
+    /// A process flag is not always window-specific. Chromium-based browsers
+    /// commonly reuse one PID for several top-level windows.
+    pub profile_identity_ambiguous: bool,
 }
 
 impl ObservedClient {
@@ -121,6 +124,7 @@ impl ObservedClient {
             monitor_name,
             cwd,
             profile_directory: None,
+            profile_identity_ambiguous: false,
         }
     }
 
@@ -135,6 +139,7 @@ impl ObservedClient {
             monitor_name,
             cwd,
             profile_directory,
+            profile_identity_ambiguous: false,
         }
     }
 }
@@ -306,6 +311,12 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     let mut kind = MatchKind::ClassFallback;
 
     if let Some(target_profile) = &target.profile_directory {
+        if observed.profile_identity_ambiguous {
+            // Never move or consume a Brave window when its profile flag came
+            // from a process shared by multiple windows.  Launching a missing
+            // profile is safer than silently moving the wrong profile.
+            return None;
+        }
         if let Some(current_profile) = &observed.profile_directory {
             if !same_nonempty(target_profile, current_profile) {
                 return None;
@@ -409,6 +420,10 @@ fn classes_match(target: &SessionClient, current: &HyprClient) -> bool {
 }
 
 fn is_brave_client(client: &SessionClient) -> bool {
+    is_brave_class(&client.class) || is_brave_class(&client.initial_class)
+}
+
+fn is_brave_hypr_client(client: &HyprClient) -> bool {
     is_brave_class(&client.class) || is_brave_class(&client.initial_class)
 }
 
@@ -719,6 +734,20 @@ fn restore_session_with_process_info(
                 continue;
             }
 
+            if has_ambiguous_profile_candidate(
+                &target.client,
+                &existing_clients,
+                &consumed_existing,
+                config,
+            ) {
+                report.details.push(format!(
+                    "SKIP: {} could not be safely matched because Brave profile identity is ambiguous",
+                    target.label
+                ));
+                report.skipped += 1;
+                continue;
+            }
+
             let launch_command = build_launch_command(&target.client);
             if !launch_command_is_trusted(&target.client, config) {
                 report.details.push(format!(
@@ -787,6 +816,25 @@ fn find_existing_restore_match(
         })
         .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
         .map(|(_, _, index)| index)
+}
+
+fn has_ambiguous_profile_candidate(
+    target: &SessionClient,
+    existing: &[ObservedClient],
+    consumed: &HashSet<String>,
+    config: &Config,
+) -> bool {
+    target.profile_directory.is_some()
+        && existing.iter().any(|current| {
+            !consumed.contains(&current.client.address)
+                && current.profile_identity_ambiguous
+                && !is_ignored_class(&current.client.class, &config.filters.ignore_classes)
+                && !is_ignored_class(
+                    &current.client.initial_class,
+                    &config.filters.ignore_classes,
+                )
+                && classes_match(target, &current.client)
+        })
 }
 
 fn dispatch_existing_repairs(
@@ -870,7 +918,8 @@ pub fn replace_session(
 
 /// Marker information for a replacement transaction managed by the CLI.  The
 /// caller writes a prepared marker before entering this function; the helper
-/// advances it to in-progress immediately before the first close.
+/// records the first close candidate, then advances it to in-progress only
+/// after that close dispatch has been accepted.
 pub struct ReplaceMarkerContext<'a> {
     pub dry_run: bool,
     pub verbose: bool,
@@ -958,16 +1007,30 @@ fn replace_session_inner(
     }
 
     let current = hyprctl.get_clients()?;
-    if let Some((backup_name, sessions_dir)) = options.marker {
-        // Keep the prepared marker until the first close is about to happen.
-        // A compositor query failure must not make startup restore a snapshot
-        // over the user's desktop.
-        crate::session::mark_replace_in_progress(backup_name, sessions_dir)
-            .map_err(|error| RestoreError::Transaction(error.to_string()))?;
-    }
+    let mut close_started = false;
     for client in current {
         if !client.address.is_empty() {
+            if let Some((backup_name, sessions_dir)) = options.marker {
+                if !close_started {
+                    // Keep the prepared marker until the first close is about
+                    // to happen. If dispatch fails, startup can inspect this
+                    // address before deciding whether recovery is necessary.
+                    crate::session::mark_replace_closing(
+                        backup_name,
+                        sessions_dir,
+                        &client.address,
+                    )
+                    .map_err(|error| RestoreError::Transaction(error.to_string()))?;
+                }
+            }
             hyprctl.dispatch(&format!("closewindow address:{}", client.address))?;
+            if !close_started {
+                close_started = true;
+                if let Some((backup_name, sessions_dir)) = options.marker {
+                    crate::session::mark_replace_in_progress(backup_name, sessions_dir)
+                        .map_err(|error| RestoreError::Transaction(error.to_string()))?;
+                }
+            }
         }
     }
 
@@ -1228,6 +1291,20 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
+        if has_ambiguous_profile_candidate(
+            target_client,
+            &observed,
+            &used_current_addresses,
+            config,
+        ) {
+            report.skipped += 1;
+            report.details.push(format!(
+                "SKIP: {} could not be safely matched because Brave profile identity is ambiguous",
+                target.label
+            ));
+            continue;
+        }
+
         match restore_single_client_with_launcher_and_process_info_with_address(
             target_client,
             hyprctl,
@@ -1423,6 +1500,24 @@ fn observe_clients_with_monitors(
             ObservedClient::with_profile_directory(client, monitor_name, cwd, profile_directory)
         })
         .collect();
+    let mut brave_window_counts = HashMap::<u32, usize>::new();
+    for observed in &clients {
+        if is_brave_hypr_client(&observed.client) {
+            *brave_window_counts.entry(observed.client.pid).or_default() += 1;
+        }
+    }
+    for observed in &mut clients {
+        if is_brave_hypr_client(&observed.client)
+            && (observed.profile_directory.is_none()
+                || brave_window_counts
+                    .get(&observed.client.pid)
+                    .copied()
+                    .unwrap_or_default()
+                    > 1)
+        {
+            observed.profile_identity_ambiguous = true;
+        }
+    }
     clients.sort_by(|left, right| left.client.address.cmp(&right.client.address));
     Ok(clients)
 }
@@ -1746,7 +1841,8 @@ fn build_reconcile_dispatch_commands_with_geometry(
         commands.push(format!("pin address:{}", current.address));
     }
     if leaving_fullscreen {
-        commands.push(format!("fullscreenstate 0 0,address:{}", current.address));
+        commands.push(format!("focuswindow address:{}", current.address));
+        commands.push("fullscreenstate 0 0".to_string());
     }
     if workspace_mismatch {
         commands.push(format!(
@@ -1781,9 +1877,10 @@ fn build_reconcile_dispatch_commands_with_geometry(
     }
 
     if entering_or_changing_fullscreen {
+        commands.push(format!("focuswindow address:{}", current.address));
         commands.push(format!(
-            "fullscreenstate {} {},address:{}",
-            target.fullscreen, target.fullscreen, current.address
+            "fullscreenstate {} {}",
+            target.fullscreen, target.fullscreen
         ));
     }
 
@@ -1892,11 +1989,29 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             })
             .collect();
         if !candidates.is_empty() {
+            if client.profile_directory.is_some() && candidates.len() > 1 {
+                return Err(RestoreError::AmbiguousWindow {
+                    class: client.class.clone(),
+                    addresses: candidates
+                        .iter()
+                        .map(|candidate| candidate.address.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
             let candidate_seen_at = first_candidate_at.get_or_insert_with(Instant::now);
             let process_related = launched.pid.is_some()
                 && candidates.iter().any(|candidate| {
                     process_info.is_process_related(launched.pid.unwrap(), candidate.pid)
                 });
+            if launched.pid.is_some() && !process_related {
+                // A same-class window can be opened by the user while the
+                // requested application is starting.  Never move that window
+                // just because it was the only candidate seen during the
+                // settle period; wait for a descendant of the process we
+                // actually launched or fail without changing it.
+                continue;
+            }
             if candidates.len() > 1 && !process_related {
                 return Err(RestoreError::AmbiguousWindow {
                     class: client.class.clone(),
@@ -2185,9 +2300,10 @@ fn build_dispatch_commands_for_monitor(
         cmds.push(format!("togglefloating {addr}"));
     }
     if client.fullscreen > 0 {
+        cmds.push(format!("focuswindow {addr}"));
         cmds.push(format!(
-            "fullscreenstate {} {},{}",
-            client.fullscreen, client.fullscreen, addr
+            "fullscreenstate {} {}",
+            client.fullscreen, client.fullscreen
         ));
     }
     if client.pinned {
@@ -2205,7 +2321,10 @@ mod tests {
     use crate::config::{AppConfig, FilterConfig, GeneralConfig};
     use crate::hyprctl::{HyprClient, HyprMonitor};
     use crate::process::{ChildProcess, ProcessError, ProcessInfoProvider};
-    use crate::session::{BraveProfile, LaunchInfo, Session, SessionClient};
+    use crate::session::{
+        mark_replace_prepared, replace_marker, BraveProfile, LaunchInfo, ReplacePhase, Session,
+        SessionClient,
+    };
     use chrono::Utc;
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -2685,6 +2804,30 @@ mod tests {
         }
     }
 
+    struct FailingCloseHyprctl {
+        client: HyprClient,
+    }
+
+    impl HyprctlClient for FailingCloseHyprctl {
+        fn get_clients(&self) -> Result<Vec<HyprClient>, HyprctlError> {
+            Ok(vec![self.client.clone()])
+        }
+
+        fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError> {
+            Ok(vec![])
+        }
+
+        fn dispatch(&self, _args: &str) -> Result<(), HyprctlError> {
+            Err(HyprctlError::CommandFailed(
+                "close dispatch failed".to_string(),
+            ))
+        }
+
+        fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
+            Ok("0.54.1".to_string())
+        }
+    }
+
     // ── Test: dry-run generates commands without dispatching ─────────────────
 
     #[test]
@@ -3050,10 +3193,13 @@ mod tests {
 
         restore_single_client_with_launcher(&target, &mock, &config, &launcher).unwrap();
 
-        assert!(mock
-            .dispatches()
+        let dispatches = mock.dispatches();
+        assert!(dispatches
             .iter()
-            .any(|dispatch| dispatch == "fullscreenstate 1 1,address:0xnew-fullscreen"));
+            .any(|dispatch| dispatch == "focuswindow address:0xnew-fullscreen"));
+        assert!(dispatches
+            .iter()
+            .any(|dispatch| dispatch == "fullscreenstate 1 1"));
         assert!(!mock
             .dispatches()
             .iter()
@@ -3117,6 +3263,45 @@ mod tests {
             .dispatches()
             .iter()
             .any(|dispatch| dispatch.contains("0xrelated")));
+    }
+
+    #[test]
+    fn test_launch_correlation_does_not_move_unrelated_same_class_window() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.title = "target".to_string();
+        target.monitor.clear();
+        let unrelated =
+            make_reconcile_window("0xunrelated", "kitty", "target", 1, 0, [10, 20], [800, 600]);
+        let mock = MockHyprctl::new(vec![vec![], vec![unrelated]]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.window_detect_timeout_ms = 500;
+        config.general.restore_delay_ms = 0;
+
+        let result = restore_single_client_with_launcher_and_process_info(
+            &target,
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            &launcher,
+            false,
+        );
+
+        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]
@@ -3688,6 +3873,81 @@ mod tests {
     }
 
     #[test]
+    fn test_brave_shared_process_is_not_assumed_to_identify_each_window() {
+        let target = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+        let session = Session {
+            name: "test".to_string(),
+            created_at: Utc::now(),
+            monitors: vec![],
+            hyprland_version: "0.54.1".to_string(),
+            clients: vec![target],
+            brave_profiles: vec![BraveProfile {
+                directory: "Default".to_string(),
+                name: "Personal".to_string(),
+            }],
+        };
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig::default(),
+            apps: HashMap::from([(
+                "brave-browser".to_string(),
+                AppConfig {
+                    binary: Some("brave".to_string()),
+                    capture_cwd: None,
+                    capture_last_command: None,
+                    hint_template: None,
+                    profile_workspaces: None,
+                    default_workspace: Some(1),
+                },
+            )]),
+        };
+        let first = make_reconcile_window(
+            "0xprofile-a",
+            "brave-browser",
+            "Personal",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let second = make_reconcile_window(
+            "0xprofile-b",
+            "brave-browser",
+            "Work",
+            2,
+            0,
+            [900, 0],
+            [800, 600],
+        );
+        let mock = MockHyprctl::new(vec![vec![first, second]]);
+
+        let report = restore_session_with_process_info(
+            &session,
+            &mock,
+            &BraveProfileProcessInfo,
+            &config,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.failed, 0);
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
     fn test_reconcile_does_nothing_when_target_is_already_in_place() {
         let target = make_client(
             "kitty",
@@ -3818,6 +4078,35 @@ mod tests {
 
         assert!(matches!(error, RestoreError::MissingLaunchBinary { .. }));
         assert!(mock.dispatches.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_replace_marker_stays_in_closing_phase_when_first_dispatch_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_replace_prepared("autosave-recovery", dir.path()).unwrap();
+        let error = replace_session_with_marker(
+            &make_session(vec![]),
+            &FailingCloseHyprctl {
+                client: make_reconcile_window("0xold", "kitty", "kitty", 1, 0, [0, 0], [800, 600]),
+            },
+            &EmptyProcessInfo,
+            &Config::default(),
+            ReplaceMarkerContext {
+                dry_run: false,
+                verbose: true,
+                backup_name: "autosave-recovery",
+                sessions_dir: dir.path(),
+            },
+        )
+        .expect_err("the failing close dispatch should abort replacement");
+
+        assert!(matches!(error, RestoreError::Hyprctl(_)));
+        assert_eq!(
+            replace_marker(dir.path())
+                .unwrap()
+                .map(|marker| marker.phase),
+            Some(ReplacePhase::Closing)
+        );
     }
 
     #[test]
@@ -4479,7 +4768,8 @@ mod tests {
 
         let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-1"));
 
-        assert_eq!(commands[0], "fullscreenstate 0 0,address:0xfullscreen");
+        assert_eq!(commands[0], "focuswindow address:0xfullscreen");
+        assert_eq!(commands[1], "fullscreenstate 0 0");
         assert!(commands
             .iter()
             .any(|command| command.contains("resizewindowpixel exact 800 600")));

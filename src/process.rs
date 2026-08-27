@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, thiserror::Error)]
@@ -241,17 +241,22 @@ pub fn profile_directory_from_cmdline(cmdline: &str) -> Option<String> {
 
 /// Search a process and its descendants for an application profile flag.
 /// Chromium puts the profile flag on either the browser process or a helper,
-/// depending on how an existing browser process was reused.
+/// depending on how an existing browser process was reused.  If the tree
+/// advertises more than one profile, the root PID cannot identify a specific
+/// top-level window and the result is intentionally ambiguous.
 pub fn find_profile_directory(
     process_info: &dyn ProcessInfoProvider,
     root_pid: u32,
 ) -> Option<String> {
     let mut queue = VecDeque::from([root_pid]);
     let mut visited = HashSet::from([root_pid]);
+    let mut profiles = HashMap::<String, String>::new();
     while let Some(pid) = queue.pop_front() {
         if let Ok(cmdline) = process_info.get_cmdline(pid) {
             if let Some(profile) = profile_directory_from_cmdline(&cmdline) {
-                return Some(profile);
+                profiles
+                    .entry(profile.to_ascii_lowercase())
+                    .or_insert(profile);
             }
         }
 
@@ -261,14 +266,16 @@ pub fn find_profile_directory(
         children.sort_by_key(|child| child.pid);
         for child in children {
             if let Some(profile) = profile_directory_from_cmdline(&child.cmdline) {
-                return Some(profile);
+                profiles
+                    .entry(profile.to_ascii_lowercase())
+                    .or_insert(profile);
             }
             if visited.insert(child.pid) {
                 queue.push_back(child.pid);
             }
         }
     }
-    None
+    (profiles.len() == 1).then(|| profiles.into_values().next().expect("one profile"))
 }
 
 #[cfg(test)]
@@ -418,5 +425,32 @@ mod tests {
             profile_directory_from_cmdline("brave --profile-directory=Profile 1"),
             Some("Profile 1".to_string())
         );
+    }
+
+    #[test]
+    fn test_profile_detection_rejects_process_trees_with_multiple_profiles() {
+        let mut children = HashMap::new();
+        children.insert(
+            1,
+            vec![ChildProcess {
+                pid: 2,
+                cwd: PathBuf::from("/tmp"),
+                cmdline: "brave --profile-directory=Default".to_string(),
+            }],
+        );
+        children.insert(
+            2,
+            vec![ChildProcess {
+                pid: 3,
+                cwd: PathBuf::from("/tmp"),
+                cmdline: "brave --profile-directory=Profile 1".to_string(),
+            }],
+        );
+        let process_info = MockProcessInfo {
+            cwds: HashMap::new(),
+            children,
+        };
+
+        assert_eq!(find_profile_directory(&process_info, 1), None);
     }
 }

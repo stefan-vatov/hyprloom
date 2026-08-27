@@ -117,6 +117,7 @@ pub struct SessionSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplacePhase {
     Prepared,
+    Closing,
     InProgress,
     Committed,
 }
@@ -125,6 +126,7 @@ pub enum ReplacePhase {
 pub struct ReplaceMarker {
     pub backup_name: String,
     pub phase: ReplacePhase,
+    pub closing_address: Option<String>,
 }
 
 /// Process-wide lock for all CLI operations that can observe or mutate the
@@ -430,6 +432,29 @@ pub fn mark_replace_in_progress(
         &ReplaceMarker {
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::InProgress,
+            closing_address: None,
+        },
+        sessions_dir,
+    )
+}
+
+/// Record the address of the first window whose close dispatch is about to be
+/// sent. Startup can use this evidence to distinguish a marker written just
+/// before a failed dispatch from a replacement that actually started closing
+/// the desktop.
+pub fn mark_replace_closing(
+    backup_name: &str,
+    sessions_dir: &std::path::Path,
+    address: &str,
+) -> Result<(), SessionError> {
+    validate_session_name(backup_name)?;
+    validate_replace_address(address)?;
+    ensure_sessions_dir(sessions_dir)?;
+    write_replace_marker(
+        &ReplaceMarker {
+            backup_name: backup_name.to_string(),
+            phase: ReplacePhase::Closing,
+            closing_address: Some(address.to_string()),
         },
         sessions_dir,
     )
@@ -448,6 +473,7 @@ pub fn mark_replace_prepared(
         &ReplaceMarker {
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::Prepared,
+            closing_address: None,
         },
         sessions_dir,
     )
@@ -463,6 +489,7 @@ pub fn mark_replace_committed(
         &ReplaceMarker {
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::Committed,
+            closing_address: None,
         },
         sessions_dir,
     )
@@ -494,13 +521,30 @@ pub fn replace_marker(
         .to_string();
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default();
-    let (phase, name) = match first {
-        "prepared" => (ReplacePhase::Prepared, lines.next().unwrap_or_default()),
+    let (phase, name, closing_address) = match first {
+        "prepared" => (
+            ReplacePhase::Prepared,
+            lines.next().unwrap_or_default(),
+            None,
+        ),
         // Older builds wrote only the backup name.  Treat that format as an
         // interrupted replacement so upgrading cannot silently skip recovery.
-        "in-progress" => (ReplacePhase::InProgress, lines.next().unwrap_or_default()),
-        "committed" => (ReplacePhase::Committed, lines.next().unwrap_or_default()),
-        legacy_name => (ReplacePhase::InProgress, legacy_name),
+        "closing" => (
+            ReplacePhase::Closing,
+            lines.next().unwrap_or_default(),
+            Some(lines.next().unwrap_or_default().to_string()),
+        ),
+        "in-progress" => (
+            ReplacePhase::InProgress,
+            lines.next().unwrap_or_default(),
+            None,
+        ),
+        "committed" => (
+            ReplacePhase::Committed,
+            lines.next().unwrap_or_default(),
+            None,
+        ),
+        legacy_name => (ReplacePhase::InProgress, legacy_name, None),
     };
     if lines.next().is_some() {
         return Err(SessionError::Io(std::io::Error::new(
@@ -509,9 +553,13 @@ pub fn replace_marker(
         )));
     }
     validate_session_name(name)?;
+    if let Some(address) = &closing_address {
+        validate_replace_address(address)?;
+    }
     Ok(Some(ReplaceMarker {
         backup_name: name.to_string(),
         phase,
+        closing_address,
     }))
 }
 
@@ -525,13 +573,35 @@ fn write_replace_marker(
     marker: &ReplaceMarker,
     sessions_dir: &std::path::Path,
 ) -> Result<(), SessionError> {
-    let phase = match marker.phase {
-        ReplacePhase::Prepared => "prepared",
-        ReplacePhase::InProgress => "in-progress",
-        ReplacePhase::Committed => "committed",
+    let content = match marker.phase {
+        ReplacePhase::Prepared => format!("prepared\n{}", marker.backup_name),
+        ReplacePhase::Closing => {
+            let address = marker.closing_address.as_deref().ok_or_else(|| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "closing replacement marker has no window address",
+                ))
+            })?;
+            validate_replace_address(address)?;
+            format!("closing\n{}\n{address}", marker.backup_name)
+        }
+        ReplacePhase::InProgress => format!("in-progress\n{}", marker.backup_name),
+        ReplacePhase::Committed => format!("committed\n{}", marker.backup_name),
     };
-    let content = format!("{phase}\n{}", marker.backup_name);
     atomic_write(&sessions_dir.join(REPLACE_MARKER_NAME), content.as_bytes())
+}
+
+fn validate_replace_address(address: &str) -> Result<(), SessionError> {
+    if address.is_empty()
+        || address.len() > MAX_SESSION_STRING_BYTES
+        || address.contains(['\r', '\n'])
+    {
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement marker has an invalid window address",
+        )));
+    }
+    Ok(())
 }
 
 pub fn clear_replace_marker(sessions_dir: &std::path::Path) -> Result<(), SessionError> {
@@ -1140,6 +1210,16 @@ mod tests {
             Some(ReplaceMarker {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::Prepared,
+                closing_address: None,
+            })
+        );
+        mark_replace_closing("autosave-recovery", dir.path(), "0xclosing").unwrap();
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::Closing,
+                closing_address: Some("0xclosing".to_string()),
             })
         );
         mark_replace_in_progress("autosave-recovery", dir.path()).unwrap();
@@ -1152,6 +1232,7 @@ mod tests {
             Some(ReplaceMarker {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::InProgress,
+                closing_address: None,
             })
         );
         mark_replace_committed("autosave-recovery", dir.path()).unwrap();
@@ -1160,6 +1241,7 @@ mod tests {
             Some(ReplaceMarker {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::Committed,
+                closing_address: None,
             })
         );
         clear_replace_marker(dir.path()).unwrap();
