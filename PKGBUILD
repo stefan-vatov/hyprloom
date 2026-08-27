@@ -1,6 +1,6 @@
 # Maintainer: Thethracian
 pkgname=hyprloom
-pkgver=0.3.6
+pkgver=0.3.7
 pkgrel=1
 pkgdesc="Save, restore, and reconcile Hyprland window sessions"
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('hyprland')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-_source_digest='3b64b77e8dfd31e37a22c9a9c50a1d6a757682e80028a3c9376d30f5da57b5ad'
+_source_digest='fb84b8268f7a2c5c16024bd1b675a1628df17d701cbfe3dcdb87d6f7eeca95f8'
 sha256sums=("$_source_digest")
 provides=('hyprflow')
 conflicts=('hyprflow')

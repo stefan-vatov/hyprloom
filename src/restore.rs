@@ -1249,6 +1249,23 @@ fn has_ambiguous_generic_chromium_candidate(
         })
 }
 
+fn has_unmatched_same_class_candidate(
+    target: &SessionClient,
+    existing: &[ObservedClient],
+    consumed: &HashSet<String>,
+    config: &Config,
+) -> bool {
+    existing.iter().any(|current| {
+        !consumed.contains(&current.client.address)
+            && !is_ignored_class(&current.client.class, &config.filters.ignore_classes)
+            && !is_ignored_class(
+                &current.client.initial_class,
+                &config.filters.ignore_classes,
+            )
+            && classes_match(target, &current.client)
+    })
+}
+
 fn dispatch_existing_repairs(
     current: &HyprClient,
     commands: &[String],
@@ -1599,6 +1616,19 @@ pub fn replacement_target_is_complete_with_backup(
     config: &Config,
 ) -> Result<bool, RestoreError> {
     if let Some(safety_snapshot) = safety_snapshot {
+        if safety_snapshot.clients.iter().any(|client| {
+            client
+                .address
+                .as_deref()
+                .is_none_or(|address| address.is_empty())
+        }) {
+            // Without an address for every pre-replacement window, absence of
+            // the known addresses cannot prove that the old desktop is gone.
+            // Do not preserve a target-looking window that may still be part
+            // of the safety snapshot; the conservative recovery path below
+            // is the only safe option for legacy/incomplete snapshots.
+            return Ok(false);
+        }
         let saved_addresses: HashSet<&str> = safety_snapshot
             .clients
             .iter()
@@ -1881,6 +1911,26 @@ fn reconcile_session_with_launcher_options(
             report.skipped += 1;
             report.details.push(format!(
                 "SKIP: {} could not be safely matched because generic Chromium window identity is unavailable",
+                target.label
+            ));
+            continue;
+        }
+
+        if !allow_ambiguous_identity
+            && has_unmatched_same_class_candidate(
+                target_client,
+                &observed,
+                &used_current_addresses,
+                config,
+            )
+        {
+            // A conservative safety recovery must not launch a second copy
+            // merely because a formerly captured window was reopened with a
+            // new address and no usable CWD/profile evidence.  Leave the
+            // existing same-class window untouched for the user to resolve.
+            report.skipped += 1;
+            report.details.push(format!(
+                "SKIP: {} could not be safely matched during safety recovery",
                 target.label
             ));
             continue;
@@ -4307,6 +4357,96 @@ mod tests {
 
         assert!(replacement_target_is_complete(
             &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_safe_recovery_does_not_launch_same_class_window_with_stale_address() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xbefore-reopen".to_string());
+
+        let mut reopened = make_reconcile_window(
+            "0xafter-reopen",
+            "kitty",
+            "Project",
+            7,
+            0,
+            [900, 100],
+            [700, 500],
+        );
+        reopened.initial_title = "Project".to_string();
+        let mock = MockHyprctl::new(vec![vec![reopened]]);
+
+        let report = recover_session_safely(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.launched, 0);
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_replacement_completion_rejects_safety_snapshot_without_addresses() {
+        let mut target = make_client(
+            "kitty",
+            2,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xnew-target".to_string());
+
+        let mut legacy_backup = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        legacy_backup.title = "Project".to_string();
+        legacy_backup.initial_title = "Project".to_string();
+        legacy_backup.address = None;
+
+        let current =
+            make_reconcile_window("0xcurrent", "kitty", "Project", 2, 0, [10, 20], [800, 600]);
+        let mock = MockHyprctl::new(vec![vec![current]]);
+
+        assert!(!replacement_target_is_complete_with_backup(
+            &make_session(vec![target]),
+            Some(&make_session(vec![legacy_backup])),
             &mock,
             &EmptyProcessInfo,
             &Config::default(),
