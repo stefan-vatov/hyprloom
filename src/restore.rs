@@ -311,6 +311,14 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if !classes_match(target, current) {
         return None;
     }
+    if is_generic_chromium_client(target) && !same_nonempty(&target.title, &current.title) {
+        // Hyprland reports every ordinary Chromium window with the same
+        // class, and Chromium commonly shares one PID across them.  Its
+        // initial title is often just "Chromium", so class plus initial-title
+        // is not enough to identify a window whose current title differs.
+        // Leave it unmatched rather than moving an unrelated browser tab.
+        return None;
+    }
     if is_brave_client(target)
         && (target.profile_identity_ambiguous || observed.profile_identity_ambiguous)
     {
@@ -474,12 +482,20 @@ fn is_brave_client(client: &SessionClient) -> bool {
     is_brave_class(&client.class) || is_brave_class(&client.initial_class)
 }
 
+fn is_generic_chromium_client(client: &SessionClient) -> bool {
+    is_generic_chromium_class(&client.class) || is_generic_chromium_class(&client.initial_class)
+}
+
 fn is_brave_hypr_client(client: &HyprClient) -> bool {
     is_brave_class(&client.class) || is_brave_class(&client.initial_class)
 }
 
 fn is_brave_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("brave-browser")
+}
+
+fn is_generic_chromium_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("chromium")
 }
 
 fn same_nonempty(left: &str, right: &str) -> bool {
@@ -1675,6 +1691,14 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
 
         let mut used_brave_clients = HashSet::new();
         for profile in &session.brave_profiles {
+            if profile_workspaces
+                .is_some_and(|workspaces| !workspaces.contains_key(&profile.directory))
+            {
+                // An explicit profile map is an allowlist.  Do not resurrect
+                // profiles that capture or a legacy session may contain but
+                // the user intentionally left unmapped.
+                continue;
+            }
             let matching_index = brave_clients
                 .iter()
                 .enumerate()
@@ -2978,6 +3002,37 @@ mod tests {
         let plan = plan_reconciliation(&[target], &[observed]);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].map(|pair| pair.kind), Some(MatchKind::AppIdentity));
+    }
+
+    #[test]
+    fn test_matching_does_not_consume_unrelated_generic_chromium_window() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.title = "ChatGPT".to_string();
+        target.initial_title = "Chromium".to_string();
+
+        let mut current = make_reconcile_window(
+            "0xunrelated",
+            "chromium",
+            "YouTube",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.initial_title = "Chromium".to_string();
+
+        let observed = ObservedClient::from_hypr_client(current, None, None);
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
     }
 
     #[test]
@@ -4654,7 +4709,7 @@ mod tests {
         );
     }
 
-    // ── Test: unmapped profile uses default_workspace fallback ──────────
+    // ── Test: profile without an explicit map uses default_workspace fallback
 
     #[test]
     fn test_restore_brave_profile_uses_default_workspace() {
@@ -4668,6 +4723,59 @@ mod tests {
                 directory: "Profile 9".to_string(),
                 name: "Unmapped".to_string(),
             }],
+        };
+
+        let mut apps = HashMap::new();
+        apps.insert(
+            "brave-browser".to_string(),
+            AppConfig {
+                binary: Some("true".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: Some(3),
+            },
+        );
+
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig {
+                ignore_classes: vec![],
+            },
+            apps,
+        };
+
+        let mock = MockHyprctl::new(vec![]);
+        let report = restore_session(&session, &mock, &config, true, true).unwrap();
+
+        assert_eq!(report.restored, 1);
+        // With no explicit map, use default_workspace=3.
+        assert!(
+            report.details.iter().any(|d| d.contains("ws=3")),
+            "profile should use default_workspace=3; got: {:?}",
+            report.details
+        );
+    }
+
+    #[test]
+    fn test_restore_brave_profile_with_explicit_mapping_skips_unmapped_profile() {
+        let session = Session {
+            name: "test".to_string(),
+            created_at: Utc::now(),
+            hyprland_version: "0.54.1".to_string(),
+            monitors: vec![],
+            clients: vec![],
+            brave_profiles: vec![
+                BraveProfile {
+                    directory: "Default".to_string(),
+                    name: "Mapped".to_string(),
+                },
+                BraveProfile {
+                    directory: "Profile 9".to_string(),
+                    name: "Unmapped".to_string(),
+                },
+            ],
         };
 
         let mut apps = HashMap::new();
@@ -4695,12 +4803,14 @@ mod tests {
         let report = restore_session(&session, &mock, &config, true, true).unwrap();
 
         assert_eq!(report.restored, 1);
-        // Should use default_workspace=3 since "Profile 9" has no mapping
-        assert!(
-            report.details.iter().any(|d| d.contains("ws=3")),
-            "unmapped profile should use default_workspace=3; got: {:?}",
-            report.details
-        );
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("Mapped")));
+        assert!(!report
+            .details
+            .iter()
+            .any(|detail| detail.contains("Unmapped")));
     }
 
     // ── Test: without profiles, brave windows restore individually ───────
