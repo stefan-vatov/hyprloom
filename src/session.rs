@@ -84,6 +84,11 @@ pub struct SessionClient {
     pub pid: Option<u32>,
     #[serde(default)]
     pub process_start_time: Option<u64>,
+    /// Hyprland's stable window identifier, when the compositor provides it.
+    /// Older snapshots omit this field and continue to use the legacy
+    /// identity fallbacks.
+    #[serde(default)]
+    pub stable_id: Option<String>,
     /// Initial Hyprland app identity.  These fields are optional in spirit:
     /// older session files do not contain them and reconciliation falls back
     /// to `class` and `title` when they are empty.
@@ -1108,6 +1113,8 @@ pub struct HyprClient {
     pub address: String,
     pub class: String,
     pub title: String,
+    #[serde(default, rename = "stableId")]
+    pub stable_id: Option<String>,
     #[serde(default, rename = "initialClass")]
     pub initial_class: String,
     #[serde(default, rename = "initialTitle")]
@@ -1170,6 +1177,7 @@ mod tests {
                 address: None,
                 pid: None,
                 process_start_time: None,
+                stable_id: None,
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 4,
@@ -1234,6 +1242,7 @@ mod tests {
                 address: None,
                 pid: None,
                 process_start_time: None,
+                stable_id: None,
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 1,

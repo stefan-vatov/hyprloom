@@ -158,6 +158,7 @@ fn build_session_client(
         address: (!client.address.is_empty()).then(|| client.address.clone()),
         pid: Some(client.pid),
         process_start_time: process_info.get_start_time(client.pid).ok(),
+        stable_id: client.stable_id.clone(),
         initial_class: if client.initial_class.is_empty() {
             client.class.clone()
         } else {
@@ -727,6 +728,7 @@ mod tests {
             address: "0xdeadbeef".to_string(),
             class: class.to_string(),
             title: format!("{class} window"),
+            stable_id: None,
             initial_class: class.to_string(),
             initial_title: class.to_string(),
             workspace: RawWorkspace {

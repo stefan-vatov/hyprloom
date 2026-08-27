@@ -26,6 +26,8 @@ pub enum RestoreError {
     UncorrelatedWindow { class: String },
     #[error("window {address} disappeared before reconciliation completed")]
     WindowDisappeared { address: String },
+    #[error("window {address} changed before reconciliation completed")]
+    WindowIdentityChanged { address: String },
     #[error("launch command '{command}' for {target} is not authorized by app identity or config")]
     UntrustedLaunch { target: String, command: String },
     #[error("binary '{command}' for {target} was not found")]
@@ -363,12 +365,26 @@ fn match_score_with_policy(
         (Some(target_profile), Some(current_profile))
             if same_nonempty(target_profile, current_profile)
     );
-    if saved_address_matches && process_identity_matches(target, observed) == Some(false) {
-        // Hyprland can recycle an address after a window closes.  Treat the
-        // address as exact only while its captured process identity still
-        // agrees; otherwise a repair could move an unrelated same-class
-        // browser or terminal window.
-        return None;
+    if saved_address_matches {
+        match exact_window_identity_matches(target, observed) {
+            Some(false) => {
+                // Hyprland can recycle an address after a window closes.
+                // Never let a positively different identity inherit the old
+                // window's placement.
+                return None;
+            }
+            Some(true) => {}
+            None if target_has_identity_evidence(target) => {
+                // A partial identity is not proof that an address still
+                // belongs to the captured window.  Launch a replacement
+                // rather than risk moving an unrelated same-class window.
+                return None;
+            }
+            None => {
+                // Legacy snapshots without any identity metadata retain the
+                // historical address behavior.
+            }
+        }
     }
     if is_generic_chromium_client(target)
         && !generic_chromium_identity_matches_with_policy(target, current, policy)
@@ -555,9 +571,50 @@ fn process_identity_matches(target: &SessionClient, observed: &ObservedClient) -
     }
     match (target.process_start_time, observed.process_start_time) {
         (Some(saved), Some(current)) => Some(saved == current),
-        (Some(_), None) => None,
-        (None, _) => Some(true),
+        // A PID without a start-time match is not sufficient: the PID may
+        // have been reused, or the provider may simply have returned partial
+        // metadata.  The caller may still use a matching stable window ID.
+        (Some(_), None) | (None, _) => None,
     }
+}
+
+fn stable_identity_matches(target: &SessionClient, observed: &ObservedClient) -> Option<bool> {
+    let saved_stable_id = target.stable_id.as_deref().filter(|id| !id.is_empty());
+    let current_stable_id = observed
+        .client
+        .stable_id
+        .as_deref()
+        .filter(|id| !id.is_empty());
+    match (saved_stable_id, current_stable_id) {
+        (Some(saved), Some(current)) => Some(saved.eq_ignore_ascii_case(current)),
+        _ => None,
+    }
+}
+
+fn exact_window_identity_matches(
+    target: &SessionClient,
+    observed: &ObservedClient,
+) -> Option<bool> {
+    // A captured stable ID is window-specific even when several windows
+    // share one browser PID.  If the current compositor does not expose it,
+    // do not silently downgrade that snapshot to weaker process evidence.
+    if target
+        .stable_id
+        .as_deref()
+        .is_some_and(|stable_id| !stable_id.is_empty())
+    {
+        return stable_identity_matches(target, observed);
+    }
+    process_identity_matches(target, observed)
+}
+
+fn target_has_identity_evidence(target: &SessionClient) -> bool {
+    target.pid.is_some()
+        || target.process_start_time.is_some()
+        || target
+            .stable_id
+            .as_deref()
+            .is_some_and(|stable_id| !stable_id.is_empty())
 }
 
 fn replacement_safety_identity_matches(
@@ -567,7 +624,7 @@ fn replacement_safety_identity_matches(
     if !classes_match(safety_client, &observed.client) {
         return false;
     }
-    if process_identity_matches(safety_client, observed) == Some(true) {
+    if exact_window_identity_matches(safety_client, observed) == Some(true) {
         return true;
     }
 
@@ -958,7 +1015,7 @@ fn restore_session_with_process_info(
                     }
                     report.restored += 1;
                 } else {
-                    match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
+                    match dispatch_existing_repairs(&current, &commands, hyprctl, process_info) {
                         Ok(()) => {
                             report.restored += 1;
                             if verbose {
@@ -1126,7 +1183,7 @@ fn restore_session_with_process_info(
                     ));
                     report.skipped += 1;
                 } else {
-                    match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
+                    match dispatch_existing_repairs(&current, &commands, hyprctl, process_info) {
                         Ok(()) => {
                             report.restored += 1;
                             if verbose {
@@ -1344,17 +1401,71 @@ fn has_unmatched_same_class_candidate(
 }
 
 fn dispatch_existing_repairs(
-    current: &HyprClient,
+    expected: &ObservedClient,
     commands: &[String],
     hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
 ) -> Result<(), RestoreError> {
-    if !window_is_present(&current.address, hyprctl)? {
+    let address = &expected.client.address;
+    let Some(current) = hyprctl
+        .get_clients()?
+        .into_iter()
+        .find(|client| client.address == *address)
+    else {
         return Err(RestoreError::WindowDisappeared {
-            address: current.address.clone(),
+            address: address.clone(),
+        });
+    };
+    if !observed_window_identity_matches(expected, &current, process_info) {
+        return Err(RestoreError::WindowIdentityChanged {
+            address: address.clone(),
         });
     }
     hyprctl.dispatch_batch(commands)?;
     Ok(())
+}
+
+/// Revalidate the window identity immediately before dispatching address-based
+/// commands.  Hyprland's address is the dispatch handle, but it can be
+/// recycled after a window closes; stable ID, PID, and process start time
+/// catch that replacement before a repair is applied to the wrong window.
+fn observed_window_identity_matches(
+    expected: &ObservedClient,
+    current: &HyprClient,
+    process_info: &dyn ProcessInfoProvider,
+) -> bool {
+    if expected.client.address != current.address {
+        return false;
+    }
+    match (
+        expected
+            .client
+            .stable_id
+            .as_deref()
+            .filter(|id| !id.is_empty()),
+        current.stable_id.as_deref().filter(|id| !id.is_empty()),
+    ) {
+        (Some(expected), Some(current)) if !expected.eq_ignore_ascii_case(current) => {
+            return false;
+        }
+        // If the selected window had a stable ID but the immediate re-query
+        // does not, the query is not strong enough to prove identity.
+        (Some(_), None) => return false,
+        _ => {}
+    }
+    if expected.client.pid != current.pid {
+        return false;
+    }
+    match expected.process_start_time {
+        Some(expected_start) => process_info
+            .get_start_time(current.pid)
+            .ok()
+            .is_some_and(|current_start| current_start == expected_start),
+        // PID equality is the best available fallback on older Hyprland
+        // versions or providers without process start-time support.  A
+        // window-specific stable ID, when available, was already checked.
+        None => true,
+    }
 }
 
 /// Validate every executable that a replacement will need before any current
@@ -1978,7 +2089,7 @@ fn reconcile_session_with_launcher_options(
                 continue;
             }
 
-            match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
+            match dispatch_existing_repairs(&current, &commands, hyprctl, process_info) {
                 Ok(()) => {
                     report.moved += 1;
                     if verbose {
@@ -2318,6 +2429,7 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                     address: None,
                     pid: None,
                     process_start_time: None,
+                    stable_id: None,
                     initial_class: "brave-browser".to_string(),
                     initial_title: "Brave".to_string(),
                     workspace: default_workspace,
@@ -2451,13 +2563,6 @@ fn observe_clients_with_monitors(
     }
     clients.sort_by(|left, right| left.client.address.cmp(&right.client.address));
     Ok(clients)
-}
-
-fn window_is_present(address: &str, hyprctl: &dyn HyprctlClient) -> Result<bool, RestoreError> {
-    Ok(hyprctl
-        .get_clients()?
-        .into_iter()
-        .any(|client| client.address == address))
 }
 
 fn observe_cwd(client: &HyprClient, process_info: &dyn ProcessInfoProvider) -> Option<PathBuf> {
@@ -2990,12 +3095,9 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             .unwrap_or(0);
         commands.splice(insertion..insertion, monitor_commands);
     }
-    if !window_is_present(&new_window.address, hyprctl)? {
-        return Err(RestoreError::WindowDisappeared {
-            address: new_window.address.clone(),
-        });
-    }
-    hyprctl.dispatch_batch(&commands)?;
+    let mut expected_window = ObservedClient::from_hypr_client(new_window.clone(), None, None);
+    expected_window.process_start_time = process_info.get_start_time(new_window.pid).ok();
+    dispatch_existing_repairs(&expected_window, &commands, hyprctl, process_info)?;
 
     // 7. Throttle subsequent launches to give the compositor time to settle.
     thread::sleep(Duration::from_millis(
@@ -3435,6 +3537,7 @@ mod tests {
             address: None,
             pid: None,
             process_start_time: None,
+            stable_id: None,
             initial_class: class.to_string(),
             initial_title: class.to_string(),
             workspace,
@@ -3680,6 +3783,96 @@ mod tests {
         observed.process_start_time = Some(20);
 
         assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
+    fn test_matching_rejects_address_when_process_identity_is_partial() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xreused".to_string());
+        target.pid = Some(1000);
+        // A capture that obtained a PID but not its start time has only
+        // partial process identity and must not trust an exact address.
+        target.process_start_time = None;
+
+        let mut current =
+            make_reconcile_window("0xreused", "kitty", "Project", 1, 0, [10, 20], [800, 600]);
+        current.pid = 1000;
+        let mut observed = ObservedClient::from_hypr_client(current, None, None);
+        observed.process_start_time = Some(20);
+
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
+    fn test_matching_rejects_reused_address_with_same_process_identity_but_new_stable_id() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.address = Some("0xreused".to_string());
+        target.pid = Some(1000);
+        target.process_start_time = Some(20);
+        target.stable_id = Some("0xwindow-a".to_string());
+
+        let mut current = make_reconcile_window(
+            "0xreused",
+            "chromium",
+            "New tab",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.pid = 1000;
+        current.stable_id = Some("0xwindow-b".to_string());
+        let mut observed = ObservedClient::from_hypr_client(current, None, None);
+        observed.process_start_time = Some(20);
+
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
+    fn test_dispatch_revalidates_window_identity_before_repair() {
+        let mut expected_client =
+            make_reconcile_window("0xreused", "chromium", "Old tab", 1, 0, [0, 0], [800, 600]);
+        expected_client.stable_id = Some("0xwindow-a".to_string());
+        let expected = ObservedClient::from_hypr_client(expected_client, None, None);
+
+        let mut reused =
+            make_reconcile_window("0xreused", "chromium", "New tab", 1, 0, [0, 0], [800, 600]);
+        reused.stable_id = Some("0xwindow-b".to_string());
+        let mock = MockHyprctl::new(vec![vec![reused]]);
+        let result = dispatch_existing_repairs(
+            &expected,
+            &["focuswindow address:0xreused".to_string()],
+            &mock,
+            &EmptyProcessInfo,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RestoreError::WindowIdentityChanged { address }) if address == "0xreused"
+        ));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]
@@ -4095,6 +4288,7 @@ mod tests {
             floating: false,
             fullscreen: 0,
             pinned: false,
+            stable_id: None,
             focus_history_id: 0,
             pid: 1000,
         }
@@ -5626,6 +5820,7 @@ mod tests {
             floating: false,
             fullscreen: 0,
             pinned: false,
+            stable_id: None,
             focus_history_id: 0,
             pid: 9999,
         };
@@ -5685,6 +5880,7 @@ mod tests {
             floating: false,
             fullscreen: 0,
             pinned: false,
+            stable_id: None,
             focus_history_id: 0,
             pid: 9999,
         };
@@ -5738,6 +5934,7 @@ mod tests {
                 floating: false,
                 fullscreen: 0,
                 pinned: false,
+                stable_id: None,
                 focus_history_id: 0,
                 pid: 1001,
             },
@@ -5757,6 +5954,7 @@ mod tests {
                 floating: false,
                 fullscreen: 0,
                 pinned: false,
+                stable_id: None,
                 focus_history_id: 0,
                 pid: 1002,
             },

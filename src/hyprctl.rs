@@ -17,6 +17,10 @@ pub struct HyprClient {
     pub address: String,
     pub class: String,
     pub title: String,
+    /// Hyprland's stable window identifier.  Unlike `address`, it is not
+    /// recycled when a different window is created at the same address.
+    #[serde(default, rename = "stableId")]
+    pub stable_id: Option<String>,
     /// The app identity reported when the window was first created.  Unlike
     /// `class`/`title`, these values stay useful when an app changes its
     /// title or class after launch.
