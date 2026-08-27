@@ -125,6 +125,8 @@ pub enum SessionError {
     InvalidName(String),
     #[error("unsafe session path for '{0}'")]
     UnsafePath(String),
+    #[error("session file '{requested}' contains payload for '{actual}'")]
+    NameMismatch { requested: String, actual: String },
     #[error("session data exceeds safety limits: {0}")]
     TooLarge(String),
 }
@@ -220,6 +222,11 @@ pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), Sessio
     ensure_sessions_dir(sessions_dir)?;
     let path = sessions_dir.join(format!("{}.json", session.name));
     let json = serde_json::to_string_pretty(session)?;
+    if json.len() as u64 > MAX_SESSION_FILE_BYTES {
+        return Err(SessionError::TooLarge(format!(
+            "serialized session is larger than {MAX_SESSION_FILE_BYTES} bytes"
+        )));
+    }
     atomic_write(&path, json.as_bytes())?;
     Ok(())
 }
@@ -270,6 +277,12 @@ pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionE
     let content = read_limited_file(&path, name)?;
     let session = serde_json::from_slice(&content)?;
     validate_session_structure(&session)?;
+    if session.name != name {
+        return Err(SessionError::NameMismatch {
+            requested: name.to_string(),
+            actual: session.name,
+        });
+    }
     Ok(session)
 }
 
@@ -421,6 +434,12 @@ pub fn migrate_legacy_sessions(
             let content = read_limited_file(&source, name)?;
             let session: Session = serde_json::from_slice(&content)?;
             validate_session_structure(&session)?;
+            if session.name != name {
+                // Never copy a payload under a filename that names a
+                // different session.  This also keeps a later load from
+                // interpreting the migrated file as the requested preset.
+                continue;
+            }
             atomic_write(&destination, &content)?;
             copied += 1;
         }
@@ -1400,6 +1419,30 @@ mod tests {
         let sessions = list_sessions(dir.path()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "target");
+        assert!(matches!(
+            load_session("autosave-old", dir.path()),
+            Err(SessionError::NameMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn test_save_rejects_serialized_session_over_file_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = make_test_session("large");
+        let mut session = base.clone();
+        session.clients = (0..300)
+            .map(|_| {
+                let mut client = base.clients[0].clone();
+                client.title = "x".repeat(MAX_SESSION_STRING_BYTES);
+                client
+            })
+            .collect();
+
+        assert!(matches!(
+            save_session(&session, dir.path()),
+            Err(SessionError::TooLarge(_))
+        ));
+        assert!(!dir.path().join("large.json").exists());
     }
 
     #[test]

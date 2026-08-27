@@ -328,23 +328,34 @@ struct DesktopLaunch {
     args: Vec<String>,
 }
 
-const OMARCHY_WEBAPP_LAUNCHERS: [&str; 2] =
-    ["omarchy-launch-or-focus-webapp", "omarchy-launch-or-focus"];
+const OMARCHY_WEBAPP_LAUNCHERS: [&str; 3] = [
+    "omarchy-launch-or-focus-webapp",
+    "omarchy-launch-or-focus",
+    "omarchy-launch-webapp",
+];
 
 fn find_webapp_launch_info(client: &crate::hyprctl::HyprClient) -> Option<LaunchInfo> {
-    let identities = [client.class.as_str(), client.initial_class.as_str()];
+    discover_webapp_launch_info(&client.class, &client.initial_class)
+}
+
+/// Find the launcher recorded by Omarchy for a Chrome web-app class.  This is
+/// also used while restoring older snapshots whose launch command predates
+/// web-app desktop-entry discovery.
+pub fn discover_webapp_launch_info(class: &str, initial_class: &str) -> Option<LaunchInfo> {
+    let identities = [class, initial_class];
     if !identities.iter().any(|class| is_webapp_class(class)) {
         return None;
     }
 
-    find_webapp_launch_info_in_directories(client, &desktop_application_directories())
+    find_webapp_launch_info_in_directories(class, initial_class, &desktop_application_directories())
 }
 
 fn find_webapp_launch_info_in_directories(
-    client: &crate::hyprctl::HyprClient,
+    class: &str,
+    initial_class: &str,
     directories: &[PathBuf],
 ) -> Option<LaunchInfo> {
-    let identities = [client.class.as_str(), client.initial_class.as_str()];
+    let identities = [class, initial_class];
     for directory in directories {
         let entries = match std::fs::read_dir(directory) {
             Ok(entries) => entries,
@@ -440,6 +451,36 @@ fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<Desk
                 .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(argument))
         })
         .unwrap_or(false);
+    let url_argument_matches = if command.eq_ignore_ascii_case("omarchy-launch-webapp") {
+        tokens
+            .get(1)
+            .map(|url| {
+                identities
+                    .iter()
+                    .any(|identity| webapp_class_matches_url(identity, url))
+            })
+            .unwrap_or(false)
+    } else if command.eq_ignore_ascii_case("omarchy-launch-or-focus-webapp") {
+        tokens
+            .get(2)
+            .map(|url| {
+                identities
+                    .iter()
+                    .any(|identity| webapp_class_matches_url(identity, url))
+            })
+            .unwrap_or(false)
+    } else {
+        tokens
+            .get(2)
+            .and_then(|nested| nested.strip_prefix("omarchy-launch-webapp "))
+            .and_then(|nested| nested.split_whitespace().next())
+            .map(|url| {
+                identities
+                    .iter()
+                    .any(|identity| webapp_class_matches_url(identity, url))
+            })
+            .unwrap_or(false)
+    };
     let startup_class_matches = startup_class
         .map(|startup| {
             identities
@@ -447,7 +488,12 @@ fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<Desk
                 .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(startup))
         })
         .unwrap_or(false);
-    if !class_argument_matches && !startup_class_matches {
+    let matches = if command.eq_ignore_ascii_case("omarchy-launch-webapp") {
+        url_argument_matches
+    } else {
+        (class_argument_matches || startup_class_matches) && url_argument_matches
+    };
+    if !matches {
         return None;
     }
 
@@ -507,6 +553,40 @@ fn is_webapp_class(class: &str) -> bool {
         .get(.."chrome-".len())
         .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
         .unwrap_or(false)
+}
+
+pub(crate) fn webapp_class_matches_url(class: &str, url: &str) -> bool {
+    let Some(prefix) = class.get(.."chrome-".len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("chrome-") {
+        return false;
+    }
+    let Some(class_host) = class["chrome-".len()..].split("__").next() else {
+        return false;
+    };
+    if class_host.is_empty() {
+        return false;
+    }
+    let Some(url_host) = webapp_url_host(url) else {
+        return false;
+    };
+    class_host.eq_ignore_ascii_case(url_host)
+}
+
+fn webapp_url_host(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")?;
+    let scheme = &url[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority = &url[scheme_end + 3..];
+    let authority = authority
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|authority| !authority.is_empty())?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty()).then_some(host)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -823,6 +903,17 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_standard_omarchy_webapp_desktop_entry() {
+        let contents = "[Desktop Entry]\nExec=omarchy-launch-webapp https://chatgpt.com/\n";
+
+        let launch = parse_webapp_desktop_file(contents, &["chrome-chatgpt.com__-Default", ""])
+            .expect("standard direct webapp entry should be recognized");
+
+        assert_eq!(launch.command, "omarchy-launch-webapp");
+        assert_eq!(launch.args, vec!["https://chatgpt.com/"]);
+    }
+
+    #[test]
     fn test_find_webapp_launch_info_uses_matching_desktop_entry() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -832,9 +923,12 @@ mod tests {
         .unwrap();
         let client = make_hypr_client("chrome-chatgpt.com__-Default", 3003);
 
-        let launch =
-            find_webapp_launch_info_in_directories(&client, &[directory.path().to_path_buf()])
-                .expect("matching webapp desktop entry should be found");
+        let launch = find_webapp_launch_info_in_directories(
+            &client.class,
+            &client.initial_class,
+            &[directory.path().to_path_buf()],
+        )
+        .expect("matching webapp desktop entry should be found");
 
         assert_eq!(launch.command, "omarchy-launch-or-focus-webapp");
         assert_eq!(

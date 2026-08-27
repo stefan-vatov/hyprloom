@@ -437,8 +437,7 @@ fn strong_identity_conflict(target: &SessionClient, observed: &ObservedClient) -
 /// was restored.  This predicate is used only by that conservative pass.
 fn ambiguous_title_identity(target: &SessionClient, observed: &ObservedClient) -> bool {
     let current = &observed.client;
-    !is_ghostty_class(target)
-        && target.profile_directory.is_none()
+    target.profile_directory.is_none()
         && launch_cwd(target).is_none()
         && same_nonempty(&target.initial_title, &current.initial_title)
         && !target.title.is_empty()
@@ -607,10 +606,12 @@ fn restore_session_with_process_info(
                 }
                 continue;
             }
-            let target_monitor = find_monitor_by_name(&current_monitors, &client.monitor);
+            let target_client = hydrate_webapp_launch(client, config);
+            let target_monitor = find_monitor_by_name(&current_monitors, &target_client.monitor);
             let target_monitor_available =
-                target_monitor_is_available(&current_monitors, &client.monitor);
-            let restore_client = adapt_client_geometry(client, &session.monitors, target_monitor);
+                target_monitor_is_available(&current_monitors, &target_client.monitor);
+            let restore_client =
+                adapt_client_geometry(&target_client, &session.monitors, target_monitor);
 
             // An existing target is repaired in place, even when it is on a
             // different workspace or monitor.  This keeps the legacy command
@@ -625,9 +626,12 @@ fn restore_session_with_process_info(
                     limit: MAX_RECONCILIATION_WINDOWS,
                 });
             }
-            if let Some(existing_index) =
-                find_existing_restore_match(client, &current_existing, &consumed_existing, config)
-            {
+            if let Some(existing_index) = find_existing_restore_match(
+                &target_client,
+                &current_existing,
+                &consumed_existing,
+                config,
+            ) {
                 let current = current_existing[existing_index].clone();
                 consumed_existing.insert(current.client.address.clone());
                 let commands = build_reconcile_dispatch_commands_with_geometry(
@@ -643,13 +647,13 @@ fn restore_session_with_process_info(
                         "{}: {} already on ws={}",
                         if dry_run { "[dry-run]" } else { "SKIP" },
                         current.client.class,
-                        client.workspace
+                        target_client.workspace
                     ));
                     report.skipped += 1;
                 } else if dry_run {
                     report.details.push(format!(
                         "[dry-run] repair {} at address {}",
-                        client.class, current.client.address
+                        target_client.class, current.client.address
                     ));
                     for command in &commands {
                         report.details.push(format!("  hyprctl dispatch {command}"));
@@ -662,7 +666,7 @@ fn restore_session_with_process_info(
                             if verbose {
                                 report.details.push(format!(
                                     "OK: repaired {} at address {}",
-                                    client.class, current.client.address
+                                    target_client.class, current.client.address
                                 ));
                             }
                         }
@@ -670,7 +674,7 @@ fn restore_session_with_process_info(
                             report.failed += 1;
                             report.details.push(format!(
                                 "FAIL: {} at address {} — {error}",
-                                client.class, current.client.address
+                                target_client.class, current.client.address
                             ));
                         }
                     }
@@ -683,15 +687,15 @@ fn restore_session_with_process_info(
                 if !launch_command_is_trusted(&restore_client, config) {
                     report.details.push(format!(
                         "[dry-run] FAIL: launch command '{}' for {} is not authorized by app identity or config",
-                        launch_command[0], client.class
+                        launch_command[0], target_client.class
                     ));
                     report.failed += 1;
                     continue;
                 }
-                if resolve_launch_binary(&launch_command[0], &client.class).is_err() {
+                if resolve_launch_binary(&launch_command[0], &target_client.class).is_err() {
                     report.details.push(format!(
                         "[dry-run] FAIL: binary '{}' not found for {}",
-                        launch_command[0], client.class
+                        launch_command[0], target_client.class
                     ));
                     report.failed += 1;
                     continue;
@@ -700,7 +704,7 @@ fn restore_session_with_process_info(
                     build_dispatch_commands_for_monitor(&restore_client, target_monitor_available);
                 report.details.push(format!(
                     "[dry-run] ws={} {} → {}",
-                    ws, client.class, client.launch.command
+                    ws, target_client.class, target_client.launch.command
                 ));
                 for cmd in &cmds {
                     report.details.push(format!("  hyprctl dispatch {cmd}"));
@@ -714,15 +718,15 @@ fn restore_session_with_process_info(
             if !launch_command_is_trusted(&restore_client, config) {
                 report.details.push(format!(
                     "FAIL: launch command '{}' for {} is not authorized by app identity or config",
-                    launch_command[0], client.class
+                    launch_command[0], target_client.class
                 ));
                 report.failed += 1;
                 continue;
             }
-            if resolve_launch_binary(&launch_command[0], &client.class).is_err() {
+            if resolve_launch_binary(&launch_command[0], &target_client.class).is_err() {
                 report.details.push(format!(
                     "FAIL: binary '{}' not found for {}",
-                    launch_command[0], client.class
+                    launch_command[0], target_client.class
                 ));
                 report.failed += 1;
                 continue;
@@ -1633,10 +1637,12 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                 && !is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
         })
         .filter(|client| !(has_brave_profiles && is_brave_client(client)))
-        .cloned()
-        .map(|client| ReconcileTarget {
-            label: format!("{} '{}'", client.class, client.title),
-            client,
+        .map(|client| {
+            let client = hydrate_webapp_launch(client, config);
+            ReconcileTarget {
+                label: format!("{} '{}'", client.class, client.title),
+                client,
+            }
         })
         .collect();
 
@@ -1743,6 +1749,32 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
             .then(left.label.cmp(&right.label))
     });
     targets
+}
+
+fn hydrate_webapp_launch(client: &SessionClient, config: &Config) -> SessionClient {
+    let mut hydrated = client.clone();
+    if !is_webapp_class(&hydrated)
+        || app_config_for(config, &hydrated.class, &hydrated.initial_class)
+            .and_then(|app| app.binary.as_ref())
+            .is_some()
+    {
+        return hydrated;
+    }
+
+    let command_is_legacy = hydrated.launch.command.is_empty()
+        || [hydrated.class.as_str(), hydrated.initial_class.as_str()]
+            .iter()
+            .any(|identity| {
+                !identity.is_empty() && identity.eq_ignore_ascii_case(&hydrated.launch.command)
+            });
+    if command_is_legacy {
+        if let Some(launch) =
+            crate::capture::discover_webapp_launch_info(&hydrated.class, &hydrated.initial_class)
+        {
+            hydrated.launch = launch;
+        }
+    }
+    hydrated
 }
 
 fn observe_clients_with_monitors(
@@ -2296,14 +2328,26 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
                     })
                     .count()
                     == 1;
-            if launched.pid.is_some() && !process_related && !profile_confirmed_browser_reuse {
+            let webapp_browser_reuse = is_webapp_class(client)
+                && candidates.len() == 1
+                && before_pids.contains(&candidates[0].pid);
+            if launched.pid.is_some()
+                && !process_related
+                && !profile_confirmed_browser_reuse
+                && !webapp_browser_reuse
+            {
                 // A same-class window can be opened by the user while the
                 // requested application is starting.  Never move that window
                 // just because it was the only candidate seen during the
                 // settle period; wait for a descendant of the process we
                 // actually launched or fail without changing it.  An already
                 // running Brave process is accepted only when the candidate's
-                // profile was positively identified.
+                // profile was positively identified.  Omarchy web apps are a
+                // second intentional exception: Chromium creates their new
+                // windows inside its already-running browser PID, so the
+                // launcher PID cannot be related to the window.  The class,
+                // new address, and single-candidate requirement still prevent
+                // an existing window from being moved accidentally.
                 continue;
             }
             if candidates.len() > 1 && !process_related {
@@ -2571,22 +2615,11 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
 
     // Omarchy Chrome web apps are represented by classes such as
     // `chrome-chatgpt.com__-Default`, while their executable is the
-    // user-facing launcher stored in the matching .desktop entry.
-    if is_webapp_class(client)
-        && ["omarchy-launch-or-focus-webapp", "omarchy-launch-or-focus"]
-            .iter()
-            .any(|launcher| launcher.eq_ignore_ascii_case(&command))
-    {
-        return client
-            .launch
-            .args
-            .first()
-            .map(|class| {
-                [client.class.as_str(), client.initial_class.as_str()]
-                    .iter()
-                    .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(class))
-            })
-            .unwrap_or(false);
+    // user-facing launcher stored in the matching .desktop entry.  The
+    // focus wrappers use eval internally, so validate their complete argv
+    // before allowing a saved session to run them automatically.
+    if is_webapp_class(client) {
+        return webapp_launch_is_trusted(client, &command);
     }
 
     [client.class.as_str(), client.initial_class.as_str()]
@@ -2639,6 +2672,74 @@ fn is_webapp_class(client: &SessionClient) -> bool {
                 .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
                 .unwrap_or(false)
         })
+}
+
+fn webapp_launch_is_trusted(client: &SessionClient, command: &str) -> bool {
+    let identities = [client.class.as_str(), client.initial_class.as_str()];
+    if command.eq_ignore_ascii_case("omarchy-launch-webapp") {
+        return client.launch.args.first().is_some_and(|url| {
+            identities
+                .iter()
+                .any(|identity| crate::capture::webapp_class_matches_url(identity, url))
+                && client
+                    .launch
+                    .args
+                    .iter()
+                    .all(|argument| !contains_shell_metacharacter(argument))
+        });
+    }
+
+    let Some(class_argument) = client.launch.args.first() else {
+        return false;
+    };
+    let class_matches = identities
+        .iter()
+        .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(class_argument));
+    if !class_matches || contains_shell_metacharacter_or_quote(class_argument) {
+        return false;
+    }
+
+    if command.eq_ignore_ascii_case("omarchy-launch-or-focus-webapp") {
+        return client.launch.args.get(1).is_some_and(|url| {
+            identities
+                .iter()
+                .any(|identity| crate::capture::webapp_class_matches_url(identity, url))
+                && client.launch.args[1..]
+                    .iter()
+                    .all(|argument| !contains_shell_metacharacter(argument))
+        });
+    }
+
+    if command.eq_ignore_ascii_case("omarchy-launch-or-focus") {
+        let Some(nested) = client.launch.args.get(1) else {
+            return false;
+        };
+        let Some(nested_args) = nested.strip_prefix("omarchy-launch-webapp ") else {
+            return false;
+        };
+        let Some(url) = nested_args.split_whitespace().next() else {
+            return false;
+        };
+        return identities
+            .iter()
+            .any(|identity| crate::capture::webapp_class_matches_url(identity, url))
+            && !contains_shell_metacharacter(nested);
+    }
+
+    false
+}
+
+fn contains_shell_metacharacter(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            ';' | '&' | '|' | '$' | '`' | '(' | ')' | '<' | '>' | '\\' | '\n' | '\r'
+        )
+    })
+}
+
+fn contains_shell_metacharacter_or_quote(value: &str) -> bool {
+    contains_shell_metacharacter(value) || value.contains(['\'', '"'])
 }
 
 /// Build the list of `hyprctl dispatch` argument strings that would be
@@ -2905,6 +3006,44 @@ mod tests {
             [800, 600],
         );
         current.initial_title = "Example App".to_string();
+        let mock = MockHyprctl::new(vec![vec![current]]);
+
+        assert!(!replacement_target_is_complete(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_replacement_target_does_not_accept_ambiguous_ghostty_title_match() {
+        let mut target = make_client(
+            "com.mitchellh.ghostty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "ghostty",
+            vec![],
+            None,
+        );
+        target.initial_title = "Ghostty".to_string();
+        target.title = "Project A".to_string();
+
+        let mut current = make_reconcile_window(
+            "0xextra-ghostty",
+            "ghostty",
+            "Project B",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.initial_class = "com.mitchellh.ghostty".to_string();
+        current.initial_title = "Ghostty".to_string();
         let mock = MockHyprctl::new(vec![vec![current]]);
 
         assert!(!replacement_target_is_complete(
@@ -4968,6 +5107,63 @@ mod tests {
     }
 
     #[test]
+    fn test_webapp_launch_accepts_window_from_existing_chromium_pid() {
+        let target = make_client(
+            "chrome-chatgpt.com__-Default",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "omarchy-launch-webapp",
+            vec!["https://chatgpt.com/".to_string()],
+            None,
+        );
+        let existing = make_reconcile_window(
+            "0xexisting",
+            "chrome-other.com__-Default",
+            "Other app",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut new_window = make_reconcile_window(
+            "0xnew",
+            "chrome-chatgpt.com__-Default",
+            "ChatGPT",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        new_window.pid = existing.pid;
+        let mock = MockHyprctl::new(vec![vec![existing.clone()], vec![existing, new_window]]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        let restored = restore_single_client_with_launcher_and_process_info_with_address(
+            &target,
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            &launcher,
+            true,
+        )
+        .expect("a new web-app window in the shared Chromium PID is safe");
+
+        assert_eq!(restored.address, "0xnew");
+        assert!(mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch.contains("0xnew")));
+    }
+
+    #[test]
     fn test_brave_launch_rejects_reused_pid_with_multiple_existing_windows() {
         let mut target = make_client(
             "brave-browser",
@@ -5666,6 +5862,43 @@ mod tests {
         );
 
         assert!(launch_command_is_trusted(&client, &Config::default()));
+    }
+
+    #[test]
+    fn test_standard_omarchy_webapp_launcher_is_trusted_for_matching_url() {
+        let client = make_client(
+            "chrome-chatgpt.com__-Default",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "omarchy-launch-webapp",
+            vec!["https://chatgpt.com/".to_string()],
+            None,
+        );
+
+        assert!(launch_command_is_trusted(&client, &Config::default()));
+    }
+
+    #[test]
+    fn test_omarchy_webapp_focus_launcher_rejects_shell_text() {
+        let client = make_client(
+            "chrome-chatgpt.com__-Default",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "omarchy-launch-or-focus",
+            vec![
+                "chrome-chatgpt.com__-Default".to_string(),
+                "omarchy-launch-webapp https://chatgpt.com/; touch /tmp/proof".to_string(),
+            ],
+            None,
+        );
+
+        assert!(!launch_command_is_trusted(&client, &Config::default()));
     }
 
     #[test]
