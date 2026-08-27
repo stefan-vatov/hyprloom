@@ -35,6 +35,18 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
+      - name: Validate Arch package
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE":/pkg -w /pkg archlinux:latest \
+            bash -euxo pipefail -c '
+              pacman -Sy --noconfirm base-devel rust
+              useradd -m builder
+              chown -R builder:builder /pkg
+              su builder -c "makepkg --verifysource --nodeps"
+              su builder -c "makepkg --nodeps --noconfirm"
+              test -n "$(find /pkg -maxdepth 1 -type f -name "*.pkg.tar.*" -print -quit)"
+            '
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -60,8 +72,17 @@ jobs:
       - name: Download source tarball and compute checksum
         id: checksum
         run: |
-          curl -sL "https://github.com/thethracian/hyprloom/archive/${GITHUB_REF_NAME}.tar.gz" \
+          curl --fail --show-error --location --retry 3 --retry-all-errors \
+            "https://github.com/thethracian/hyprloom/archive/${GITHUB_REF_NAME}.tar.gz" \
             -o source.tar.gz
+          test -s source.tar.gz
+          tar -tzf source.tar.gz >/dev/null
+          curl --fail --show-error --location --retry 3 --retry-all-errors \
+            "https://codeload.github.com/thethracian/hyprloom/tar.gz/refs/tags/${GITHUB_REF_NAME}" \
+            -o source-verify.tar.gz
+          test -s source-verify.tar.gz
+          tar -tzf source-verify.tar.gz >/dev/null
+          cmp --silent source.tar.gz source-verify.tar.gz
           sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
 

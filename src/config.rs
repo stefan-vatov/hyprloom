@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Safety limits for values that control sleeps and polling loops.  They keep
+/// a damaged config from making automatic restore appear hung indefinitely.
+pub const MAX_RESTORE_DELAY_MS: u64 = 60_000;
+pub const MAX_WINDOW_DETECT_TIMEOUT_MS: u64 = 120_000;
+pub const MAX_AUTOSAVE_RETAIN: usize = 1_000;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -10,6 +16,20 @@ pub struct Config {
     pub filters: FilterConfig,
     #[serde(default)]
     pub apps: HashMap<String, AppConfig>,
+}
+
+impl Config {
+    /// Clamp operational settings to bounded values before they reach a
+    /// restore or autosave loop.  Configuration files are user-editable, so
+    /// this is deliberately best-effort and keeps valid settings intact.
+    pub fn normalize(&mut self) {
+        self.general.restore_delay_ms = self.general.restore_delay_ms.min(MAX_RESTORE_DELAY_MS);
+        self.general.window_detect_timeout_ms = self
+            .general
+            .window_detect_timeout_ms
+            .min(MAX_WINDOW_DETECT_TIMEOUT_MS);
+        self.general.autosave_retain = self.general.autosave_retain.min(MAX_AUTOSAVE_RETAIN);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,8 +140,28 @@ impl Default for FilterConfig {
 pub fn load_config() -> Config {
     for path in [config_path(), legacy_config_path()] {
         if path.exists() {
-            let content = std::fs::read_to_string(path).unwrap_or_default();
-            return toml::from_str(&content).unwrap_or_default();
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: could not read config '{}': {error}; using defaults",
+                        path.display()
+                    );
+                    return Config::default();
+                }
+            };
+            let mut config: Config = match toml::from_str(&content) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!(
+                        "Warning: could not parse config '{}': {error}; using defaults",
+                        path.display()
+                    );
+                    return Config::default();
+                }
+            };
+            config.normalize();
+            return config;
         }
     }
     Config::default()
@@ -236,6 +276,23 @@ hint_template = "{cwd}"
     fn test_config_autosave_retain_default() {
         let config = Config::default();
         assert_eq!(config.general.autosave_retain, 5);
+    }
+
+    #[test]
+    fn test_config_normalizes_operational_limits() {
+        let mut config = Config::default();
+        config.general.restore_delay_ms = u64::MAX;
+        config.general.window_detect_timeout_ms = u64::MAX;
+        config.general.autosave_retain = usize::MAX;
+
+        config.normalize();
+
+        assert_eq!(config.general.restore_delay_ms, MAX_RESTORE_DELAY_MS);
+        assert_eq!(
+            config.general.window_detect_timeout_ms,
+            MAX_WINDOW_DETECT_TIMEOUT_MS
+        );
+        assert_eq!(config.general.autosave_retain, MAX_AUTOSAVE_RETAIN);
     }
 
     #[test]

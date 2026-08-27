@@ -22,6 +22,12 @@ pub enum RestoreError {
     AmbiguousWindow { class: String, addresses: String },
     #[error("window {address} disappeared before reconciliation completed")]
     WindowDisappeared { address: String },
+    #[error("launch command '{command}' for {target} is not authorized by app identity or config")]
+    UntrustedLaunch { target: String, command: String },
+    #[error("binary '{command}' for {target} was not found")]
+    MissingLaunchBinary { target: String, command: String },
+    #[error("timed out waiting for existing windows to close")]
+    ReplaceTimeout,
 }
 
 // ── Report ──────────────────────────────────────────────────────────────────
@@ -354,15 +360,13 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
 }
 
 fn classes_match(target: &SessionClient, current: &HyprClient) -> bool {
-    let target_classes = [&target.class, &target.initial_class];
-    let current_classes = [&current.class, &current.initial_class];
-
-    target_classes.iter().any(|target_class| {
-        !target_class.is_empty()
-            && current_classes.iter().any(|current_class| {
-                !current_class.is_empty() && target_class.eq_ignore_ascii_case(current_class)
-            })
-    })
+    // Only compare the same identity field.  Cross-field matching creates a
+    // transitive false positive when one app's runtime class happens to equal
+    // another app's initial class (for example target wrapper/app-a versus
+    // current app-a/app-b).  Empty initial-class fields are the legacy format
+    // and intentionally fall back to the runtime class comparison above.
+    same_nonempty(&target.class, &current.class)
+        || same_nonempty(&target.initial_class, &current.initial_class)
 }
 
 fn is_brave_client(client: &SessionClient) -> bool {
@@ -438,7 +442,7 @@ pub fn restore_session(
         }
     }
     let mut consumed_existing = HashSet::new();
-    let current_monitors = hyprctl.get_monitors().unwrap_or_default();
+    let current_monitors = hyprctl.get_monitors()?;
 
     // Detect if profile-based Brave restore applies.
     let has_brave_profiles =
@@ -492,21 +496,51 @@ pub fn restore_session(
                 continue;
             }
 
-            // Legacy restore remains additive, but uses the same robust class
-            // and workspace identity rules as reconciliation so a changed
-            // runtime class cannot cause an avoidable duplicate launch.
-            if let Some(existing_index) = existing_clients.iter().position(|current| {
-                !consumed_existing.contains(&current.address)
-                    && !is_ignored_class(&current.class, &config.filters.ignore_classes)
-                    && !is_ignored_class(&current.initial_class, &config.filters.ignore_classes)
-                    && classes_match(client, current)
-                    && workspace_matches(client, current)
-            }) {
-                let current = &existing_clients[existing_index];
-                let msg = format!("SKIP: {} already on ws={}", current.class, client.workspace);
-                report.details.push(msg);
-                report.skipped += 1;
-                consumed_existing.insert(existing_clients[existing_index].address.clone());
+            // An existing target is repaired in place, even when it is on a
+            // different workspace or monitor.  This keeps the legacy command
+            // useful on its own while sharing the same placement semantics as
+            // --reconcile.
+            if let Some(existing_index) = find_existing_restore_match(
+                client,
+                &existing_clients,
+                &consumed_existing,
+                &current_monitors,
+                config,
+            ) {
+                let current = existing_clients[existing_index].clone();
+                consumed_existing.insert(current.address.clone());
+                let current_monitor = monitor_name_for_id(&current_monitors, current.monitor);
+                let commands = build_reconcile_dispatch_commands(
+                    &restore_client,
+                    &current,
+                    current_monitor.as_deref(),
+                );
+                if commands.is_empty() {
+                    report.details.push(format!(
+                        "SKIP: {} already on ws={}",
+                        current.class, client.workspace
+                    ));
+                    report.skipped += 1;
+                } else {
+                    match dispatch_existing_repairs(&current, &commands, hyprctl) {
+                        Ok(()) => {
+                            report.restored += 1;
+                            if verbose {
+                                report.details.push(format!(
+                                    "OK: repaired {} at address {}",
+                                    client.class, current.address
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            report.failed += 1;
+                            report.details.push(format!(
+                                "FAIL: {} at address {} — {error}",
+                                client.class, current.address
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -624,6 +658,123 @@ pub fn restore_session(
     Ok(report)
 }
 
+fn find_existing_restore_match(
+    target: &SessionClient,
+    existing: &[HyprClient],
+    consumed: &HashSet<String>,
+    monitors: &[HyprMonitor],
+    config: &Config,
+) -> Option<usize> {
+    existing
+        .iter()
+        .enumerate()
+        .filter(|(_, current)| {
+            !consumed.contains(&current.address)
+                && !is_ignored_class(&current.class, &config.filters.ignore_classes)
+                && !is_ignored_class(&current.initial_class, &config.filters.ignore_classes)
+        })
+        .filter_map(|(index, current)| {
+            let monitor_name = monitor_name_for_id(monitors, current.monitor);
+            let observed = ObservedClient::from_hypr_client(current.clone(), monitor_name, None);
+            match_score(target, &observed).map(|(score, _)| (score, current.address.clone(), index))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
+        .map(|(_, _, index)| index)
+}
+
+fn monitor_name_for_id(monitors: &[HyprMonitor], id: i32) -> Option<String> {
+    monitors
+        .iter()
+        .find(|monitor| monitor.id == id)
+        .map(|monitor| monitor.name.clone())
+}
+
+fn dispatch_existing_repairs(
+    current: &HyprClient,
+    commands: &[String],
+    hyprctl: &dyn HyprctlClient,
+) -> Result<(), RestoreError> {
+    for command in commands {
+        if !window_is_present(&current.address, hyprctl)? {
+            return Err(RestoreError::WindowDisappeared {
+                address: current.address.clone(),
+            });
+        }
+        hyprctl.dispatch(command)?;
+    }
+    Ok(())
+}
+
+/// Validate every executable that a replacement will need before any current
+/// window is closed.  Unlike an ordinary reconcile pass, replacement will
+/// make every target missing, so every launch command must be trusted and
+/// resolvable up front.
+pub fn validate_replacement_targets(
+    session: &Session,
+    config: &Config,
+) -> Result<(), RestoreError> {
+    for target in build_reconcile_targets(session, config) {
+        let launch_command = build_launch_command(&target.client);
+        if !launch_command_is_trusted(&target.client, config) {
+            return Err(RestoreError::UntrustedLaunch {
+                target: target.label,
+                command: launch_command[0].clone(),
+            });
+        }
+        if which::which(&launch_command[0]).is_err() {
+            return Err(RestoreError::MissingLaunchBinary {
+                target: target.label,
+                command: launch_command[0].clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Close the current desktop and reconcile the already-loaded session in the
+/// same helper process.  Loading and validating the target before the first
+/// close removes the UI's check/use race: deleting or editing the session
+/// after this function starts cannot change what will be restored.
+pub fn replace_session(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<ReconcileReport, RestoreError> {
+    validate_replacement_targets(session, config)?;
+    if dry_run {
+        return reconcile_session(session, hyprctl, process_info, config, true, verbose);
+    }
+
+    let current = hyprctl.get_clients()?;
+    for client in current {
+        if !client.address.is_empty() {
+            hyprctl.dispatch(&format!("closewindow address:{}", client.address))?;
+        }
+    }
+
+    let timeout = Duration::from_millis(
+        config
+            .general
+            .window_detect_timeout_ms
+            .min(crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS),
+    );
+    let started = Instant::now();
+    loop {
+        if hyprctl.get_clients()?.is_empty() {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            return Err(RestoreError::ReplaceTimeout);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    reconcile_session(session, hyprctl, process_info, config, false, verbose)
+}
+
 #[derive(Debug, Clone)]
 struct ReconcileTarget {
     client: SessionClient,
@@ -668,8 +819,8 @@ pub fn reconcile_session_with_launcher(
     launcher: &dyn ProcessLauncher,
 ) -> Result<ReconcileReport, RestoreError> {
     let targets = build_reconcile_targets(session, config);
-    let current_monitors = hyprctl.get_monitors().unwrap_or_default();
-    let observed = observe_clients(hyprctl, process_info, config)?;
+    let current_monitors = hyprctl.get_monitors()?;
+    let observed = observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
     let target_clients: Vec<SessionClient> = targets
         .iter()
         .map(|target| {
@@ -717,13 +868,8 @@ pub fn reconcile_session_with_launcher(
             used_current.insert(pair.current_index);
             report.matched += 1;
 
-            let current_target_monitor = if target.client.monitor.is_empty() {
-                None
-            } else {
-                hyprctl.get_monitors().ok().and_then(|monitors| {
-                    find_monitor_by_name(&monitors, &target.client.monitor).cloned()
-                })
-            };
+            let current_target_monitor =
+                find_monitor_by_name(&current_monitors, &target.client.monitor).cloned();
             let command_target = adapt_client_geometry(
                 &target.client,
                 &session.monitors,
@@ -1017,10 +1163,19 @@ fn observe_clients(
     process_info: &dyn ProcessInfoProvider,
     config: &Config,
 ) -> Result<Vec<ObservedClient>, RestoreError> {
-    let monitor_names: HashMap<i32, String> = hyprctl
-        .get_monitors()
-        .unwrap_or_default()
-        .into_iter()
+    let monitors = hyprctl.get_monitors()?;
+    observe_clients_with_monitors(hyprctl, process_info, config, &monitors)
+}
+
+fn observe_clients_with_monitors(
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    monitors: &[HyprMonitor],
+) -> Result<Vec<ObservedClient>, RestoreError> {
+    let monitor_names: HashMap<i32, String> = monitors
+        .iter()
+        .cloned()
         .map(|monitor| (monitor.id, monitor.name))
         .collect();
 
@@ -1235,6 +1390,9 @@ fn build_reconcile_dispatch_commands_with_geometry(
     let monitor_mismatch = !target.monitor.is_empty()
         && current_monitor
             .map(|monitor| !monitor.eq_ignore_ascii_case(&target.monitor))
+            // A successful monitor query can still lack a name for a stale
+            // monitor ID.  Leave that case alone; query failures themselves
+            // are propagated by the callers rather than being hidden here.
             .unwrap_or(false);
     let workspace_mismatch = !workspace_matches(target, current);
     let leaving_fullscreen = current.fullscreen > 0 && target.fullscreen == 0;
@@ -1347,14 +1505,24 @@ fn restore_single_client_with_launcher_and_process_info(
 
     // 2. Build and spawn the launch command.
     let launch_cmd = build_launch_command(client);
+    let launch_binary =
+        which::which(&launch_cmd[0]).map_err(|_| RestoreError::MissingLaunchBinary {
+            target: client.class.clone(),
+            command: launch_cmd[0].clone(),
+        })?;
     let launched = launcher
-        .spawn(&launch_cmd[0], &launch_cmd[1..])
+        .spawn(&launch_binary.to_string_lossy(), &launch_cmd[1..])
         .map_err(|e| {
             HyprctlError::CommandFailed(format!("spawn '{}' failed: {e}", launch_cmd[0]))
         })?;
 
     // 3. Poll for the new window (address not in snapshot + class match).
-    let timeout = Duration::from_millis(config.general.window_detect_timeout_ms);
+    let timeout = Duration::from_millis(
+        config
+            .general
+            .window_detect_timeout_ms
+            .min(crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS),
+    );
     let poll_interval = Duration::from_millis(100);
     let candidate_settle = Duration::from_millis(250).min(timeout);
     let start = Instant::now();
@@ -1418,7 +1586,12 @@ fn restore_single_client_with_launcher_and_process_info(
     }
 
     // 7. Throttle subsequent launches to give the compositor time to settle.
-    thread::sleep(Duration::from_millis(config.general.restore_delay_ms));
+    thread::sleep(Duration::from_millis(
+        config
+            .general
+            .restore_delay_ms
+            .min(crate::config::MAX_RESTORE_DELAY_MS),
+    ));
 
     Ok(format!(
         "OK: {} → ws={} at {:?}",
@@ -1701,6 +1874,33 @@ mod tests {
     }
 
     #[test]
+    fn test_matching_does_not_cross_runtime_and_initial_class_fields() {
+        let mut target = make_client(
+            "wrapper",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "wrapper",
+            vec![],
+            None,
+        );
+        target.initial_class = "app-a".to_string();
+
+        let mut current =
+            make_reconcile_window("0xunrelated", "app-a", "app-a", 1, 0, [10, 20], [800, 600]);
+        current.initial_class = "app-b".to_string();
+
+        let plan = plan_reconciliation(
+            &[target],
+            &[ObservedClient::from_hypr_client(current, None, None)],
+        );
+
+        assert_eq!(plan, vec![None]);
+    }
+
+    #[test]
     fn test_geometry_adapts_to_changed_monitor_origin_and_resolution() {
         let target = make_client(
             "kitty",
@@ -1907,6 +2107,64 @@ mod tests {
 
         fn dispatch(&self, args: &str) -> Result<(), HyprctlError> {
             self.dispatches.borrow_mut().push(args.to_string());
+            Ok(())
+        }
+
+        fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
+            Ok("0.54.1".to_string())
+        }
+    }
+
+    struct MonitorErrorHyprctl;
+
+    impl HyprctlClient for MonitorErrorHyprctl {
+        fn get_clients(&self) -> Result<Vec<HyprClient>, HyprctlError> {
+            Ok(vec![])
+        }
+
+        fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError> {
+            Err(HyprctlError::CommandFailed(
+                "monitor query unavailable".to_string(),
+            ))
+        }
+
+        fn dispatch(&self, _args: &str) -> Result<(), HyprctlError> {
+            Ok(())
+        }
+
+        fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
+            Ok("0.54.1".to_string())
+        }
+    }
+
+    struct ClosingMockHyprctl {
+        clients: RefCell<Vec<HyprClient>>,
+        dispatches: RefCell<Vec<String>>,
+    }
+
+    impl ClosingMockHyprctl {
+        fn new(clients: Vec<HyprClient>) -> Self {
+            Self {
+                clients: RefCell::new(clients),
+                dispatches: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl HyprctlClient for ClosingMockHyprctl {
+        fn get_clients(&self) -> Result<Vec<HyprClient>, HyprctlError> {
+            Ok(self.clients.borrow().clone())
+        }
+
+        fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError> {
+            Ok(vec![])
+        }
+
+        fn dispatch(&self, args: &str) -> Result<(), HyprctlError> {
+            self.dispatches.borrow_mut().push(args.to_string());
+            if args.starts_with("closewindow ") {
+                self.clients.borrow_mut().clear();
+            }
             Ok(())
         }
 
@@ -2806,6 +3064,134 @@ mod tests {
         assert_eq!(report.extras, 0);
         assert!(mock.dispatches().is_empty());
         assert!(launcher.launches.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_propagates_monitor_query_failures() {
+        let error = reconcile_session_with_launcher(
+            &make_session(vec![]),
+            &MonitorErrorHyprctl,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &RecordingLauncher::default(),
+        )
+        .expect_err("monitor query failures must not be hidden");
+
+        assert!(matches!(
+            error,
+            RestoreError::Hyprctl(HyprctlError::CommandFailed(message))
+                if message == "monitor query unavailable"
+        ));
+    }
+
+    #[test]
+    fn test_replace_closes_existing_windows_before_reconciling() {
+        let current = make_reconcile_window("0xold", "kitty", "kitty", 1, 0, [0, 0], [800, 600]);
+        let mock = ClosingMockHyprctl::new(vec![current]);
+        let report = replace_session(
+            &make_session(vec![]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.launched, 0);
+        assert_eq!(report.failed, 0);
+        assert_eq!(
+            mock.dispatches.borrow().as_slice(),
+            &["closewindow address:0xold"]
+        );
+    }
+
+    #[test]
+    fn test_replace_validates_targets_before_closing_existing_windows() {
+        let current = make_reconcile_window("0xold", "kitty", "kitty", 1, 0, [0, 0], [800, 600]);
+        let mock = ClosingMockHyprctl::new(vec![current]);
+        let target = make_client(
+            "kitty",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "missing_replace_binary_xyz",
+            vec![],
+            None,
+        );
+        let mut config = Config::default();
+        config.apps.insert(
+            "kitty".to_string(),
+            AppConfig {
+                binary: Some("missing_replace_binary_xyz".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
+            },
+        );
+
+        let error = replace_session(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            false,
+            true,
+        )
+        .expect_err("missing target binary must abort before close");
+
+        assert!(matches!(error, RestoreError::MissingLaunchBinary { .. }));
+        assert!(mock.dispatches.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_restore_repairs_existing_window_on_the_wrong_workspace() {
+        let mut target = make_client(
+            "kitty",
+            3,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        // Keep this test focused on workspace repair rather than monitor-name
+        // resolution, which the mock intentionally does not provide.
+        target.monitor.clear();
+        let current = make_reconcile_window(
+            "0xwrong-workspace",
+            "kitty",
+            "kitty",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        let mock = MockHyprctl::new(vec![vec![current]]);
+
+        let report = restore_session(
+            &make_session(vec![target]),
+            &mock,
+            &Config::default(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.restored, 1);
+        assert_eq!(report.skipped, 0);
+        assert!(mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch.contains("movetoworkspacesilent 3")));
     }
 
     #[test]

@@ -1,11 +1,19 @@
+use crate::config::MAX_AUTOSAVE_RETAIN;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::fs::OpenOptions;
-use std::io::Write;
+use std::io::{Read, Write};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+pub const MAX_SESSION_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_SESSION_CLIENTS: usize = 4_096;
+pub const MAX_SESSION_MONITORS: usize = 128;
+pub const MAX_SESSION_BRAVE_PROFILES: usize = 1_024;
+pub const MAX_SESSION_ARGS: usize = 2_048;
+pub const MAX_SESSION_STRING_BYTES: usize = 64 * 1024;
 
 // === Hyprloom session structs (what we save to disk) ===
 
@@ -93,6 +101,8 @@ pub enum SessionError {
     InvalidName(String),
     #[error("unsafe session path for '{0}'")]
     UnsafePath(String),
+    #[error("session data exceeds safety limits: {0}")]
+    TooLarge(String),
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +113,7 @@ pub struct SessionSummary {
 }
 
 pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), SessionError> {
-    validate_session_name(&session.name)?;
+    validate_session_structure(session)?;
     ensure_sessions_dir(sessions_dir)?;
     let path = sessions_dir.join(format!("{}.json", session.name));
     let json = serde_json::to_string_pretty(session)?;
@@ -113,12 +123,12 @@ pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), Sessio
 
 fn ensure_sessions_dir(sessions_dir: &Path) -> Result<(), SessionError> {
     match std::fs::symlink_metadata(sessions_dir) {
-        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(metadata) if metadata.is_dir() => ensure_private_directory(sessions_dir),
         Ok(_) => Err(SessionError::UnsafePath(sessions_dir.display().to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir_all(sessions_dir)?;
             match std::fs::symlink_metadata(sessions_dir) {
-                Ok(metadata) if metadata.is_dir() => Ok(()),
+                Ok(metadata) if metadata.is_dir() => ensure_private_directory(sessions_dir),
                 Ok(_) => Err(SessionError::UnsafePath(sessions_dir.display().to_string())),
                 Err(error) => Err(SessionError::Io(error)),
             }
@@ -129,7 +139,10 @@ fn ensure_sessions_dir(sessions_dir: &Path) -> Result<(), SessionError> {
 
 fn existing_sessions_dir(sessions_dir: &Path) -> Result<bool, SessionError> {
     match std::fs::symlink_metadata(sessions_dir) {
-        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(metadata) if metadata.is_dir() => {
+            ensure_private_directory(sessions_dir)?;
+            Ok(true)
+        }
         Ok(_) => Err(SessionError::UnsafePath(sessions_dir.display().to_string())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(SessionError::Io(error)),
@@ -150,8 +163,11 @@ pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionE
         }
         Err(error) => return Err(SessionError::Io(error)),
     }
-    let content = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&content)?)
+    ensure_private_file(&path, name)?;
+    let content = read_limited_file(&path, name)?;
+    let session = serde_json::from_slice(&content)?;
+    validate_session_structure(&session)?;
+    Ok(session)
 }
 
 pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
@@ -166,9 +182,15 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
             .file_type()
             .map(|file_type| file_type.is_file())
             .unwrap_or(false);
-        if is_regular_file && path.extension().map(|e| e == "json").unwrap_or(false) {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(session) = serde_json::from_str::<Session>(&content) {
+        if is_regular_file
+            && path.extension().map(|e| e == "json").unwrap_or(false)
+            && ensure_private_file(&path, &entry.file_name().to_string_lossy()).is_ok()
+        {
+            if let Ok(content) = read_limited_file(&path, &entry.file_name().to_string_lossy()) {
+                if let Ok(session) = serde_json::from_slice::<Session>(&content) {
+                    if validate_session_structure(&session).is_err() {
+                        continue;
+                    }
                     summaries.push(SessionSummary {
                         name: session.name.clone(),
                         created_at: session.created_at,
@@ -200,6 +222,7 @@ pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionErro
         }
         Err(error) => return Err(SessionError::Io(error)),
     }
+    ensure_private_file(&path, name)?;
     std::fs::remove_file(path)?;
     Ok(())
 }
@@ -211,9 +234,11 @@ pub fn session_exists(name: &str, sessions_dir: &Path) -> bool {
     if !matches!(existing_sessions_dir(sessions_dir), Ok(true)) {
         return false;
     }
-    std::fs::symlink_metadata(sessions_dir.join(format!("{name}.json")))
+    let path = sessions_dir.join(format!("{name}.json"));
+    std::fs::symlink_metadata(&path)
         .map(|metadata| metadata.file_type().is_file())
         .unwrap_or(false)
+        && ensure_private_file(&path, name).is_ok()
 }
 
 pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
@@ -248,6 +273,7 @@ pub fn migrate_legacy_sessions(
     }
 
     ensure_sessions_dir(sessions_dir)?;
+    ensure_private_directory(legacy_sessions_dir)?;
     let mut copied = 0;
     for entry in std::fs::read_dir(legacy_sessions_dir)? {
         let entry = entry?;
@@ -268,7 +294,10 @@ pub fn migrate_legacy_sessions(
             if validate_session_name(name).is_err() {
                 continue;
             }
-            let content = std::fs::read(source)?;
+            ensure_private_file(&source, name)?;
+            let content = read_limited_file(&source, name)?;
+            let session: Session = serde_json::from_slice(&content)?;
+            validate_session_structure(&session)?;
             atomic_write(&destination, &content)?;
             copied += 1;
         }
@@ -306,6 +335,7 @@ pub fn list_autosave_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>
 /// Deletes the oldest autosave sessions, keeping only the `retain` newest.
 /// Returns the count of sessions deleted. Non-autosave sessions are untouched.
 pub fn rotate_autosaves(sessions_dir: &Path, retain: usize) -> Result<usize, SessionError> {
+    let retain = retain.min(MAX_AUTOSAVE_RETAIN);
     if retain == 0 {
         return Ok(0);
     }
@@ -377,6 +407,132 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
         std::io::ErrorKind::AlreadyExists,
         "could not allocate a unique temporary session path",
     )))
+}
+
+fn read_limited_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.len() > MAX_SESSION_FILE_BYTES {
+        return Err(SessionError::TooLarge(format!(
+            "'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes"
+        )));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    let mut content = Vec::with_capacity(metadata.len().min(MAX_SESSION_FILE_BYTES) as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_SESSION_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > MAX_SESSION_FILE_BYTES {
+        return Err(SessionError::TooLarge(format!(
+            "'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes"
+        )));
+    }
+    Ok(content)
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
+    ensure_private_path(path, true)
+}
+
+fn ensure_private_file(path: &Path, label: &str) -> Result<(), SessionError> {
+    ensure_private_path(path, false).map_err(|error| match error {
+        SessionError::UnsafePath(_) => SessionError::UnsafePath(label.to_string()),
+        other => other,
+    })
+}
+
+fn ensure_private_path(path: &Path, directory: bool) -> Result<(), SessionError> {
+    #[cfg(unix)]
+    {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(SessionError::UnsafePath(path.display().to_string()));
+        }
+        let expected_mode = if directory { 0o700 } else { 0o600 };
+        if metadata.permissions().mode() & 0o777 != expected_mode {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(expected_mode);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        let verified = std::fs::symlink_metadata(path)?;
+        if verified.uid() != unsafe { libc::geteuid() }
+            || verified.permissions().mode() & 0o077 != 0
+        {
+            return Err(SessionError::UnsafePath(path.display().to_string()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, directory);
+    Ok(())
+}
+
+fn validate_session_structure(session: &Session) -> Result<(), SessionError> {
+    validate_session_name(&session.name)?;
+    validate_text("session version", &session.hyprland_version)?;
+    if session.monitors.len() > MAX_SESSION_MONITORS {
+        return Err(SessionError::TooLarge(format!(
+            "more than {MAX_SESSION_MONITORS} monitors"
+        )));
+    }
+    if session.clients.len() > MAX_SESSION_CLIENTS {
+        return Err(SessionError::TooLarge(format!(
+            "more than {MAX_SESSION_CLIENTS} clients"
+        )));
+    }
+    if session.brave_profiles.len() > MAX_SESSION_BRAVE_PROFILES {
+        return Err(SessionError::TooLarge(format!(
+            "more than {MAX_SESSION_BRAVE_PROFILES} browser profiles"
+        )));
+    }
+
+    for monitor in &session.monitors {
+        validate_text("monitor name", &monitor.name)?;
+    }
+    for client in &session.clients {
+        for (label, value) in [
+            ("client class", &client.class),
+            ("client title", &client.title),
+            ("client initial class", &client.initial_class),
+            ("client initial title", &client.initial_title),
+            ("client workspace name", &client.workspace_name),
+            ("client monitor", &client.monitor),
+            ("launch command", &client.launch.command),
+        ] {
+            validate_text(label, value)?;
+        }
+        if let Some(profile) = &client.profile_directory {
+            validate_text("client profile directory", profile)?;
+        }
+        if let Some(hint) = &client.launch.hint {
+            validate_text("launch hint", hint)?;
+        }
+        if client.launch.args.len() > MAX_SESSION_ARGS {
+            return Err(SessionError::TooLarge(format!(
+                "more than {MAX_SESSION_ARGS} launch arguments"
+            )));
+        }
+        for argument in &client.launch.args {
+            validate_text("launch argument", argument)?;
+        }
+    }
+    for profile in &session.brave_profiles {
+        validate_text("browser profile directory", &profile.directory)?;
+        validate_text("browser profile name", &profile.name)?;
+    }
+    Ok(())
+}
+
+fn validate_text(label: &str, value: &str) -> Result<(), SessionError> {
+    if value.len() > MAX_SESSION_STRING_BYTES {
+        return Err(SessionError::TooLarge(format!(
+            "{label} is longer than {MAX_SESSION_STRING_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Parses a human-readable duration string into a `chrono::Duration`.
@@ -846,6 +1002,50 @@ mod tests {
             .expect_err("symlinked sessions directory must be rejected");
         assert!(matches!(error, SessionError::UnsafePath(_)));
         assert!(!outside.path().join("work.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_session_storage_is_restricted_to_user_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut directory_permissions = std::fs::metadata(dir.path()).unwrap().permissions();
+        directory_permissions.set_mode(0o755);
+        std::fs::set_permissions(dir.path(), directory_permissions).unwrap();
+
+        save_session(&make_test_session("work"), dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("work.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn test_oversized_session_file_is_rejected_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("work.json");
+        std::fs::write(&path, vec![b' '; MAX_SESSION_FILE_BYTES as usize + 1]).unwrap();
+
+        let error = load_session("work", dir.path()).expect_err("oversized session must fail");
+        assert!(matches!(error, SessionError::TooLarge(_)));
+    }
+
+    #[test]
+    fn test_structurally_oversized_session_is_rejected_before_save() {
+        let mut session = make_test_session("work");
+        session.clients = vec![session.clients[0].clone(); MAX_SESSION_CLIENTS + 1];
+
+        let error = save_session(&session, tempfile::tempdir().unwrap().path())
+            .expect_err("too many clients must fail");
+        assert!(matches!(error, SessionError::TooLarge(_)));
     }
 
     #[test]

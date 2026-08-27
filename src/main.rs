@@ -5,10 +5,10 @@ use hyprloom::config::{
 };
 use hyprloom::hyprctl::RealHyprctl;
 use hyprloom::process::RealProcessInfo;
-use hyprloom::restore::restore_session;
+use hyprloom::restore::{replace_session, restore_session, validate_replacement_targets};
 use hyprloom::session::{
-    delete_session, list_sessions, load_session, migrate_legacy_sessions, save_session,
-    session_exists,
+    autosave_name_now, delete_session, list_sessions, load_session, migrate_legacy_sessions,
+    save_session, session_exists,
 };
 
 #[derive(Parser)]
@@ -52,6 +52,11 @@ enum Commands {
         /// Print exec-once line for Hyprland config
         #[arg(long)]
         on_login: bool,
+    },
+    /// Close the current desktop and restore a saved session atomically.
+    Replace {
+        /// Session name to replace the current desktop with
+        name: String,
     },
     /// List saved sessions
     List,
@@ -265,6 +270,73 @@ fn main() {
                         eprintln!("Error restoring session: {}", e);
                         std::process::exit(1);
                     }
+                }
+            }
+        }
+
+        Commands::Replace { name } => {
+            let session = match load_session(&name, &sessions_dir) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("Error loading session: {error}");
+                    std::process::exit(1);
+                }
+            };
+
+            // Validate the complete target before capturing or closing the
+            // current desktop.  The replace implementation loads this same
+            // session in memory and performs the close/restore sequence in a
+            // single process.
+            if let Err(error) = validate_replacement_targets(&session, &config) {
+                eprintln!("Replace cancelled: {error}");
+                std::process::exit(1);
+            }
+
+            let hyprctl = RealHyprctl;
+            let process_info = RealProcessInfo;
+            let backup_name = autosave_name_now();
+            let backup = match capture_session(&backup_name, &hyprctl, &process_info, &config) {
+                Ok(session) => session,
+                Err(error) => {
+                    eprintln!("Replace cancelled: safety backup failed: {error}");
+                    std::process::exit(1);
+                }
+            };
+            if let Err(error) = save_session(&backup, &sessions_dir) {
+                eprintln!("Replace cancelled: safety backup could not be saved: {error}");
+                std::process::exit(1);
+            }
+
+            match replace_session(
+                &session,
+                &hyprctl,
+                &process_info,
+                &config,
+                false,
+                cli.verbose,
+            ) {
+                Ok(report) => {
+                    println!(
+                        "Replaced desktop with '{}' ({} unchanged, {} moved, {} launched, {} extra left alone, {} failed). Safety backup: '{}'.",
+                        session.name,
+                        report.unchanged,
+                        report.moved,
+                        report.launched,
+                        report.extras,
+                        report.failed,
+                        backup_name
+                    );
+                    for detail in &report.details {
+                        println!("  {detail}");
+                    }
+                    if report.failed > 0 {
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Error replacing desktop: {error}");
+                    eprintln!("Safety backup is available as '{backup_name}'.");
+                    std::process::exit(1);
                 }
             }
         }

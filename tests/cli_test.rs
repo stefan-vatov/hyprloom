@@ -17,6 +17,7 @@ fn test_cli_help() {
         .success()
         .stdout(predicate::str::contains("save"))
         .stdout(predicate::str::contains("restore"))
+        .stdout(predicate::str::contains("replace"))
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("delete"));
 }
