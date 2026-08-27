@@ -6,8 +6,9 @@ use hyprloom::config::{
 use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::{
-    recover_session, replace_session_with_marker, replacement_target_is_complete, restore_session,
-    validate_replacement_targets, ReplaceMarkerContext,
+    recover_session, recover_session_safely, replace_session_with_marker,
+    replacement_target_is_complete, restore_session, validate_replacement_targets,
+    ReplaceMarkerContext,
 };
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
@@ -389,7 +390,7 @@ fn main() {
                             "Replacement was incomplete; attempting safety recovery from '{}'.",
                             backup_name
                         );
-                        if report_safety_recovery(
+                        if report_non_destructive_safety_recovery(
                             &backup,
                             &hyprctl,
                             &process_info,
@@ -415,7 +416,7 @@ fn main() {
                             eprintln!(
                                 "Attempting safety recovery from '{backup_name}' before giving up."
                             );
-                            if report_safety_recovery(
+                            if report_non_destructive_safety_recovery(
                                 &backup,
                                 &hyprctl,
                                 &process_info,
@@ -664,6 +665,7 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             return false;
         }
     };
+    let target_aware_marker = marker.target_name.is_some();
     if marker.phase == ReplacePhase::Committed {
         eprintln!(
             "Found a completed desktop replacement; finalizing its recovery marker without replaying the old snapshot."
@@ -741,7 +743,12 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
     };
     let hyprctl = RealHyprctl;
     let process_info = RealProcessInfo;
-    if report_safety_recovery(&backup, &hyprctl, &process_info, config, false) {
+    let recovered = if target_aware_marker {
+        report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, config, false)
+    } else {
+        report_safety_recovery(&backup, &hyprctl, &process_info, config, false)
+    };
+    if recovered {
         return clear_recovery_marker(sessions_dir);
     }
     false
@@ -828,17 +835,48 @@ fn report_safety_recovery(
     verbose: bool,
 ) -> bool {
     let recovery_config = safety_recovery_config(config);
-    match recover_session(
-        backup,
-        hyprctl,
-        process_info,
-        &recovery_config,
-        false,
-        verbose,
-    ) {
+    report_recovery_result(
+        recover_session(
+            backup,
+            hyprctl,
+            process_info,
+            &recovery_config,
+            false,
+            verbose,
+        ),
+        "Safety recovery",
+    )
+}
+
+fn report_non_destructive_safety_recovery(
+    backup: &hyprloom::session::Session,
+    hyprctl: &RealHyprctl,
+    process_info: &RealProcessInfo,
+    config: &hyprloom::config::Config,
+    verbose: bool,
+) -> bool {
+    let recovery_config = safety_recovery_config(config);
+    report_recovery_result(
+        recover_session_safely(
+            backup,
+            hyprctl,
+            process_info,
+            &recovery_config,
+            false,
+            verbose,
+        ),
+        "Non-destructive safety recovery",
+    )
+}
+
+fn report_recovery_result(
+    result: Result<hyprloom::restore::ReconcileReport, hyprloom::restore::RestoreError>,
+    label: &str,
+) -> bool {
+    match result {
         Ok(report) if report.failed == 0 && report.skipped == 0 => {
             eprintln!(
-                "Safety recovery pass completed: {} unchanged, {} moved, {} launched, {} skipped.",
+                "{label} pass completed: {} unchanged, {} moved, {} launched, {} skipped.",
                 report.unchanged, report.moved, report.launched, report.skipped
             );
             for detail in &report.details {
@@ -848,12 +886,8 @@ fn report_safety_recovery(
         }
         Ok(report) => {
             eprintln!(
-                "Safety recovery was partial: {} unchanged, {} moved, {} launched, {} skipped, {} failed.",
-                report.unchanged,
-                report.moved,
-                report.launched,
-                report.skipped,
-                report.failed
+                "{label} was partial: {} unchanged, {} moved, {} launched, {} skipped, {} failed.",
+                report.unchanged, report.moved, report.launched, report.skipped, report.failed
             );
             for detail in &report.details {
                 eprintln!("  recovery: {detail}");
@@ -862,7 +896,7 @@ fn report_safety_recovery(
             false
         }
         Err(error) => {
-            eprintln!("Safety recovery could not run: {error}");
+            eprintln!("{label} could not run: {error}");
             eprintln!("The safety backup remains available for another retry.");
             false
         }

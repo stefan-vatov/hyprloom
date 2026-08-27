@@ -1,7 +1,7 @@
 use crate::config::{app_config_for, is_ignored_class, Config};
 use crate::hyprctl::{HyprClient, HyprMonitor, HyprctlClient, HyprctlError};
 use crate::process::{
-    find_profile_directory, select_terminal_process, ProcessInfoProvider, RealProcessInfo,
+    find_profile_directories, select_terminal_process, ProcessInfoProvider, RealProcessInfo,
 };
 use crate::session::{Monitor, Session, SessionClient};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -420,10 +420,6 @@ fn strong_identity_conflict(target: &SessionClient, observed: &ObservedClient) -
         && !current.initial_title.is_empty()
         && !same_nonempty(&target.initial_title, &current.initial_title)
         && !title_evidence_agrees;
-    let same_initial_title_conflict = !is_ghostty_class(target)
-        && launch_cwd(target).is_none()
-        && same_nonempty(&target.initial_title, &current.initial_title)
-        && current_title_conflict;
     let title_conflict =
         current_title_conflict && !same_nonempty(&target.initial_title, &current.initial_title);
     let cwd_conflict = matches!(
@@ -431,7 +427,38 @@ fn strong_identity_conflict(target: &SessionClient, observed: &ObservedClient) -
         (Some(target_cwd), Some(current_cwd)) if target_cwd != *current_cwd
     );
 
-    same_initial_title_conflict || initial_title_conflict || title_conflict && cwd_conflict
+    initial_title_conflict || title_conflict && cwd_conflict
+}
+
+/// A same-initial-title match can be a legitimate live window whose title has
+/// changed since capture, so ordinary reconciliation keeps it eligible.  A
+/// crash-recovery pass has a different safety requirement: it must not claim
+/// that an unrelated generic same-class window proves the replacement target
+/// was restored.  This predicate is used only by that conservative pass.
+fn ambiguous_title_identity(target: &SessionClient, observed: &ObservedClient) -> bool {
+    let current = &observed.client;
+    !is_ghostty_class(target)
+        && target.profile_directory.is_none()
+        && launch_cwd(target).is_none()
+        && same_nonempty(&target.initial_title, &current.initial_title)
+        && !target.title.is_empty()
+        && !current.title.is_empty()
+        && !same_nonempty(&target.title, &current.title)
+        && !titles_similar(&target.title, &current.title)
+}
+
+fn allowed_match(
+    target: &SessionClient,
+    observed: &ObservedClient,
+    allow_ambiguous_identity: bool,
+) -> Option<(i32, MatchKind)> {
+    let (score, kind) = match_score(target, observed)?;
+    if !allow_ambiguous_identity
+        && (kind == MatchKind::ClassFallback || ambiguous_title_identity(target, observed))
+    {
+        return None;
+    }
+    Some((score, kind))
 }
 
 fn classes_match(target: &SessionClient, current: &HyprClient) -> bool {
@@ -871,6 +898,16 @@ fn find_existing_restore_match(
     consumed: &HashSet<String>,
     config: &Config,
 ) -> Option<usize> {
+    find_existing_restore_match_with_policy(target, existing, consumed, config, true)
+}
+
+fn find_existing_restore_match_with_policy(
+    target: &SessionClient,
+    existing: &[ObservedClient],
+    consumed: &HashSet<String>,
+    config: &Config,
+    allow_ambiguous_identity: bool,
+) -> Option<usize> {
     existing
         .iter()
         .enumerate()
@@ -883,7 +920,7 @@ fn find_existing_restore_match(
                 )
         })
         .filter_map(|(index, current)| {
-            match_score(target, current)
+            allowed_match(target, current, allow_ambiguous_identity)
                 .map(|(score, _)| (score, current.client.address.clone(), index))
         })
         .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
@@ -1046,6 +1083,32 @@ pub fn recover_session(
             validate_targets: false,
             marker: None,
         },
+    )
+}
+
+/// Recover a safety snapshot without closing windows that appeared after the
+/// replacement started.  Only strong identity matches are repaired; unknown
+/// current windows remain extras, and missing snapshot targets are launched.
+/// This is the safe startup path after a crash, when the user may already have
+/// continued working on the desktop.
+pub fn recover_session_safely(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<ReconcileReport, RestoreError> {
+    let launcher = RealProcessLauncher;
+    reconcile_session_with_launcher_options(
+        session,
+        hyprctl,
+        process_info,
+        config,
+        dry_run,
+        verbose,
+        &launcher,
+        false,
     )
 }
 
@@ -1218,7 +1281,7 @@ pub fn replacement_target_is_complete(
     if target_count == 0 {
         return Ok(false);
     }
-    let report = reconcile_session(session, hyprctl, process_info, config, true, false)?;
+    let report = recover_session_safely(session, hyprctl, process_info, config, true, false)?;
     Ok(report.matched == target_count
         && report.launched == 0
         && report.skipped == 0
@@ -1234,6 +1297,29 @@ pub fn reconcile_session_with_launcher(
     dry_run: bool,
     verbose: bool,
     launcher: &dyn ProcessLauncher,
+) -> Result<ReconcileReport, RestoreError> {
+    reconcile_session_with_launcher_options(
+        session,
+        hyprctl,
+        process_info,
+        config,
+        dry_run,
+        verbose,
+        launcher,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_session_with_launcher_options(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    dry_run: bool,
+    verbose: bool,
+    launcher: &dyn ProcessLauncher,
+    allow_ambiguous_identity: bool,
 ) -> Result<ReconcileReport, RestoreError> {
     let targets = build_reconcile_targets(session, config);
     let current_monitors = hyprctl.get_monitors()?;
@@ -1270,12 +1356,31 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
         let matched = if dry_run {
-            plan[target_index].and_then(|pair| {
-                observed
-                    .get(pair.current_index)
-                    .cloned()
-                    .map(|current| (current, pair.kind))
-            })
+            plan[target_index]
+                .and_then(|pair| {
+                    observed
+                        .get(pair.current_index)
+                        .cloned()
+                        .and_then(|current| {
+                            allowed_match(target_client, &current, allow_ambiguous_identity)
+                                .map(|(_, kind)| (current, kind))
+                        })
+                })
+                .or_else(|| {
+                    find_existing_restore_match_with_policy(
+                        target_client,
+                        &observed,
+                        &used_current_addresses,
+                        config,
+                        allow_ambiguous_identity,
+                    )
+                    .and_then(|index| {
+                        observed.get(index).cloned().and_then(|current| {
+                            allowed_match(target_client, &current, allow_ambiguous_identity)
+                                .map(|(_, kind)| (current, kind))
+                        })
+                    })
+                })
         } else {
             // The initial assignment is only a plan.  Re-read the compositor
             // immediately before each target so a window that appeared after
@@ -1297,21 +1402,23 @@ pub fn reconcile_session_with_launcher(
                     refreshed.iter().enumerate().find_map(|(index, current)| {
                         (!used_current_addresses.contains(&address)
                             && current.client.address == address
-                            && match_score(target_client, current).is_some())
+                            && allowed_match(target_client, current, allow_ambiguous_identity)
+                                .is_some())
                         .then_some(index)
                     })
                 })
                 .or_else(|| {
-                    find_existing_restore_match(
+                    find_existing_restore_match_with_policy(
                         target_client,
                         &refreshed,
                         &used_current_addresses,
                         config,
+                        allow_ambiguous_identity,
                     )
                 });
             selected_index.map(|index| {
                 let current = refreshed[index].clone();
-                let kind = match_score(target_client, &current)
+                let kind = allowed_match(target_client, &current, allow_ambiguous_identity)
                     .map(|(_, kind)| kind)
                     .unwrap_or(MatchKind::ClassFallback);
                 (current, kind)
@@ -1629,8 +1736,7 @@ fn observe_clients_with_monitors(
         .map(|client| {
             let monitor_name = monitor_names.get(&client.monitor).cloned();
             let cwd = observe_cwd(&client, process_info);
-            let profile_directory = find_profile_directory(process_info, client.pid);
-            ObservedClient::with_profile_directory(client, monitor_name, cwd, profile_directory)
+            ObservedClient::with_profile_directory(client, monitor_name, cwd, None)
         })
         .collect();
     let mut brave_window_counts = HashMap::<u32, usize>::new();
@@ -1640,15 +1746,30 @@ fn observe_clients_with_monitors(
         }
     }
     for observed in &mut clients {
-        if is_brave_hypr_client(&observed.client)
-            && (observed.profile_directory.is_none()
-                || brave_window_counts
-                    .get(&observed.client.pid)
-                    .copied()
-                    .unwrap_or_default()
-                    > 1)
-        {
-            observed.profile_identity_ambiguous = true;
+        if is_brave_hypr_client(&observed.client) {
+            let window_count = brave_window_counts
+                .get(&observed.client.pid)
+                .copied()
+                .unwrap_or_default();
+            let profiles = find_profile_directories(process_info, observed.client.pid);
+            match profiles.as_slice() {
+                [profile] if window_count == 1 => {
+                    observed.profile_directory = Some(profile.clone());
+                }
+                [] if window_count == 1 => {
+                    // Brave's normal Default profile is commonly omitted
+                    // from the command line.  It is safe to infer it only
+                    // when this PID owns exactly one visible Brave window.
+                    observed.profile_directory = Some("Default".to_string());
+                }
+                [profile] => {
+                    observed.profile_directory = Some(profile.clone());
+                    observed.profile_identity_ambiguous = true;
+                }
+                _ => {
+                    observed.profile_identity_ambiguous = true;
+                }
+            }
         }
     }
     clients.sort_by(|left, right| left.client.address.cmp(&right.client.address));
@@ -2229,11 +2350,16 @@ fn candidate_matches_profile(
     let Some(target_profile) = &target.profile_directory else {
         return true;
     };
-    match find_profile_directory(process_info, candidate.pid) {
-        Some(candidate_profile) => candidate_profile.eq_ignore_ascii_case(target_profile),
-        // A shared Brave browser process can advertise several profiles.  An
-        // unknown profile is never enough evidence to move a profile target.
-        None => false,
+    let profiles = find_profile_directories(process_info, candidate.pid);
+    match profiles.as_slice() {
+        [candidate_profile] => candidate_profile.eq_ignore_ascii_case(target_profile),
+        // Brave omits the flag for its normal profile.  The caller's launch
+        // correlation still has to prove that this is the window created by
+        // the requested launch before it can be moved.
+        [] => target_profile.eq_ignore_ascii_case("Default"),
+        // A shared browser process can advertise several profiles.  No single
+        // top-level window can be assigned safely from that process tree.
+        _ => false,
     }
 }
 
@@ -2255,9 +2381,10 @@ fn launched_process_is_related(
         // check also protects descendant correlation when the launch PID was
         // recycled before a child window appeared.
         (Some(_), None) | (None, Some(_)) => false,
-        // Lightweight providers do not model process start times; retain
-        // their historical root-PID behavior.
-        (None, None) => true,
+        // A provider which explicitly supports start times must fail closed
+        // when both reads are unavailable.  Only lightweight providers that
+        // opt out of timestamp support retain the historical PID fallback.
+        (None, None) => !process_info.has_reliable_process_start_time(),
     };
     if !root_identity_matches {
         return false;
@@ -2306,7 +2433,11 @@ fn choose_launched_window(
     let mut scored: Vec<(i32, String, HyprClient)> = candidates
         .into_iter()
         .filter_map(|candidate| {
-            let profile_directory = find_profile_directory(process_info, candidate.pid);
+            let profile_directory =
+                match find_profile_directories(process_info, candidate.pid).as_slice() {
+                    [profile] => Some(profile.clone()),
+                    _ => None,
+                };
             let mut observed = ObservedClient::with_profile_directory(
                 candidate.clone(),
                 None,
@@ -2650,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matching_rejects_conflicting_current_title_when_initial_title_is_generic() {
+    fn test_matching_allows_live_title_changes_when_initial_title_is_generic() {
         let mut target = make_client(
             "example-app",
             1,
@@ -2677,7 +2808,46 @@ mod tests {
         current.initial_title = "Example App".to_string();
         let observed = ObservedClient::from_hypr_client(current, None, None);
 
-        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+        let plan = plan_reconciliation(&[target], &[observed]);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].map(|pair| pair.kind), Some(MatchKind::AppIdentity));
+    }
+
+    #[test]
+    fn test_replacement_target_does_not_accept_ambiguous_generic_title_match() {
+        let mut target = make_client(
+            "example-app",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "example-app",
+            vec![],
+            None,
+        );
+        target.initial_title = "Example App".to_string();
+        target.title = "Project A".to_string();
+
+        let mut current = make_reconcile_window(
+            "0xextra",
+            "example-app",
+            "Project B",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.initial_title = "Example App".to_string();
+        let mock = MockHyprctl::new(vec![vec![current]]);
+
+        assert!(!replacement_target_is_complete(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
     }
 
     #[test]
@@ -2955,6 +3125,22 @@ mod tests {
         }
     }
 
+    struct ReliableStartTimeUnavailableProcessInfo;
+
+    impl ProcessInfoProvider for ReliableStartTimeUnavailableProcessInfo {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, _pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Ok(vec![])
+        }
+
+        fn has_reliable_process_start_time(&self) -> bool {
+            true
+        }
+    }
+
     struct StartTimeRelatedProcessInfo {
         start_time: u64,
         children: HashMap<u32, Vec<ChildProcess>>,
@@ -3027,6 +3213,20 @@ mod tests {
 
         assert!(!launched_process_is_related(&launched, 2000, &reused));
         assert!(launched_process_is_related(&launched, 2000, &same_process));
+    }
+
+    #[test]
+    fn test_launch_correlation_fails_closed_when_reliable_start_time_is_unavailable() {
+        let launched = LaunchedProcess {
+            pid: Some(1000),
+            start_time: None,
+        };
+
+        assert!(!launched_process_is_related(
+            &launched,
+            1000,
+            &ReliableStartTimeUnavailableProcessInfo
+        ));
     }
 
     #[test]

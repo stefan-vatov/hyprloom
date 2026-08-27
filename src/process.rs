@@ -58,6 +58,14 @@ pub trait ProcessInfoProvider {
         Err(ProcessError::NotFound(pid))
     }
 
+    /// Return whether a failed start-time read is meaningful for this
+    /// provider.  Real `/proc` inspection is reliable enough to fail closed;
+    /// small test doubles and integrations that do not model timestamps can
+    /// retain the historical PID-only fallback.
+    fn has_reliable_process_start_time(&self) -> bool {
+        false
+    }
+
     /// Return whether `candidate_pid` is the root process or one of its
     /// descendants.  This is used to correlate a newly launched process with
     /// the window it eventually creates.
@@ -131,6 +139,10 @@ impl ProcessInfoProvider for RealProcessInfo {
 
     fn get_start_time(&self, pid: u32) -> Result<u64, ProcessError> {
         read_process_start_time(pid)
+    }
+
+    fn has_reliable_process_start_time(&self) -> bool {
+        true
     }
 }
 
@@ -248,12 +260,13 @@ pub fn select_terminal_process(
         .iter()
         .filter(|child| !child.cwd.as_os_str().is_empty() && is_plain_shell(&child.cmdline))
         .count();
-    if shell_count > 1 {
+    if shell_count != 1 {
         // A terminal server, multiplexer, or single-instance terminal can
-        // expose several shell descendants for one Hyprland client PID.  No
-        // process-level signal tells us which shell belongs to that window,
-        // so returning an arbitrary shell would capture another window's CWD
-        // or command and later use it as false identity evidence.
+        // expose several shell descendants for one Hyprland client PID.  An
+        // unrecognised shell leaves no trustworthy shell candidate.  In both
+        // cases no process-level signal tells us which child belongs to that
+        // window, so returning an arbitrary descendant would capture another
+        // window's CWD or command and later use it as false identity evidence.
         return None;
     }
     select_terminal_child(&descendants).cloned()
@@ -479,6 +492,25 @@ mod tests {
                     cmdline: "bash".to_string(),
                 },
             ],
+        );
+        let process_info = MockProcessInfo {
+            cwds: HashMap::new(),
+            children,
+        };
+
+        assert!(select_terminal_process(&process_info, 1).is_none());
+    }
+
+    #[test]
+    fn test_terminal_selection_rejects_unknown_shell_fallback() {
+        let mut children = HashMap::new();
+        children.insert(
+            1,
+            vec![ChildProcess {
+                pid: 20,
+                cwd: PathBuf::from("/work"),
+                cmdline: "nu".to_string(),
+            }],
         );
         let process_info = MockProcessInfo {
             cwds: HashMap::new(),

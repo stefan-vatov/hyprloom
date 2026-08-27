@@ -1,8 +1,8 @@
 use crate::config::{app_config_for, is_ignored_class, AppConfig, Config};
 use crate::hyprctl::{HyprctlClient, HyprctlError};
 use crate::process::{
-    find_profile_directories, find_profile_directory, is_helper_process, is_plain_shell,
-    select_terminal_process, ProcessError, ProcessInfoProvider,
+    find_profile_directories, is_helper_process, is_plain_shell, select_terminal_process,
+    ProcessError, ProcessInfoProvider,
 };
 use crate::session::{LaunchInfo, Monitor, Session, SessionClient};
 use chrono::Utc;
@@ -56,13 +56,37 @@ pub fn capture_session(
         })
         .collect();
 
+    let brave_window_counts = raw_clients
+        .iter()
+        .filter(|client| is_brave_client(client))
+        .fold(HashMap::<u32, usize>::new(), |mut counts, client| {
+            *counts.entry(client.pid).or_default() += 1;
+            counts
+        });
+    let brave_profiles_by_pid: HashMap<u32, Vec<String>> = raw_clients
+        .iter()
+        .filter(|client| is_brave_client(client))
+        .map(|client| {
+            (
+                client.pid,
+                find_profile_directories(process_info, client.pid),
+            )
+        })
+        .collect();
+
     let clients: Vec<SessionClient> = raw_clients
         .iter()
         .filter(|c| {
             !is_ignored_class(&c.class, &config.filters.ignore_classes)
                 && !is_ignored_class(&c.initial_class, &config.filters.ignore_classes)
         })
-        .map(|c| build_session_client(c, &monitor_map, process_info, config))
+        .map(|c| {
+            let profile_directory = brave_profiles_by_pid
+                .get(&c.pid)
+                .and_then(|profiles| profile_for_window(profiles, brave_window_counts.get(&c.pid)))
+                .map(str::to_string);
+            build_session_client(c, &monitor_map, process_info, config, profile_directory)
+        })
         .collect();
 
     let brave_profiles = if clients.iter().any(|c| {
@@ -80,11 +104,21 @@ pub fn capture_session(
             None => {
                 let active_directories: Vec<String> = raw_clients
                     .iter()
-                    .filter(|client| {
-                        client.class.eq_ignore_ascii_case("brave-browser")
-                            || client.initial_class.eq_ignore_ascii_case("brave-browser")
+                    .filter(|client| is_brave_client(client))
+                    .flat_map(|client| {
+                        brave_profiles_by_pid
+                            .get(&client.pid)
+                            .into_iter()
+                            .flat_map(|profiles| {
+                                if profiles.is_empty()
+                                    && brave_window_counts.get(&client.pid) == Some(&1)
+                                {
+                                    vec!["Default".to_string()]
+                                } else {
+                                    profiles.clone()
+                                }
+                            })
                     })
-                    .flat_map(|client| find_profile_directories(process_info, client.pid))
                     .collect();
                 crate::brave::filter_profiles_by_active_directories(
                     all_profiles,
@@ -113,6 +147,7 @@ fn build_session_client(
     monitor_map: &HashMap<i32, String>,
     process_info: &dyn ProcessInfoProvider,
     config: &Config,
+    profile_directory: Option<String>,
 ) -> SessionClient {
     let monitor_name = monitor_map
         .get(&client.monitor)
@@ -122,10 +157,7 @@ fn build_session_client(
     let app_config = app_config_for(config, &client.class, &client.initial_class);
     let launch = build_launch_info(client, app_config, process_info);
 
-    let profile_directory = find_profile_directory(process_info, client.pid);
-    let profile_identity_ambiguous = (client.class.eq_ignore_ascii_case("brave-browser")
-        || client.initial_class.eq_ignore_ascii_case("brave-browser"))
-        && profile_directory.is_none();
+    let profile_identity_ambiguous = is_brave_client(client) && profile_directory.is_none();
 
     SessionClient {
         class: client.class.clone(),
@@ -152,6 +184,19 @@ fn build_session_client(
         profile_identity_ambiguous,
         focus_history_id: client.focus_history_id,
         launch,
+    }
+}
+
+fn is_brave_client(client: &crate::hyprctl::HyprClient) -> bool {
+    client.class.eq_ignore_ascii_case("brave-browser")
+        || client.initial_class.eq_ignore_ascii_case("brave-browser")
+}
+
+fn profile_for_window<'a>(profiles: &'a [String], window_count: Option<&usize>) -> Option<&'a str> {
+    match profiles {
+        [profile] if window_count == Some(&1) => Some(profile.as_str()),
+        [] if window_count == Some(&1) => Some("Default"),
+        _ => None,
     }
 }
 
@@ -517,6 +562,12 @@ mod tests {
             "no args expected without CWD capture"
         );
         assert!(launch.hint.is_none());
+        assert_eq!(
+            session.clients[0].profile_directory.as_deref(),
+            Some("Default"),
+            "a lone Brave window without a profile flag is the Default profile"
+        );
+        assert!(!session.clients[0].profile_identity_ambiguous);
     }
 
     #[test]
