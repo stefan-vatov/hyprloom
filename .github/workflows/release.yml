@@ -22,8 +22,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate release version
+        id: version
         run: |
           tag_version="${GITHUB_REF_NAME#v}"
+          echo "version=${tag_version}" >> "$GITHUB_OUTPUT"
           cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
           pkg_version="$(sed -n 's/^pkgver=//p' PKGBUILD | head -n 1)"
           test "$tag_version" = "$cargo_version"
@@ -35,23 +37,21 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
-      - name: Validate Arch package
+      - name: Create deterministic source archive
         run: |
-          docker run --rm -v "$GITHUB_WORKSPACE":/pkg -w /pkg archlinux:latest \
-            bash -euxo pipefail -c '
-              pacman -Sy --noconfirm base-devel rust
-              useradd -m builder
-              chown -R builder:builder /pkg
-              su builder -c "makepkg --verifysource --nodeps"
-              su builder -c "makepkg --nodeps --noconfirm"
-              test -n "$(find /pkg -maxdepth 1 -type f -name "*.pkg.tar.*" -print -quit)"
-            '
+          tag_version="${{ steps.version.outputs.version }}"
+          git archive --format=tar --prefix="hyprloom-${tag_version}/" \
+            --mtime="1970-01-01" HEAD | gzip -n > "hyprloom-${tag_version}.tar.gz"
+          test -s "hyprloom-${tag_version}.tar.gz"
+          tar -tzf "hyprloom-${tag_version}.tar.gz" >/dev/null
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: target/release/hyprloom
+          files: |
+            target/release/hyprloom
+            hyprloom-${{ steps.version.outputs.version }}.tar.gz
 
   # Publishes the updated PKGBUILD to AUR.
   # Required secret: AUR_SSH_PRIVATE_KEY
@@ -73,16 +73,10 @@ jobs:
         id: checksum
         run: |
           curl --fail --show-error --location --retry 3 --retry-all-errors \
-            "https://github.com/thethracian/hyprloom/archive/${GITHUB_REF_NAME}.tar.gz" \
+            "https://github.com/thethracian/hyprloom/releases/download/${GITHUB_REF_NAME}/hyprloom-${{ steps.version.outputs.version }}.tar.gz" \
             -o source.tar.gz
           test -s source.tar.gz
           tar -tzf source.tar.gz >/dev/null
-          curl --fail --show-error --location --retry 3 --retry-all-errors \
-            "https://codeload.github.com/thethracian/hyprloom/tar.gz/refs/tags/${GITHUB_REF_NAME}" \
-            -o source-verify.tar.gz
-          test -s source-verify.tar.gz
-          tar -tzf source-verify.tar.gz >/dev/null
-          cmp --silent source.tar.gz source-verify.tar.gz
           sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
 
@@ -105,6 +99,19 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.checksum.outputs.sha256 }}')/" PKGBUILD
+
+      - name: Validate Arch package
+        working-directory: aur-repo
+        run: |
+          docker run --rm -v "$PWD":/pkg -w /pkg archlinux:latest \
+            bash -euxo pipefail -c '
+              pacman -Sy --noconfirm base-devel rust
+              useradd -m builder
+              chown -R builder:builder /pkg
+              su builder -c "makepkg --verifysource --nodeps"
+              su builder -c "makepkg --nodeps --noconfirm"
+              test -n "$(find /pkg -maxdepth 1 -type f -name "*.pkg.tar.*" -print -quit)"
+            '
 
       - name: Generate .SRCINFO
         working-directory: aur-repo
