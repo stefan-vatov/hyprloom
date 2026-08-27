@@ -1831,6 +1831,7 @@ mod tests {
         // First client: kitty
         let kitty = &clients[0];
         assert_eq!(kitty.address, "0x55c46f7e1350");
+        assert_eq!(kitty.stable_id.as_deref(), Some("18000001"));
         assert_eq!(kitty.class, "kitty");
         assert_eq!(kitty.initial_class, "kitty");
         assert_eq!(kitty.title, "Claude Code");

@@ -10,6 +10,7 @@
     "monitor": 0,
     "class": "kitty",
     "title": "Claude Code",
+    "stableId": "18000001",
     "initialClass": "kitty",
     "initialTitle": "kitty",
     "pid": 9537,
