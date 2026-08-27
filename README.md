@@ -9,7 +9,7 @@ When you reboot or after a power loss, hyprloom restores your applications to th
 - **Save** current session — captures all windows, positions, workspaces, and monitor layout
 - **Restore** saved session — relaunches apps and positions them precisely
 - **Reconcile** saved session — reuses open windows, repairs only mismatches, and leaves extras alone
-- **Replace** current desktop — saves a safety autosnapshot, closes current windows, and restores one loaded target
+- **Replace** current desktop — saves a safety autosnapshot, closes current windows, restores one loaded target, and attempts recovery if it fails
 - **Monitor-aware geometry** — adapts captured positions and sizes when a known monitor moves or changes resolution
 - **Kitty terminal support** — restores working directory + shows hint of last command
 - **Ghostty-aware restore** — recognizes the Linux app class and restores its working directory when configured
@@ -46,7 +46,7 @@ hyprloom restore           # restores "latest"
 hyprloom restore work      # restores "work"
 hyprloom restore --dry-run # preview without executing
 hyprloom restore work --reconcile # repair/reuse open windows; launch only missing ones
-hyprloom replace work      # safety backup, close current windows, then restore work
+hyprloom replace work      # safety backup, close current windows, then restore work (with recovery on failure)
 hyprloom restore --max-age 24h  # skip if session older than 24h
 hyprloom restore --on-login     # print exec-once line for hyprland.conf
 
@@ -110,6 +110,8 @@ pass is idempotent. Use the normal `restore` mode for additive launch/repair
 behavior, or `replace`/Deskloom's Replace action when you want a clean desktop
 first. Replace validates every target before closing the current windows and
 keeps a safety autosnapshot named with the `autosave-` prefix.
+Replace closes every current Hyprland client, including clients excluded by
+the capture filters; use reconciliation when extras should remain untouched.
 
 ### Brave Profile Support
 

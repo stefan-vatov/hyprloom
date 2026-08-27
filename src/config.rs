@@ -1,12 +1,22 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 
 /// Safety limits for values that control sleeps and polling loops.  They keep
 /// a damaged config from making automatic restore appear hung indefinitely.
 pub const MAX_RESTORE_DELAY_MS: u64 = 60_000;
+pub const MIN_WINDOW_DETECT_TIMEOUT_MS: u64 = 500;
 pub const MAX_WINDOW_DETECT_TIMEOUT_MS: u64 = 120_000;
 pub const MAX_AUTOSAVE_RETAIN: usize = 1_000;
+pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+pub const MAX_CONFIG_APPS: usize = 1_024;
+pub const MAX_CONFIG_FILTERS: usize = 4_096;
+pub const MAX_CONFIG_PROFILE_WORKSPACES: usize = 4_096;
+pub const MAX_CONFIG_STRING_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -27,7 +37,7 @@ impl Config {
         self.general.window_detect_timeout_ms = self
             .general
             .window_detect_timeout_ms
-            .min(MAX_WINDOW_DETECT_TIMEOUT_MS);
+            .clamp(MIN_WINDOW_DETECT_TIMEOUT_MS, MAX_WINDOW_DETECT_TIMEOUT_MS);
         self.general.autosave_retain = self.general.autosave_retain.min(MAX_AUTOSAVE_RETAIN);
     }
 }
@@ -139,32 +149,116 @@ impl Default for FilterConfig {
 
 pub fn load_config() -> Config {
     for path in [config_path(), legacy_config_path()] {
-        if path.exists() {
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(error) => {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let content = match read_config_file(&path) {
+                    Ok(content) => content,
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: could not read config '{}': {error}; using defaults",
+                            path.display()
+                        );
+                        return Config::default();
+                    }
+                };
+                let mut config: Config = match toml::from_str(&content) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: could not parse config '{}': {error}; using defaults",
+                            path.display()
+                        );
+                        return Config::default();
+                    }
+                };
+                if let Err(error) = validate_config_structure(&config) {
                     eprintln!(
-                        "Warning: could not read config '{}': {error}; using defaults",
+                        "Warning: config '{}' exceeds safety limits: {error}; using defaults",
                         path.display()
                     );
                     return Config::default();
                 }
-            };
-            let mut config: Config = match toml::from_str(&content) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!(
-                        "Warning: could not parse config '{}': {error}; using defaults",
-                        path.display()
-                    );
-                    return Config::default();
-                }
-            };
-            config.normalize();
-            return config;
+                config.normalize();
+                return config;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!(
+                    "Warning: could not inspect config '{}': {error}; using defaults",
+                    path.display()
+                );
+                return Config::default();
+            }
         }
     }
     Config::default()
+}
+
+fn read_config_file(path: &std::path::Path) -> Result<String, String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|error| error.to_string())?;
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("config path is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_CONFIG_FILE_BYTES {
+        return Err(format!("file is larger than {MAX_CONFIG_FILE_BYTES} bytes"));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_CONFIG_FILE_BYTES) as usize);
+    file.take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+        return Err(format!("file is larger than {MAX_CONFIG_FILE_BYTES} bytes"));
+    }
+    String::from_utf8(bytes).map_err(|error| error.to_string())
+}
+
+fn validate_config_structure(config: &Config) -> Result<(), String> {
+    validate_config_text("default session", &config.general.default_session)?;
+    if config.filters.ignore_classes.len() > MAX_CONFIG_FILTERS {
+        return Err(format!("more than {MAX_CONFIG_FILTERS} ignored classes"));
+    }
+    for class in &config.filters.ignore_classes {
+        validate_config_text("ignored class", class)?;
+    }
+    if config.apps.len() > MAX_CONFIG_APPS {
+        return Err(format!("more than {MAX_CONFIG_APPS} app configurations"));
+    }
+    for (name, app) in &config.apps {
+        validate_config_text("app name", name)?;
+        for (label, value) in [
+            ("app binary", app.binary.as_deref()),
+            ("app hint template", app.hint_template.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_config_text(label, value)?;
+            }
+        }
+        if let Some(workspaces) = &app.profile_workspaces {
+            if workspaces.len() > MAX_CONFIG_PROFILE_WORKSPACES {
+                return Err(format!(
+                    "more than {MAX_CONFIG_PROFILE_WORKSPACES} profile workspace mappings"
+                ));
+            }
+            for profile in workspaces.keys() {
+                validate_config_text("profile workspace name", profile)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_config_text(label: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_CONFIG_STRING_BYTES {
+        return Err(format!(
+            "{label} is longer than {MAX_CONFIG_STRING_BYTES} bytes"
+        ));
+    }
+    Ok(())
 }
 
 pub fn config_path() -> PathBuf {
@@ -293,6 +387,29 @@ hint_template = "{cwd}"
             MAX_WINDOW_DETECT_TIMEOUT_MS
         );
         assert_eq!(config.general.autosave_retain, MAX_AUTOSAVE_RETAIN);
+
+        config.general.window_detect_timeout_ms = 100;
+        config.normalize();
+        assert_eq!(
+            config.general.window_detect_timeout_ms,
+            MIN_WINDOW_DETECT_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn test_config_file_and_structure_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, vec![b' '; MAX_CONFIG_FILE_BYTES as usize + 1]).unwrap();
+        assert!(read_config_file(&path).is_err());
+
+        let mut config = Config::default();
+        config.general.default_session = "x".repeat(MAX_CONFIG_STRING_BYTES + 1);
+        assert!(validate_config_structure(&config).is_err());
+
+        config.general.default_session = "latest".to_string();
+        config.filters.ignore_classes = vec!["class".to_string(); MAX_CONFIG_FILTERS + 1];
+        assert!(validate_config_structure(&config).is_err());
     }
 
     #[test]

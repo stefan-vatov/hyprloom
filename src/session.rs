@@ -2,10 +2,12 @@ use crate::config::MAX_AUTOSAVE_RETAIN;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const MAX_SESSION_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -110,6 +112,67 @@ pub struct SessionSummary {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub client_count: usize,
+}
+
+/// Process-wide lock for all CLI operations that can observe or mutate the
+/// desktop/session store.  Keeping this in the helper means the UI, systemd
+/// autosave, and manually invoked commands share one serialization boundary.
+pub struct OperationLock {
+    file: File,
+}
+
+impl OperationLock {
+    pub fn acquire() -> Result<Self, SessionError> {
+        let lock_dir = operation_lock_dir()?;
+        match std::fs::symlink_metadata(&lock_dir) {
+            Ok(metadata) if metadata.is_dir() => ensure_private_directory(&lock_dir)?,
+            Ok(_) => return Err(SessionError::UnsafePath(lock_dir.display().to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&lock_dir)?;
+                ensure_private_directory(&lock_dir)?;
+            }
+            Err(error) => return Err(SessionError::Io(error)),
+        }
+
+        let path = lock_dir.join("operation.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+        }
+        let file = options.open(&path)?;
+        ensure_private_file(&path, "operation.lock")?;
+
+        #[cfg(unix)]
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(SessionError::Io(std::io::Error::last_os_error()));
+        }
+
+        Ok(Self { file })
+    }
+}
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn operation_lock_dir() -> Result<std::path::PathBuf, SessionError> {
+    dirs::runtime_dir()
+        .or_else(dirs::state_dir)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("state")))
+        .map(|root| root.join("hyprloom"))
+        .ok_or_else(|| {
+            SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not determine a user state directory for the operation lock",
+            ))
+        })
 }
 
 pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), SessionError> {
@@ -308,6 +371,7 @@ pub fn migrate_legacy_sessions(
 // === Autosave helpers ===
 
 pub const AUTOSAVE_PREFIX: &str = "autosave-";
+const REPLACE_MARKER_NAME: &str = ".replace-in-progress";
 static AUTOSAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn autosave_name_now() -> String {
@@ -319,6 +383,64 @@ pub fn autosave_name_now() -> String {
         std::process::id(),
         sequence
     )
+}
+
+/// Record that a replace operation has a saved desktop which can be used for
+/// recovery if the helper is interrupted after it starts closing windows.
+pub fn mark_replace_in_progress(
+    backup_name: &str,
+    sessions_dir: &std::path::Path,
+) -> Result<(), SessionError> {
+    validate_session_name(backup_name)?;
+    ensure_sessions_dir(sessions_dir)?;
+    atomic_write(
+        &sessions_dir.join(REPLACE_MARKER_NAME),
+        backup_name.as_bytes(),
+    )
+}
+
+pub fn pending_replace_backup(
+    sessions_dir: &std::path::Path,
+) -> Result<Option<String>, SessionError> {
+    if !existing_sessions_dir(sessions_dir)? {
+        return Ok(None);
+    }
+    let path = sessions_dir.join(REPLACE_MARKER_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(SessionError::UnsafePath(REPLACE_MARKER_NAME.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(SessionError::Io(error)),
+    }
+    let content = read_limited_file(&path, REPLACE_MARKER_NAME)?;
+    let name = std::str::from_utf8(&content)
+        .map_err(|error| {
+            SessionError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            ))
+        })?
+        .trim()
+        .to_string();
+    validate_session_name(&name)?;
+    Ok(Some(name))
+}
+
+pub fn clear_replace_marker(sessions_dir: &std::path::Path) -> Result<(), SessionError> {
+    if !existing_sessions_dir(sessions_dir)? {
+        return Ok(());
+    }
+    let path = sessions_dir.join(REPLACE_MARKER_NAME);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            ensure_private_file(&path, REPLACE_MARKER_NAME)?;
+            std::fs::remove_file(path)?;
+        }
+        Ok(_) => return Err(SessionError::UnsafePath(REPLACE_MARKER_NAME.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(SessionError::Io(error)),
+    }
+    Ok(())
 }
 
 /// Returns autosave sessions only (name starts with `AUTOSAVE_PREFIX`),
@@ -410,18 +532,25 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
 }
 
 fn read_limited_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionError> {
-    let metadata = std::fs::symlink_metadata(path)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(SessionError::UnsafePath(label.to_string()));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(SessionError::UnsafePath(label.to_string()));
+    }
     if metadata.len() > MAX_SESSION_FILE_BYTES {
         return Err(SessionError::TooLarge(format!(
             "'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes"
         )));
     }
 
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
-    let mut file = options.open(path)?;
     let mut content = Vec::with_capacity(metadata.len().min(MAX_SESSION_FILE_BYTES) as usize);
     Read::by_ref(&mut file)
         .take(MAX_SESSION_FILE_BYTES.saturating_add(1))
@@ -887,6 +1016,18 @@ mod tests {
     #[test]
     fn test_autosave_names_are_unique_within_a_process() {
         assert_ne!(autosave_name_now(), autosave_name_now());
+    }
+
+    #[test]
+    fn test_replace_recovery_marker_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_replace_in_progress("autosave-recovery", dir.path()).unwrap();
+        assert_eq!(
+            pending_replace_backup(dir.path()).unwrap().as_deref(),
+            Some("autosave-recovery")
+        );
+        clear_replace_marker(dir.path()).unwrap();
+        assert_eq!(pending_replace_backup(dir.path()).unwrap(), None);
     }
 
     #[test]

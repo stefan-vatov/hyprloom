@@ -1,7 +1,13 @@
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const SERVICE_NAME: &str = "hyprloom-autosave.service";
 const TIMER_NAME: &str = "hyprloom-autosave.timer";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn systemd_user_dir() -> PathBuf {
     dirs::config_dir()
@@ -59,9 +65,77 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
 
     let service_path = systemd_dir.join(SERVICE_NAME);
     let timer_path = systemd_dir.join(TIMER_NAME);
-    std::fs::write(&service_path, service_content())?;
-    std::fs::write(&timer_path, timer_content())?;
+    let previous_service = match std::fs::read(&service_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    atomic_write(&service_path, service_content().as_bytes())?;
+    if let Err(error) = atomic_write(&timer_path, timer_content().as_bytes()) {
+        // Do not leave a newly-written service paired with a stale or
+        // truncated timer when the second replacement fails.
+        match previous_service {
+            Some(contents) => {
+                let _ = atomic_write(&service_path, &contents);
+            }
+            None => {
+                let _ = std::fs::remove_file(&service_path);
+            }
+        }
+        return Err(error);
+    }
     Ok((service_path, timer_path))
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "systemd unit path has no parent directory",
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unit");
+
+    for _ in 0..100 {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o644);
+
+        let mut file = match options.open(&temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        let write_result = file.write_all(contents).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+            let _ = directory.sync_all();
+        }
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary systemd unit path",
+    ))
 }
 
 pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {

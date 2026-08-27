@@ -7,9 +7,11 @@ use hyprloom::hyprctl::RealHyprctl;
 use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::{replace_session, restore_session, validate_replacement_targets};
 use hyprloom::session::{
-    autosave_name_now, delete_session, list_sessions, load_session, migrate_legacy_sessions,
-    save_session, session_exists,
+    autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
+    mark_replace_in_progress, migrate_legacy_sessions, pending_replace_backup, save_session,
+    session_exists, OperationLock,
 };
+use std::path::Path;
 
 #[derive(Parser)]
 #[command(
@@ -53,7 +55,7 @@ enum Commands {
         #[arg(long)]
         on_login: bool,
     },
-    /// Close the current desktop and restore a saved session atomically.
+    /// Replace the current desktop and automatically attempt safety recovery.
     Replace {
         /// Session name to replace the current desktop with
         name: String,
@@ -85,8 +87,22 @@ fn main() {
     let cli = Cli::parse();
     let config = load_config();
     let sessions_dir = sessions_dir();
+    let _operation_lock = match OperationLock::acquire() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Error acquiring hyprloom operation lock: {error}");
+            std::process::exit(1);
+        }
+    };
     if let Err(error) = migrate_legacy_sessions(&sessions_dir, &legacy_sessions_dir()) {
         eprintln!("Warning: could not migrate legacy hyprflow sessions: {error}");
+    }
+    let recovery_ready = recover_pending_replace(&sessions_dir, &config);
+    if !recovery_ready && command_requires_clean_recovery(&cli.command) {
+        eprintln!(
+            "A previous desktop replacement still needs recovery; retry after Hyprland is available."
+        );
+        std::process::exit(1);
     }
 
     match cli.command {
@@ -306,6 +322,10 @@ fn main() {
                 eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
             }
+            if let Err(error) = mark_replace_in_progress(&backup_name, &sessions_dir) {
+                eprintln!("Replace cancelled: could not record recovery marker: {error}");
+                std::process::exit(1);
+            }
 
             match replace_session(
                 &session,
@@ -329,13 +349,37 @@ fn main() {
                     for detail in &report.details {
                         println!("  {detail}");
                     }
-                    if report.failed > 0 {
+                    if report.failed > 0 || report.skipped > 0 {
+                        eprintln!(
+                            "Replacement was incomplete; attempting safety recovery from '{}'.",
+                            backup_name
+                        );
+                        if report_safety_recovery(
+                            &backup,
+                            &hyprctl,
+                            &process_info,
+                            &config,
+                            cli.verbose,
+                        ) {
+                            clear_recovery_marker(&sessions_dir);
+                        }
                         std::process::exit(1);
+                    } else {
+                        clear_recovery_marker(&sessions_dir);
                     }
                 }
                 Err(error) => {
                     eprintln!("Error replacing desktop: {error}");
-                    eprintln!("Safety backup is available as '{backup_name}'.");
+                    eprintln!("Attempting safety recovery from '{backup_name}' before giving up.");
+                    if report_safety_recovery(
+                        &backup,
+                        &hyprctl,
+                        &process_info,
+                        &config,
+                        cli.verbose,
+                    ) {
+                        clear_recovery_marker(&sessions_dir);
+                    }
                     std::process::exit(1);
                 }
             }
@@ -531,6 +575,96 @@ fn main() {
                     println!("To disable: hyprloom autosave --uninstall");
                 }
             }
+        }
+    }
+}
+
+fn clear_recovery_marker(sessions_dir: &Path) -> bool {
+    if let Err(error) = clear_replace_marker(sessions_dir) {
+        eprintln!("Warning: could not clear replacement recovery marker: {error}");
+        return false;
+    }
+    true
+}
+
+fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Config) -> bool {
+    let backup_name = match pending_replace_backup(sessions_dir) {
+        Ok(Some(name)) => name,
+        Ok(None) => return true,
+        Err(error) => {
+            eprintln!("Warning: could not inspect replacement recovery marker: {error}");
+            return false;
+        }
+    };
+    eprintln!(
+        "Found an interrupted desktop replacement; attempting recovery from '{backup_name}'."
+    );
+    let backup = match load_session(&backup_name, sessions_dir) {
+        Ok(backup) => backup,
+        Err(error) => {
+            eprintln!("Warning: could not load replacement recovery snapshot: {error}");
+            return false;
+        }
+    };
+    let hyprctl = RealHyprctl;
+    let process_info = RealProcessInfo;
+    if report_safety_recovery(&backup, &hyprctl, &process_info, config, false) {
+        return clear_recovery_marker(sessions_dir);
+    }
+    false
+}
+
+fn command_requires_clean_recovery(command: &Commands) -> bool {
+    !matches!(
+        command,
+        Commands::List | Commands::Config | Commands::Restore { on_login: true, .. }
+    )
+}
+
+fn report_safety_recovery(
+    backup: &hyprloom::session::Session,
+    hyprctl: &RealHyprctl,
+    process_info: &RealProcessInfo,
+    config: &hyprloom::config::Config,
+    verbose: bool,
+) -> bool {
+    match hyprloom::restore::reconcile_session(
+        backup,
+        hyprctl,
+        process_info,
+        config,
+        false,
+        verbose,
+    ) {
+        Ok(report) if report.failed == 0 && report.skipped == 0 => {
+            eprintln!(
+                "Safety recovery pass completed: {} unchanged, {} moved, {} launched, {} skipped.",
+                report.unchanged, report.moved, report.launched, report.skipped
+            );
+            for detail in &report.details {
+                eprintln!("  recovery: {detail}");
+            }
+            true
+        }
+        Ok(report) => {
+            eprintln!(
+                "Safety recovery was partial: {} unchanged, {} moved, {} launched, {} skipped, {} failed.",
+                report.unchanged,
+                report.moved,
+                report.launched,
+                report.skipped,
+                report.failed
+            );
+            for detail in &report.details {
+                eprintln!("  recovery: {detail}");
+            }
+            eprintln!("The safety backup remains available for another retry.");
+            false
+        }
+        Err(error) => {
+            eprintln!("Safety recovery could not run: {error}");
+            eprintln!("The safety backup remains available for another retry.");
+            false
         }
     }
 }

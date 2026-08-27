@@ -5,6 +5,8 @@ use crate::process::{
 };
 use crate::session::{Monitor, Session, SessionClient};
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -432,17 +434,28 @@ pub fn restore_session(
     dry_run: bool,
     verbose: bool,
 ) -> Result<RestoreReport, RestoreError> {
+    let process_info = RealProcessInfo;
+    restore_session_with_process_info(session, hyprctl, &process_info, config, dry_run, verbose)
+}
+
+fn restore_session_with_process_info(
+    session: &Session,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+    dry_run: bool,
+    verbose: bool,
+) -> Result<RestoreReport, RestoreError> {
     let mut report = RestoreReport::default();
 
     // Fetch current windows once to detect already-running duplicates.
-    let mut existing_clients = Vec::new();
-    if !dry_run {
-        if let Ok(current) = hyprctl.get_clients() {
-            existing_clients = current;
-        }
-    }
     let mut consumed_existing = HashSet::new();
     let current_monitors = hyprctl.get_monitors()?;
+    let existing_clients = if dry_run {
+        Vec::new()
+    } else {
+        observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?
+    };
 
     // Detect if profile-based Brave restore applies.
     let has_brave_profiles =
@@ -500,35 +513,30 @@ pub fn restore_session(
             // different workspace or monitor.  This keeps the legacy command
             // useful on its own while sharing the same placement semantics as
             // --reconcile.
-            if let Some(existing_index) = find_existing_restore_match(
-                client,
-                &existing_clients,
-                &consumed_existing,
-                &current_monitors,
-                config,
-            ) {
+            if let Some(existing_index) =
+                find_existing_restore_match(client, &existing_clients, &consumed_existing, config)
+            {
                 let current = existing_clients[existing_index].clone();
-                consumed_existing.insert(current.address.clone());
-                let current_monitor = monitor_name_for_id(&current_monitors, current.monitor);
+                consumed_existing.insert(current.client.address.clone());
                 let commands = build_reconcile_dispatch_commands(
                     &restore_client,
-                    &current,
-                    current_monitor.as_deref(),
+                    &current.client,
+                    current.monitor_name.as_deref(),
                 );
                 if commands.is_empty() {
                     report.details.push(format!(
                         "SKIP: {} already on ws={}",
-                        current.class, client.workspace
+                        current.client.class, client.workspace
                     ));
                     report.skipped += 1;
                 } else {
-                    match dispatch_existing_repairs(&current, &commands, hyprctl) {
+                    match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
                         Ok(()) => {
                             report.restored += 1;
                             if verbose {
                                 report.details.push(format!(
                                     "OK: repaired {} at address {}",
-                                    client.class, current.address
+                                    client.class, current.client.address
                                 ));
                             }
                         }
@@ -536,7 +544,7 @@ pub fn restore_session(
                             report.failed += 1;
                             report.details.push(format!(
                                 "FAIL: {} at address {} — {error}",
-                                client.class, current.address
+                                client.class, current.client.address
                             ));
                         }
                     }
@@ -554,7 +562,7 @@ pub fn restore_session(
                 report.failed += 1;
                 continue;
             }
-            if which::which(&launch_command[0]).is_err() {
+            if resolve_launch_binary(&launch_command[0], &client.class).is_err() {
                 let msg = format!(
                     "SKIP: binary '{}' not found for {}",
                     launch_command[0], client.class
@@ -566,7 +574,13 @@ pub fn restore_session(
                 continue;
             }
 
-            match restore_single_client(&restore_client, hyprctl, config, verbose) {
+            match restore_single_client_with_launcher_and_process_info(
+                &restore_client,
+                hyprctl,
+                process_info,
+                config,
+                &RealProcessLauncher,
+            ) {
                 Ok(msg) => {
                     if verbose {
                         report.details.push(msg);
@@ -593,7 +607,6 @@ pub fn restore_session(
                 is_brave_client(&target.client) && target.client.profile_directory.is_some()
             })
             .collect();
-        let process_info = RealProcessInfo;
         let launcher = RealProcessLauncher;
 
         for mut target in profile_targets {
@@ -623,7 +636,7 @@ pub fn restore_session(
                 report.failed += 1;
                 continue;
             }
-            if which::which(&launch_command[0]).is_err() {
+            if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
                 report.details.push(format!(
                     "SKIP: binary '{}' not found for {}",
                     launch_command[0], target.label
@@ -635,7 +648,7 @@ pub fn restore_session(
             match restore_single_client_with_launcher_and_process_info(
                 &target.client,
                 hyprctl,
-                &process_info,
+                process_info,
                 config,
                 &launcher,
             ) {
@@ -660,33 +673,27 @@ pub fn restore_session(
 
 fn find_existing_restore_match(
     target: &SessionClient,
-    existing: &[HyprClient],
+    existing: &[ObservedClient],
     consumed: &HashSet<String>,
-    monitors: &[HyprMonitor],
     config: &Config,
 ) -> Option<usize> {
     existing
         .iter()
         .enumerate()
         .filter(|(_, current)| {
-            !consumed.contains(&current.address)
-                && !is_ignored_class(&current.class, &config.filters.ignore_classes)
-                && !is_ignored_class(&current.initial_class, &config.filters.ignore_classes)
+            !consumed.contains(&current.client.address)
+                && !is_ignored_class(&current.client.class, &config.filters.ignore_classes)
+                && !is_ignored_class(
+                    &current.client.initial_class,
+                    &config.filters.ignore_classes,
+                )
         })
         .filter_map(|(index, current)| {
-            let monitor_name = monitor_name_for_id(monitors, current.monitor);
-            let observed = ObservedClient::from_hypr_client(current.clone(), monitor_name, None);
-            match_score(target, &observed).map(|(score, _)| (score, current.address.clone(), index))
+            match_score(target, current)
+                .map(|(score, _)| (score, current.client.address.clone(), index))
         })
         .max_by(|left, right| left.0.cmp(&right.0).then_with(|| right.1.cmp(&left.1)))
         .map(|(_, _, index)| index)
-}
-
-fn monitor_name_for_id(monitors: &[HyprMonitor], id: i32) -> Option<String> {
-    monitors
-        .iter()
-        .find(|monitor| monitor.id == id)
-        .map(|monitor| monitor.name.clone())
 }
 
 fn dispatch_existing_repairs(
@@ -721,7 +728,7 @@ pub fn validate_replacement_targets(
                 command: launch_command[0].clone(),
             });
         }
-        if which::which(&launch_command[0]).is_err() {
+        if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
             return Err(RestoreError::MissingLaunchBinary {
                 target: target.label,
                 command: launch_command[0].clone(),
@@ -755,12 +762,10 @@ pub fn replace_session(
         }
     }
 
-    let timeout = Duration::from_millis(
-        config
-            .general
-            .window_detect_timeout_ms
-            .min(crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS),
-    );
+    let timeout = Duration::from_millis(config.general.window_detect_timeout_ms.clamp(
+        crate::config::MIN_WINDOW_DETECT_TIMEOUT_MS,
+        crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS,
+    ));
     let started = Instant::now();
     loop {
         if hyprctl.get_clients()?.is_empty() {
@@ -965,7 +970,7 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
         if dry_run {
-            if which::which(&launch_command[0]).is_err() {
+            if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
                 report.failed += 1;
                 report.details.push(format!(
                     "[dry-run] FAIL: binary '{}' not found for {}",
@@ -985,7 +990,7 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
-        if which::which(&launch_command[0]).is_err() {
+        if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
             report.skipped += 1;
             report.details.push(format!(
                 "SKIP: binary '{}' not found for {}",
@@ -1455,23 +1460,6 @@ fn build_reconcile_dispatch_commands_with_geometry(
 
 // ── Per-client restore logic ────────────────────────────────────────────────
 
-fn restore_single_client(
-    client: &SessionClient,
-    hyprctl: &dyn HyprctlClient,
-    config: &Config,
-    _verbose: bool,
-) -> Result<String, RestoreError> {
-    let launcher = RealProcessLauncher;
-    let process_info = RealProcessInfo;
-    restore_single_client_with_launcher_and_process_info(
-        client,
-        hyprctl,
-        &process_info,
-        config,
-        &launcher,
-    )
-}
-
 #[cfg(test)]
 fn restore_single_client_with_launcher(
     client: &SessionClient,
@@ -1505,11 +1493,7 @@ fn restore_single_client_with_launcher_and_process_info(
 
     // 2. Build and spawn the launch command.
     let launch_cmd = build_launch_command(client);
-    let launch_binary =
-        which::which(&launch_cmd[0]).map_err(|_| RestoreError::MissingLaunchBinary {
-            target: client.class.clone(),
-            command: launch_cmd[0].clone(),
-        })?;
+    let launch_binary = resolve_launch_binary(&launch_cmd[0], &client.class)?;
     let launched = launcher
         .spawn(&launch_binary.to_string_lossy(), &launch_cmd[1..])
         .map_err(|e| {
@@ -1517,12 +1501,10 @@ fn restore_single_client_with_launcher_and_process_info(
         })?;
 
     // 3. Poll for the new window (address not in snapshot + class match).
-    let timeout = Duration::from_millis(
-        config
-            .general
-            .window_detect_timeout_ms
-            .min(crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS),
-    );
+    let timeout = Duration::from_millis(config.general.window_detect_timeout_ms.clamp(
+        crate::config::MIN_WINDOW_DETECT_TIMEOUT_MS,
+        crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS,
+    ));
     let poll_interval = Duration::from_millis(100);
     let candidate_settle = Duration::from_millis(250).min(timeout);
     let start = Instant::now();
@@ -1745,6 +1727,33 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
         .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command))
+}
+
+fn resolve_launch_binary(command: &str, target: &str) -> Result<PathBuf, RestoreError> {
+    let path = which::which(command).map_err(|_| RestoreError::MissingLaunchBinary {
+        target: target.to_string(),
+        command: command.to_string(),
+    })?;
+    let metadata = std::fs::metadata(&path).map_err(|_| RestoreError::MissingLaunchBinary {
+        target: target.to_string(),
+        command: command.to_string(),
+    })?;
+    if !metadata.is_file() || {
+        #[cfg(unix)]
+        {
+            metadata.permissions().mode() & 0o111 == 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    } {
+        return Err(RestoreError::MissingLaunchBinary {
+            target: target.to_string(),
+            command: command.to_string(),
+        });
+    }
+    Ok(path)
 }
 
 fn is_ghostty_class(client: &SessionClient) -> bool {
@@ -2019,6 +2028,23 @@ mod tests {
         }
     }
 
+    struct CwdProcessInfo {
+        cwds: HashMap<u32, PathBuf>,
+    }
+
+    impl ProcessInfoProvider for CwdProcessInfo {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            self.cwds
+                .get(&pid)
+                .cloned()
+                .ok_or(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, _pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Ok(vec![])
+        }
+    }
+
     struct ChildCwdProcessInfo;
 
     impl ProcessInfoProvider for ChildCwdProcessInfo {
@@ -2137,6 +2163,28 @@ mod tests {
         }
     }
 
+    struct ClientErrorHyprctl;
+
+    impl HyprctlClient for ClientErrorHyprctl {
+        fn get_clients(&self) -> Result<Vec<HyprClient>, HyprctlError> {
+            Err(HyprctlError::CommandFailed(
+                "client query unavailable".to_string(),
+            ))
+        }
+
+        fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError> {
+            Ok(vec![])
+        }
+
+        fn dispatch(&self, _args: &str) -> Result<(), HyprctlError> {
+            Ok(())
+        }
+
+        fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
+            Ok("0.54.1".to_string())
+        }
+    }
+
     struct ClosingMockHyprctl {
         clients: RefCell<Vec<HyprClient>>,
         dispatches: RefCell<Vec<String>>,
@@ -2219,6 +2267,95 @@ mod tests {
             mock.dispatches().is_empty(),
             "dry-run must not send real hyprctl dispatches"
         );
+    }
+
+    #[test]
+    fn test_restore_propagates_initial_client_query_failures() {
+        let client = make_client(
+            "kitty",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+
+        let result = restore_session(
+            &make_session(vec![client]),
+            &ClientErrorHyprctl,
+            &Config::default(),
+            false,
+            false,
+        );
+
+        assert!(matches!(
+            result,
+            Err(RestoreError::Hyprctl(HyprctlError::CommandFailed(message)))
+                if message == "client query unavailable"
+        ));
+    }
+
+    #[test]
+    fn test_normal_restore_matches_terminal_windows_by_working_directory() {
+        let mut first = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec!["--directory".to_string(), "/one".to_string()],
+            None,
+        );
+        first.title = "terminal".to_string();
+        let mut second = make_client(
+            "kitty",
+            2,
+            [900, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec!["--directory".to_string(), "/two".to_string()],
+            None,
+        );
+        second.title = "terminal".to_string();
+
+        let current_one =
+            make_reconcile_window("0xone", "kitty", "terminal", 1, 0, [10, 20], [800, 600]);
+        let mut current_two =
+            make_reconcile_window("0xtwo", "kitty", "terminal", 2, 0, [900, 20], [800, 600]);
+        current_two.pid = 102;
+        let mut current_one = current_one;
+        current_one.pid = 101;
+        let mock = MockHyprctl::new(vec![vec![current_one, current_two]]);
+        let process_info = CwdProcessInfo {
+            cwds: HashMap::from([(101, PathBuf::from("/two")), (102, PathBuf::from("/one"))]),
+        };
+
+        let report = restore_session_with_process_info(
+            &make_session(vec![first, second]),
+            &mock,
+            &process_info,
+            &Config::default(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.restored, 2);
+        assert_eq!(report.skipped, 0);
+        let dispatches = mock.dispatches();
+        assert!(dispatches
+            .iter()
+            .any(|dispatch| dispatch == "movetoworkspacesilent 1,address:0xtwo"));
+        assert!(dispatches
+            .iter()
+            .any(|dispatch| dispatch == "movetoworkspacesilent 2,address:0xone"));
     }
 
     #[test]
