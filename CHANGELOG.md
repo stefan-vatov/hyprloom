@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.5] - 2026-08-27
+
+### Fixed
+
+- Use saved Hyprland addresses as exact identity for live windows and tolerate focus-history changes for Chromium
+- Stop guessing Brave's `Default` profile when the process exposes no positive profile identity
+- Prevent startup recovery from finalizing while a pre-replacement window is still present
+- Verify AUR package source attestation and package-file integrity before promoting a helper binary
+
 ## [0.3.4] - 2026-08-27
 
 ### Fixed

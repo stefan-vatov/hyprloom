@@ -7,7 +7,7 @@ use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::{
     recover_session, recover_session_safely, replace_session_with_marker,
-    replacement_target_is_complete, restore_session, validate_replacement_targets,
+    replacement_target_is_complete_with_backup, restore_session, validate_replacement_targets,
     validate_safety_snapshot, ReplaceMarkerContext,
 };
 use hyprloom::session::{
@@ -747,14 +747,18 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
         if let Some(target_name) = marker.target_name.as_deref() {
             let hyprctl = RealHyprctl;
             let process_info = RealProcessInfo;
+            let backup_for_completion = load_session(&marker.backup_name, sessions_dir).ok();
             match load_session(target_name, sessions_dir) {
-                Ok(target) => match replacement_target_is_complete(
-                    &target,
-                    &hyprctl,
-                    &process_info,
-                    config,
-                ) {
-                    Ok(true) => {
+                Ok(target) => match backup_for_completion.as_ref().map(|backup| {
+                    replacement_target_is_complete_with_backup(
+                        &target,
+                        Some(backup),
+                        &hyprctl,
+                        &process_info,
+                        config,
+                    )
+                }) {
+                    Some(Ok(true)) => {
                         eprintln!(
                             "Found a replacement whose target windows are already present; preserving the current desktop and finalizing its recovery marker."
                         );
@@ -763,10 +767,11 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
                             config.general.autosave_retain,
                         );
                     }
-                    Ok(false) => {}
-                    Err(error) => eprintln!(
+                    Some(Ok(false)) => {}
+                    Some(Err(error)) => eprintln!(
                         "Warning: could not verify the replacement target; attempting safety recovery: {error}"
                     ),
+                    None => {}
                 },
                 Err(error) => eprintln!(
                     "Warning: could not load the replacement target; attempting safety recovery: {error}"

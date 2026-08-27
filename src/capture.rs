@@ -110,15 +110,7 @@ pub fn capture_session(
                         brave_profiles_by_pid
                             .get(&client.pid)
                             .into_iter()
-                            .flat_map(|profiles| {
-                                if profiles.is_empty()
-                                    && brave_window_counts.get(&client.pid) == Some(&1)
-                                {
-                                    vec!["Default".to_string()]
-                                } else {
-                                    profiles.clone()
-                                }
-                            })
+                            .flat_map(|profiles| profiles.clone())
                     })
                     .collect();
                 crate::brave::filter_profiles_by_active_directories(
@@ -197,7 +189,6 @@ fn is_brave_client(client: &crate::hyprctl::HyprClient) -> bool {
 fn profile_for_window<'a>(profiles: &'a [String], window_count: Option<&usize>) -> Option<&'a str> {
     match profiles {
         [profile] if window_count == Some(&1) => Some(profile.as_str()),
-        [] if window_count == Some(&1) => Some("Default"),
         _ => None,
     }
 }
@@ -938,10 +929,10 @@ mod tests {
         assert!(launch.hint.is_none());
         assert_eq!(
             session.clients[0].profile_directory.as_deref(),
-            Some("Default"),
-            "a lone Brave window without a profile flag is the Default profile"
+            None,
+            "a missing profile flag is not positive window identity"
         );
-        assert!(!session.clients[0].profile_identity_ambiguous);
+        assert!(session.clients[0].profile_identity_ambiguous);
     }
 
     #[test]

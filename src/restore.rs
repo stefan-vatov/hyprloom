@@ -317,12 +317,27 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if !classes_match(target, current) {
         return None;
     }
+    let saved_address_matches = target
+        .address
+        .as_deref()
+        .is_some_and(|address| same_nonempty(address, &current.address));
     if is_generic_chromium_client(target) && !generic_chromium_identity_matches(target, current) {
         // Ordinary Chromium windows share one class and commonly one PID.
         // A title is not window ownership: two tabs can show the same title,
         // and a page title can change after capture.  Reuse only a compositor
         // identity captured for that window; legacy snapshots without one
         // remain safely unmatched.
+        return None;
+    }
+    if target
+        .address
+        .as_deref()
+        .is_some_and(|address| !address.is_empty() && !saved_address_matches)
+    {
+        // A saved address identifies a specific live window.  Once that
+        // window is gone, same-class/title evidence is not enough to move a
+        // different window into its place; leave it as an extra and launch
+        // the missing target instead.
         return None;
     }
     if is_brave_client(target)
@@ -343,17 +358,16 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
         // side came from a shared or otherwise profile-unknown process.
         return None;
     }
-    if target.profile_directory.is_none() && strong_identity_conflict(target, observed) {
+    if target.profile_directory.is_none()
+        && !saved_address_matches
+        && strong_identity_conflict(target, observed)
+    {
         return None;
     }
 
     let mut score = 1_000;
     let mut kind = MatchKind::ClassFallback;
-    if target
-        .address
-        .as_deref()
-        .is_some_and(|address| same_nonempty(address, &current.address))
-    {
+    if saved_address_matches {
         // Hyprland's address identifies the exact live window.  Prefer it
         // over geometry when two windows share the same app/title and one has
         // moved since capture.  A missing address remains a normal legacy
@@ -578,9 +592,10 @@ fn generic_chromium_identity_matches(target: &SessionClient, current: &HyprClien
     if target_address.is_empty() || !same_nonempty(target_address, &current.address) {
         return false;
     }
-    target.focus_history_id == 0
-        || current.focus_history_id == 0
-        || target.focus_history_id == current.focus_history_id
+    // The compositor address is the window identity.  Focus history changes
+    // whenever the user focuses another window, so it is not an additional
+    // ownership constraint once the address matches.
+    true
 }
 
 fn generic_chromium_match_is_safe(
@@ -1468,6 +1483,36 @@ pub fn replacement_target_is_complete(
     process_info: &dyn ProcessInfoProvider,
     config: &Config,
 ) -> Result<bool, RestoreError> {
+    replacement_target_is_complete_with_backup(session, None, hyprctl, process_info, config)
+}
+
+/// Variant used by startup recovery when the replacement marker also names
+/// the safety snapshot.  A target-looking window cannot prove that a
+/// replacement completed while any window from the pre-replacement desktop
+/// is still present: the old window may share the target's class and title.
+pub fn replacement_target_is_complete_with_backup(
+    session: &Session,
+    safety_snapshot: Option<&Session>,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+) -> Result<bool, RestoreError> {
+    if let Some(safety_snapshot) = safety_snapshot {
+        let saved_addresses: HashSet<&str> = safety_snapshot
+            .clients
+            .iter()
+            .map(|client| client.address.as_deref().unwrap_or_default())
+            .filter(|address| !address.is_empty())
+            .collect();
+        if !saved_addresses.is_empty()
+            && hyprctl
+                .get_clients()?
+                .iter()
+                .any(|client| saved_addresses.contains(client.address.as_str()))
+        {
+            return Ok(false);
+        }
+    }
     if session.clients.iter().any(|client| {
         is_ignored_class(&client.class, &config.filters.ignore_classes)
             || is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
@@ -1861,6 +1906,11 @@ fn brave_profile_targets(session: &Session, config: &Config) -> Option<Vec<Brave
         .filter_map(|client| client.profile_directory.as_deref())
         .filter(|directory| !directory.is_empty())
         .collect();
+    let has_ambiguous_captured_identity = session
+        .clients
+        .iter()
+        .filter(|client| is_brave_client(client))
+        .any(|client| client.profile_identity_ambiguous);
     if active_directories.is_empty() {
         // A profile-only snapshot has no window identity to contradict it, so
         // preserve its explicit profile targets.  With captured Brave windows,
@@ -1868,7 +1918,9 @@ fn brave_profile_targets(session: &Session, config: &Config) -> Option<Vec<Brave
         // unless there is exactly one of each.  Do not assign profiles by
         // count or launch a complete Local State inventory by accident.
         return (brave_client_count == 0
-            || (brave_client_count == 1 && session.brave_profiles.len() == 1))
+            || (!has_ambiguous_captured_identity
+                && brave_client_count == 1
+                && session.brave_profiles.len() == 1))
             .then(|| session.brave_profiles.clone())
             .or_else(|| Some(Vec::new()));
     }
@@ -2092,12 +2144,6 @@ fn observe_clients_with_monitors(
             match profiles.as_slice() {
                 [profile] if window_count == 1 => {
                     observed.profile_directory = Some(profile.clone());
-                }
-                [] if window_count == 1 => {
-                    // Brave's normal Default profile is commonly omitted
-                    // from the command line.  It is safe to infer it only
-                    // when this PID owns exactly one visible Brave window.
-                    observed.profile_directory = Some("Default".to_string());
                 }
                 [profile] => {
                     observed.profile_directory = Some(profile.clone());
@@ -3309,6 +3355,78 @@ mod tests {
     }
 
     #[test]
+    fn test_matching_generic_chromium_address_survives_focus_history_change() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.address = Some("0xbrowser".to_string());
+        target.focus_history_id = 3;
+
+        let mut current = make_reconcile_window(
+            "0xbrowser",
+            "chromium",
+            "Project page",
+            1,
+            0,
+            [900, 500],
+            [800, 600],
+        );
+        current.focus_history_id = 17;
+        let observed = ObservedClient::from_hypr_client(current, None, None);
+
+        assert_eq!(
+            plan_reconciliation(&[target], &[observed])[0].map(|pair| pair.kind),
+            Some(MatchKind::ExactIdentity)
+        );
+    }
+
+    #[test]
+    fn test_matching_does_not_move_same_title_window_when_saved_address_is_gone() {
+        let mut target = make_client(
+            "com.mitchellh.ghostty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "ghostty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xclosed".to_string());
+
+        let mut current = make_reconcile_window(
+            "0xother",
+            "com.mitchellh.ghostty",
+            "Project",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.initial_class = "com.mitchellh.ghostty".to_string();
+        current.initial_title = "Project".to_string();
+
+        assert_eq!(
+            plan_reconciliation(
+                &[target],
+                &[ObservedClient::from_hypr_client(current, None, None)]
+            ),
+            vec![None]
+        );
+    }
+
+    #[test]
     fn test_matching_prefers_saved_address_for_same_app_windows_after_one_moves() {
         let mut target = make_client(
             "kitty",
@@ -3904,6 +4022,59 @@ mod tests {
         assert!(replacement_target_is_complete(
             &make_session(vec![target]),
             &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn test_replacement_target_is_not_complete_while_old_window_remains() {
+        let mut target = make_client(
+            "kitty",
+            2,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xnew-target".to_string());
+
+        let mut old_window = make_reconcile_window(
+            "0xold-window",
+            "kitty",
+            "Project",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        old_window.initial_title = "Project".to_string();
+        let mut backup_client = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        backup_client.title = "Project".to_string();
+        backup_client.initial_title = "Project".to_string();
+        backup_client.address = Some("0xold-window".to_string());
+
+        let current = MockHyprctl::new(vec![vec![old_window]]);
+        assert!(!replacement_target_is_complete_with_backup(
+            &make_session(vec![target]),
+            Some(&make_session(vec![backup_client])),
+            &current,
             &EmptyProcessInfo,
             &Config::default(),
         )

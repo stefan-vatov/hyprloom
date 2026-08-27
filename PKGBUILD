@@ -1,6 +1,6 @@
 # Maintainer: Thethracian
 pkgname=hyprloom
-pkgver=0.3.4
+pkgver=0.3.5
 pkgrel=1
 pkgdesc="Save, restore, and reconcile Hyprland window sessions"
 arch=('x86_64')
@@ -9,7 +9,8 @@ license=('MIT')
 depends=('hyprland')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-sha256sums=('6918aad7f6ef8f3792d52ad0ad5b555751a6ae186c0d5358ca4e086f8d47c393')
+_source_digest=''
+sha256sums=("$_source_digest")
 provides=('hyprflow')
 conflicts=('hyprflow')
 replaces=('hyprflow')
@@ -37,5 +38,7 @@ package() {
     cd "$pkgname-$pkgver"
     install -Dm0755 -t "$pkgdir/usr/bin/" "target/release/$pkgname"
     ln -s hyprloom "$pkgdir/usr/bin/hyprflow"
+    install -Dm0644 /dev/null "$pkgdir/usr/share/$pkgname/source-digest"
+    printf '%s\n' "$_source_digest" > "$pkgdir/usr/share/$pkgname/source-digest"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
