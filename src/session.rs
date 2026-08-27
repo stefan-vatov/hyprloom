@@ -461,10 +461,14 @@ pub fn rotate_autosaves(sessions_dir: &Path, retain: usize) -> Result<usize, Ses
     if retain == 0 {
         return Ok(0);
     }
+    let pending_backup = pending_replace_backup(sessions_dir)?;
     let autosaves = list_autosave_sessions(sessions_dir)?;
     let mut pruned = 0;
     if autosaves.len() > retain {
         for session in &autosaves[retain..] {
+            if pending_backup.as_deref() == Some(session.name.as_str()) {
+                continue;
+            }
             match delete_session(&session.name, sessions_dir) {
                 Ok(()) => pruned += 1,
                 // Another autosave rotation may have removed it already.
@@ -1061,6 +1065,23 @@ mod tests {
         assert_eq!(remaining[1].name, "autosave-20260309T120000");
 
         assert!(session_exists("work", dir.path()));
+    }
+
+    #[test]
+    fn test_rotate_autosaves_keeps_pending_replace_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let oldest = "autosave-20260309T100000";
+        save_session(&make_test_session(oldest), dir.path()).unwrap();
+        save_session(&make_test_session("autosave-20260309T110000"), dir.path()).unwrap();
+        save_session(&make_test_session("autosave-20260309T120000"), dir.path()).unwrap();
+        mark_replace_in_progress(oldest, dir.path()).unwrap();
+
+        let pruned = rotate_autosaves(dir.path(), 1).unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(session_exists(oldest, dir.path()));
+        assert!(session_exists("autosave-20260309T120000", dir.path()));
+        assert!(!session_exists("autosave-20260309T110000", dir.path()));
     }
 
     #[test]

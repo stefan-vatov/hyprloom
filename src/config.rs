@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Read;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
 /// Safety limits for values that control sleeps and polling loops.  They keep
@@ -203,6 +203,26 @@ fn read_config_file(path: &std::path::Path) -> Result<String, String> {
     let metadata = file.metadata().map_err(|error| error.to_string())?;
     if !metadata.is_file() {
         return Err("config path is not a regular file".to_string());
+    }
+    #[cfg(unix)]
+    {
+        let user_id = unsafe { libc::geteuid() };
+        let parent = path
+            .parent()
+            .ok_or_else(|| "config path has no parent directory".to_string())?;
+        let parent_metadata =
+            std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+        if metadata.uid() != user_id
+            || metadata.permissions().mode() & 0o022 != 0
+            || !parent_metadata.is_dir()
+            || parent_metadata.uid() != user_id
+            || parent_metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(
+                "config file or its directory is not user-owned and non-writable by others"
+                    .to_string(),
+            );
+        }
     }
     if metadata.len() > MAX_CONFIG_FILE_BYTES {
         return Err(format!("file is larger than {MAX_CONFIG_FILE_BYTES} bytes"));
@@ -410,6 +430,29 @@ hint_template = "{cwd}"
         config.general.default_session = "latest".to_string();
         config.filters.ignore_classes = vec!["class".to_string(); MAX_CONFIG_FILTERS + 1];
         assert!(validate_config_structure(&config).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_config_rejects_group_writable_config_or_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[general]\nrestore_delay_ms = 1\n").unwrap();
+
+        let mut file_permissions = std::fs::metadata(&path).unwrap().permissions();
+        file_permissions.set_mode(0o664);
+        std::fs::set_permissions(&path, file_permissions).unwrap();
+        assert!(read_config_file(&path).is_err());
+
+        let mut file_permissions = std::fs::metadata(&path).unwrap().permissions();
+        file_permissions.set_mode(0o600);
+        std::fs::set_permissions(&path, file_permissions).unwrap();
+        let mut directory_permissions = std::fs::metadata(directory.path()).unwrap().permissions();
+        directory_permissions.set_mode(0o770);
+        std::fs::set_permissions(directory.path(), directory_permissions).unwrap();
+        assert!(read_config_file(&path).is_err());
     }
 
     #[test]

@@ -70,6 +70,11 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
+    let previous_timer = match std::fs::read(&timer_path) {
+        Ok(contents) => Some(contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     atomic_write(&service_path, service_content().as_bytes())?;
     if let Err(error) = atomic_write(&timer_path, timer_content().as_bytes()) {
         // Do not leave a newly-written service paired with a stale or
@@ -80,6 +85,14 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
             }
             None => {
                 let _ = std::fs::remove_file(&service_path);
+            }
+        }
+        match previous_timer {
+            Some(contents) => {
+                let _ = atomic_write(&timer_path, &contents);
+            }
+            None => {
+                let _ = std::fs::remove_file(&timer_path);
             }
         }
         return Err(error);

@@ -311,13 +311,15 @@ fn main() {
             let hyprctl = RealHyprctl;
             let process_info = RealProcessInfo;
             let backup_name = autosave_name_now();
-            let backup = match capture_session(&backup_name, &hyprctl, &process_info, &config) {
-                Ok(session) => session,
-                Err(error) => {
-                    eprintln!("Replace cancelled: safety backup failed: {error}");
-                    std::process::exit(1);
-                }
-            };
+            let recovery_config = safety_recovery_config(&config);
+            let backup =
+                match capture_session(&backup_name, &hyprctl, &process_info, &recovery_config) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        eprintln!("Replace cancelled: safety backup failed: {error}");
+                        std::process::exit(1);
+                    }
+                };
             if let Err(error) = save_session(&backup, &sessions_dir) {
                 eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
@@ -365,7 +367,12 @@ fn main() {
                         }
                         std::process::exit(1);
                     } else {
-                        clear_recovery_marker(&sessions_dir);
+                        if !clear_recovery_marker(&sessions_dir) {
+                            eprintln!(
+                                "Replacement completed, but its recovery marker could not be cleared; retry after checking the session store."
+                            );
+                            std::process::exit(1);
+                        }
                     }
                 }
                 Err(error) => {
@@ -628,11 +635,12 @@ fn report_safety_recovery(
     config: &hyprloom::config::Config,
     verbose: bool,
 ) -> bool {
+    let recovery_config = safety_recovery_config(config);
     match hyprloom::restore::reconcile_session(
         backup,
         hyprctl,
         process_info,
-        config,
+        &recovery_config,
         false,
         verbose,
     ) {
@@ -667,4 +675,13 @@ fn report_safety_recovery(
             false
         }
     }
+}
+
+fn safety_recovery_config(config: &hyprloom::config::Config) -> hyprloom::config::Config {
+    let mut recovery_config = config.clone();
+    // Replace closes every current client, including classes excluded from
+    // ordinary snapshots.  The recovery copy must therefore include those
+    // clients too; otherwise a failed replacement cannot restore them.
+    recovery_config.filters.ignore_classes.clear();
+    recovery_config
 }
