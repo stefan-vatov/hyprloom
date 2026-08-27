@@ -590,23 +590,40 @@ pub(crate) fn webapp_class_matches_url(class: &str, url: &str) -> bool {
     if !prefix.eq_ignore_ascii_case("chrome-") {
         return false;
     }
-    let Some((class_host, class_suffix)) = class["chrome-".len()..].split_once("__") else {
-        return false;
-    };
-    if class_host.is_empty() {
-        return false;
-    }
     let Some(url_host) = webapp_url_host(url) else {
         return false;
     };
     let Some(url_route) = webapp_url_route(url) else {
         return false;
     };
-    let class_route = class_suffix
-        .rsplit_once('-')
-        .map(|(route, _profile)| route)
-        .unwrap_or(class_suffix);
-    class_host.eq_ignore_ascii_case(url_host) && class_route == url_route.replace('/', "_")
+    let class_identity = &class["chrome-".len()..];
+    if let Some((class_host, class_suffix)) = class_identity.split_once("__") {
+        if class_host.is_empty() {
+            return false;
+        }
+        let class_route = class_suffix
+            .rsplit_once('-')
+            .map(|(route, _profile)| route)
+            .unwrap_or(class_suffix);
+        return class_host.eq_ignore_ascii_case(url_host)
+            && class_route == url_route.replace('/', "_");
+    }
+
+    // Chromium also emits a compact root-app class such as
+    // `chrome-example.com-Default` on some versions.  There is no route
+    // component to validate in that form, so accept it only for the root URL
+    // and only when the trailing component is a known profile suffix.
+    if !url_route.is_empty() {
+        return false;
+    }
+    let expected_prefix = format!("{url_host}-");
+    let Some(class_prefix) = class_identity.get(..expected_prefix.len()) else {
+        return false;
+    };
+    let Some(profile) = class_identity.get(expected_prefix.len()..) else {
+        return false;
+    };
+    class_prefix.eq_ignore_ascii_case(&expected_prefix) && is_webapp_profile_suffix(profile)
 }
 
 fn webapp_class_uses_default_profile(class: &str) -> bool {
@@ -616,13 +633,17 @@ fn webapp_class_uses_default_profile(class: &str) -> bool {
     if !prefix.eq_ignore_ascii_case("chrome-") {
         return false;
     }
-    let Some((_host, suffix)) = class["chrome-".len()..].split_once("__") else {
-        return false;
-    };
-    suffix
+    class["chrome-".len()..]
         .rsplit_once('-')
         .map(|(_route, profile)| profile.eq_ignore_ascii_case("Default"))
         .unwrap_or(false)
+}
+
+fn is_webapp_profile_suffix(profile: &str) -> bool {
+    profile.eq_ignore_ascii_case("Default")
+        || profile
+            .strip_prefix("Profile_")
+            .is_some_and(|number| !number.is_empty() && number.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn webapp_url_host(url: &str) -> Option<&str> {
@@ -995,6 +1016,19 @@ mod tests {
         assert!(!webapp_class_uses_default_profile(
             "chrome-discord.com__channels_@me-Profile_1"
         ));
+    }
+
+    #[test]
+    fn test_pathless_root_webapp_class_matches_default_profile() {
+        let class = "chrome-example.com-Default";
+
+        assert!(webapp_class_matches_url(class, "https://example.com/"));
+        assert!(webapp_class_matches_url(
+            class,
+            "https://example.com/?view=home"
+        ));
+        assert!(webapp_class_uses_default_profile(class));
+        assert!(!webapp_class_matches_url(class, "https://example.com/app"));
     }
 
     #[test]

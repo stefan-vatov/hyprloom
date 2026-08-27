@@ -311,12 +311,12 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if !classes_match(target, current) {
         return None;
     }
-    if is_generic_chromium_client(target) && !same_nonempty(&target.title, &current.title) {
-        // Hyprland reports every ordinary Chromium window with the same
-        // class, and Chromium commonly shares one PID across them.  Its
-        // initial title is often just "Chromium", so class plus initial-title
-        // is not enough to identify a window whose current title differs.
-        // Leave it unmatched rather than moving an unrelated browser tab.
+    if is_generic_chromium_client(target) {
+        // Hyprland reports ordinary Chromium windows with the same class, and
+        // Chromium commonly shares one PID across them.  Its current and
+        // initial titles are not a stable per-window identity: two tabs can
+        // both be "New Tab" or show the same page title.  Leave generic
+        // Chromium unmatched rather than moving an unrelated browser tab.
         return None;
     }
     if is_brave_client(target)
@@ -483,7 +483,10 @@ fn is_brave_client(client: &SessionClient) -> bool {
 }
 
 fn is_generic_chromium_client(client: &SessionClient) -> bool {
-    is_generic_chromium_class(&client.class) || is_generic_chromium_class(&client.initial_class)
+    (is_generic_chromium_class(&client.class) || is_generic_chromium_class(&client.initial_class))
+        && ![client.class.as_str(), client.initial_class.as_str()]
+            .iter()
+            .any(|class| is_webapp_class_name(class))
 }
 
 fn is_brave_hypr_client(client: &HyprClient) -> bool {
@@ -1648,13 +1651,31 @@ fn brave_profile_targets(session: &Session, config: &Config) -> Option<Vec<Brave
 
     if let Some(workspaces) = profile_workspaces {
         let inventory = if session.brave_profiles.is_empty() {
-            workspaces
-                .keys()
-                .map(|directory| BraveProfile {
-                    directory: directory.clone(),
-                    name: directory.clone(),
-                })
-                .collect()
+            let mut captured = Vec::new();
+            for client in session
+                .clients
+                .iter()
+                .filter(|client| is_brave_client(client))
+            {
+                let Some(directory) = client
+                    .profile_directory
+                    .as_deref()
+                    .filter(|directory| !directory.is_empty())
+                else {
+                    continue;
+                };
+                if captured
+                    .iter()
+                    .any(|profile: &BraveProfile| profile.directory.eq_ignore_ascii_case(directory))
+                {
+                    continue;
+                }
+                captured.push(BraveProfile {
+                    directory: directory.to_string(),
+                    name: client.title.clone(),
+                });
+            }
+            captured
         } else {
             session.brave_profiles.clone()
         };
@@ -1682,13 +1703,15 @@ fn brave_profile_targets(session: &Session, config: &Config) -> Option<Vec<Brave
         .filter(|directory| !directory.is_empty())
         .collect();
     if active_directories.is_empty() {
-        // Older snapshots may not have per-window profile identity.  Preserve
-        // the profile targets when their count can be accounted for by the
-        // captured Brave windows (or when the session is profile-only), but do
-        // not turn a complete Local State inventory into extra launches when
-        // it contains more profiles than captured windows.
-        return (brave_client_count == 0 || session.brave_profiles.len() <= brave_client_count)
-            .then(|| session.brave_profiles.clone());
+        // A profile-only snapshot has no window identity to contradict it, so
+        // preserve its explicit profile targets.  With captured Brave windows,
+        // however, a profile list without per-window identity is ambiguous
+        // unless there is exactly one of each.  Do not assign profiles by
+        // count or launch a complete Local State inventory by accident.
+        return (brave_client_count == 0
+            || (brave_client_count == 1 && session.brave_profiles.len() == 1))
+            .then(|| session.brave_profiles.clone())
+            .or_else(|| Some(Vec::new()));
     }
 
     let active_profiles: Vec<BraveProfile> = session
@@ -1701,13 +1724,11 @@ fn brave_profile_targets(session: &Session, config: &Config) -> Option<Vec<Brave
         })
         .cloned()
         .collect();
-    if !active_profiles.is_empty() || session.brave_profiles.len() <= brave_client_count {
-        Some(active_profiles)
-    } else {
-        // A partially recognizable legacy inventory is still unsafe to use
-        // as a profile target list if it contains more profiles than windows.
-        None
-    }
+    // An inventory with a profile identity that does not occur in the saved
+    // windows is also not safe to reinterpret as raw Brave targets.  Returning
+    // an empty profile mode makes restore/reconcile skip those windows rather
+    // than moving an arbitrary shared-process window.
+    Some(active_profiles)
 }
 
 fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileTarget> {
@@ -2356,12 +2377,11 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
     target_monitor_available: bool,
 ) -> Result<RestoredWindow, RestoreError> {
     // 1. Snapshot existing window addresses before launching.
-    let before_clients = hyprctl.get_clients()?;
-    let before: HashSet<String> = before_clients
-        .iter()
-        .map(|client| client.address.clone())
+    let before: HashSet<String> = hyprctl
+        .get_clients()?
+        .into_iter()
+        .map(|client| client.address)
         .collect();
-    let before_pids: HashSet<u32> = before_clients.iter().map(|client| client.pid).collect();
 
     // 2. Build and spawn the launch command.
     let launch_cmd = build_launch_command(client);
@@ -2405,34 +2425,15 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             let process_related = candidates.iter().any(|candidate| {
                 launched_process_is_related(&launched, candidate.pid, process_info)
             });
-            let profile_confirmed_browser_reuse = is_brave_client(client)
-                && client.profile_directory.is_some()
-                && candidates.len() == 1
-                && before_pids.contains(&candidates[0].pid)
-                // A profile flag belongs to the shared browser process, not
-                // necessarily to the newly-created top-level window.  Once
-                // that PID already owns multiple visible Brave windows, a
-                // positive process-level profile is not enough to identify
-                // which window appeared for this launch.
-                && before_clients
-                    .iter()
-                    .filter(|before| {
-                        before.pid == candidates[0].pid && is_brave_hypr_client(before)
-                    })
-                    .count()
-                    == 1;
-            if launched.pid.is_some() && !process_related && !profile_confirmed_browser_reuse {
+            if launched.pid.is_some() && !process_related {
                 // A same-class window can be opened by the user while the
                 // requested application is starting.  Never move that window
                 // just because it was the only candidate seen during the
                 // settle period; wait for a descendant of the process we
-                // actually launched or fail without changing it.  An already
-                // running Brave process is accepted only when the candidate's
-                // profile was positively identified.  Chromium web apps do
-                // not get a similar exception: a user can open another
-                // same-class app window while the requested launch is
-                // starting, and Hyprland gives us no per-window URL or
-                // browser-tab identity to distinguish those cases safely.
+                // actually launched or fail without changing it.  A profile
+                // flag belongs to the shared Brave process, not necessarily
+                // to the newly-created top-level window, so it cannot relax
+                // this rule.
                 continue;
             }
             if candidates.len() > 1 && !process_related {
@@ -2751,12 +2752,14 @@ fn is_ghostty_class(client: &SessionClient) -> bool {
 fn is_webapp_class(client: &SessionClient) -> bool {
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
-        .any(|class| {
-            class
-                .get(.."chrome-".len())
-                .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
-                .unwrap_or(false)
-        })
+        .any(|class| is_webapp_class_name(class))
+}
+
+fn is_webapp_class_name(class: &str) -> bool {
+    class
+        .get(.."chrome-".len())
+        .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
+        .unwrap_or(false)
 }
 
 fn webapp_launch_is_trusted(client: &SessionClient, command: &str) -> bool {
@@ -3085,6 +3088,37 @@ mod tests {
             "0xunrelated",
             "chromium",
             "YouTube",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.initial_title = "Chromium".to_string();
+
+        let observed = ObservedClient::from_hypr_client(current, None, None);
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
+    fn test_matching_does_not_consume_identical_title_generic_chromium_window() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.title = "New Tab".to_string();
+        target.initial_title = "Chromium".to_string();
+
+        let mut current = make_reconcile_window(
+            "0xunrelated-identical-title",
+            "chromium",
+            "New Tab",
             1,
             0,
             [10, 20],
@@ -4919,7 +4953,39 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_brave_inventory_does_not_launch_closed_profiles() {
+    fn test_brave_mapping_does_not_create_profiles_absent_from_snapshot() {
+        let session = Session {
+            name: "without-brave".to_string(),
+            created_at: Utc::now(),
+            hyprland_version: "0.54.1".to_string(),
+            monitors: vec![],
+            clients: vec![],
+            brave_profiles: vec![],
+        };
+        let config = Config {
+            apps: HashMap::from([(
+                "brave-browser".to_string(),
+                AppConfig {
+                    binary: Some("true".to_string()),
+                    capture_cwd: None,
+                    capture_last_command: None,
+                    hint_template: None,
+                    profile_workspaces: Some(HashMap::from([("Default".to_string(), 2)])),
+                    default_workspace: Some(1),
+                },
+            )]),
+            ..Config::default()
+        };
+
+        let report = restore_session(&session, &MockHyprctl::new(vec![]), &config, true, true)
+            .expect("a snapshot without Brave should remain a no-op");
+
+        assert_eq!(report.restored, 0);
+        assert!(report.details.is_empty());
+    }
+
+    #[test]
+    fn test_legacy_brave_inventory_without_identity_is_skipped_safely() {
         let session = Session {
             name: "test".to_string(),
             created_at: Utc::now(),
@@ -4965,9 +5031,9 @@ mod tests {
         };
 
         let report = restore_session(&session, &MockHyprctl::new(vec![]), &config, true, true)
-            .expect("legacy inventory should fall back safely");
+            .expect("ambiguous legacy inventory should be skipped safely");
 
-        assert_eq!(report.restored, 1);
+        assert_eq!(report.restored, 0);
         assert!(report
             .details
             .iter()
@@ -5320,7 +5386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_brave_launch_accepts_reused_pid_when_profile_is_positive() {
+    fn test_brave_launch_rejects_reused_pid_even_when_profile_is_positive() {
         let mut target = make_client(
             "brave-browser",
             1,
@@ -5358,23 +5424,20 @@ mod tests {
             ..Default::default()
         };
         let mut config = Config::default();
+        config.general.window_detect_timeout_ms = 500;
         config.general.restore_delay_ms = 0;
 
-        let restored = restore_single_client_with_launcher_and_process_info_with_address(
+        let result = restore_single_client_with_launcher_and_process_info_with_address(
             &target,
             &mock,
             &BraveProfileProcessInfo,
             &config,
             &launcher,
             true,
-        )
-        .expect("a positively identified reused browser profile is safe");
+        );
 
-        assert_eq!(restored.address, "0xnew");
-        assert!(mock
-            .dispatches()
-            .iter()
-            .any(|dispatch| dispatch.contains("0xnew")));
+        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]

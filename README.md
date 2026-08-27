@@ -143,6 +143,10 @@ windows are saved and restored; closed profiles in Local State are not launched
 unexpectedly. Use `hyprloom config` to see detected profiles and their mapping
 status.
 
+If an older snapshot contains Brave windows but no reliable per-window profile
+identity, Hyprloom skips those Brave targets rather than assigning a profile by
+window count or moving the wrong shared-process window.
+
 ```toml
 [apps.brave-browser]
 binary = "brave"
