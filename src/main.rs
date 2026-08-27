@@ -6,12 +6,12 @@ use hyprloom::config::{
 use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::{
-    recover_session, replace_session_with_marker, restore_session, validate_replacement_targets,
-    ReplaceMarkerContext,
+    recover_session, replace_session_with_marker, replacement_target_is_complete, restore_session,
+    validate_replacement_targets, ReplaceMarkerContext,
 };
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
-    mark_replace_prepared, migrate_legacy_sessions, replace_marker, save_session, session_exists,
+    migrate_legacy_sessions, replace_marker, save_session, session_exists,
     validate_user_session_name, OperationLock, ReplacePhase,
 };
 use std::path::Path;
@@ -348,7 +348,11 @@ fn main() {
                 eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
             }
-            if let Err(error) = mark_replace_prepared(&backup_name, &sessions_dir) {
+            if let Err(error) = hyprloom::session::mark_replace_prepared_for_target(
+                &backup_name,
+                Some(&name),
+                &sessions_dir,
+            ) {
                 eprintln!("Replace cancelled: could not record recovery marker: {error}");
                 std::process::exit(1);
             }
@@ -362,6 +366,7 @@ fn main() {
                     dry_run: false,
                     verbose: cli.verbose,
                     backup_name: &backup_name,
+                    target_name: &name,
                     sessions_dir: &sessions_dir,
                 },
             ) {
@@ -693,6 +698,34 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
                 return false;
             }
             Some(true) => {}
+        }
+    }
+    if marker.phase == ReplacePhase::InProgress {
+        if let Some(target_name) = marker.target_name.as_deref() {
+            let hyprctl = RealHyprctl;
+            let process_info = RealProcessInfo;
+            match load_session(target_name, sessions_dir) {
+                Ok(target) => match replacement_target_is_complete(
+                    &target,
+                    &hyprctl,
+                    &process_info,
+                    config,
+                ) {
+                    Ok(true) => {
+                        eprintln!(
+                            "Found a replacement whose target windows are already present; preserving the current desktop and finalizing its recovery marker."
+                        );
+                        return clear_recovery_marker(sessions_dir);
+                    }
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "Warning: could not verify the replacement target; attempting safety recovery: {error}"
+                    ),
+                },
+                Err(error) => eprintln!(
+                    "Warning: could not load the replacement target; attempting safety recovery: {error}"
+                ),
+            }
         }
     }
     let backup_name = marker.backup_name;

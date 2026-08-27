@@ -52,6 +52,12 @@ pub trait ProcessInfoProvider {
         Err(ProcessError::NotFound(pid))
     }
 
+    /// Return the kernel process-start timestamp when the provider can read
+    /// one.  The default keeps lightweight test doubles compatible.
+    fn get_start_time(&self, pid: u32) -> Result<u64, ProcessError> {
+        Err(ProcessError::NotFound(pid))
+    }
+
     /// Return whether `candidate_pid` is the root process or one of its
     /// descendants.  This is used to correlate a newly launched process with
     /// the window it eventually creates.
@@ -122,6 +128,10 @@ impl ProcessInfoProvider for RealProcessInfo {
             Ok(cmdline)
         }
     }
+
+    fn get_start_time(&self, pid: u32) -> Result<u64, ProcessError> {
+        read_process_start_time(pid)
+    }
 }
 
 fn read_cmdline(pid: u32) -> String {
@@ -136,6 +146,17 @@ fn read_cmdline(pid: u32) -> String {
                 .join(" ")
         })
         .unwrap_or_default()
+}
+
+fn read_process_start_time(pid: u32) -> Result<u64, ProcessError> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|_| ProcessError::NotFound(pid))?;
+    let (_, fields) = stat.rsplit_once(')').ok_or(ProcessError::NotFound(pid))?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or(ProcessError::NotFound(pid))
 }
 
 /// Whether a process command line represents an interactive shell itself,
@@ -239,15 +260,15 @@ pub fn profile_directory_from_cmdline(cmdline: &str) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-/// Search a process and its descendants for an application profile flag.
+/// Search a process and its descendants for all application profile flags.
 /// Chromium puts the profile flag on either the browser process or a helper,
-/// depending on how an existing browser process was reused.  If the tree
-/// advertises more than one profile, the root PID cannot identify a specific
-/// top-level window and the result is intentionally ambiguous.
-pub fn find_profile_directory(
+/// depending on how an existing browser process was reused.  Returning the
+/// complete set lets capture preserve the active profile inventory even when
+/// one shared process cannot identify a particular top-level window.
+pub fn find_profile_directories(
     process_info: &dyn ProcessInfoProvider,
     root_pid: u32,
-) -> Option<String> {
+) -> Vec<String> {
     let mut queue = VecDeque::from([root_pid]);
     let mut visited = HashSet::from([root_pid]);
     let mut profiles = HashMap::<String, String>::new();
@@ -275,7 +296,19 @@ pub fn find_profile_directory(
             }
         }
     }
-    (profiles.len() == 1).then(|| profiles.into_values().next().expect("one profile"))
+    let mut profiles: Vec<String> = profiles.into_values().collect();
+    profiles.sort_by_key(|profile| profile.to_ascii_lowercase());
+    profiles
+}
+
+/// Return a single profile only when the process tree provides an
+/// unambiguous identity for it.
+pub fn find_profile_directory(
+    process_info: &dyn ProcessInfoProvider,
+    root_pid: u32,
+) -> Option<String> {
+    let mut profiles = find_profile_directories(process_info, root_pid);
+    (profiles.len() == 1).then(|| profiles.pop().expect("one profile"))
 }
 
 #[cfg(test)]
@@ -452,5 +485,9 @@ mod tests {
         };
 
         assert_eq!(find_profile_directory(&process_info, 1), None);
+        assert_eq!(
+            find_profile_directories(&process_info, 1),
+            vec!["Default".to_string(), "Profile 1".to_string()]
+        );
     }
 }

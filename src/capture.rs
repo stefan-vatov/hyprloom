@@ -1,8 +1,8 @@
 use crate::config::{app_config_for, is_ignored_class, AppConfig, Config};
 use crate::hyprctl::{HyprctlClient, HyprctlError};
 use crate::process::{
-    find_profile_directory, is_helper_process, is_plain_shell, select_terminal_process,
-    ProcessError, ProcessInfoProvider,
+    find_profile_directories, find_profile_directory, is_helper_process, is_plain_shell,
+    select_terminal_process, ProcessError, ProcessInfoProvider,
 };
 use crate::session::{LaunchInfo, Monitor, Session, SessionClient};
 use chrono::Utc;
@@ -78,13 +78,13 @@ pub fn capture_session(
         match profile_ws {
             Some(mappings) => crate::brave::filter_profiles_by_config(all_profiles, Some(mappings)),
             None => {
-                let active_directories: Vec<String> = clients
+                let active_directories: Vec<String> = raw_clients
                     .iter()
                     .filter(|client| {
                         client.class.eq_ignore_ascii_case("brave-browser")
                             || client.initial_class.eq_ignore_ascii_case("brave-browser")
                     })
-                    .filter_map(|client| client.profile_directory.clone())
+                    .flat_map(|client| find_profile_directories(process_info, client.pid))
                     .collect();
                 crate::brave::filter_profiles_by_active_directories(
                     all_profiles,
@@ -122,6 +122,11 @@ fn build_session_client(
     let app_config = app_config_for(config, &client.class, &client.initial_class);
     let launch = build_launch_info(client, app_config, process_info);
 
+    let profile_directory = find_profile_directory(process_info, client.pid);
+    let profile_identity_ambiguous = (client.class.eq_ignore_ascii_case("brave-browser")
+        || client.initial_class.eq_ignore_ascii_case("brave-browser"))
+        && profile_directory.is_none();
+
     SessionClient {
         class: client.class.clone(),
         title: client.title.clone(),
@@ -143,7 +148,8 @@ fn build_session_client(
         floating: client.floating,
         fullscreen: client.fullscreen,
         pinned: client.pinned,
-        profile_directory: find_profile_directory(process_info, client.pid),
+        profile_directory,
+        profile_identity_ambiguous,
         focus_history_id: client.focus_history_id,
         launch,
     }
