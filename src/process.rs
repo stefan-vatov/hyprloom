@@ -243,10 +243,20 @@ pub fn select_terminal_process(
     process_info: &dyn ProcessInfoProvider,
     terminal_pid: u32,
 ) -> Option<ChildProcess> {
-    process_info
-        .get_descendants(terminal_pid)
-        .ok()
-        .and_then(|children| select_terminal_child(&children).cloned())
+    let descendants = process_info.get_descendants(terminal_pid).ok()?;
+    let shell_count = descendants
+        .iter()
+        .filter(|child| !child.cwd.as_os_str().is_empty() && is_plain_shell(&child.cmdline))
+        .count();
+    if shell_count > 1 {
+        // A terminal server, multiplexer, or single-instance terminal can
+        // expose several shell descendants for one Hyprland client PID.  No
+        // process-level signal tells us which shell belongs to that window,
+        // so returning an arbitrary shell would capture another window's CWD
+        // or command and later use it as false identity evidence.
+        return None;
+    }
+    select_terminal_child(&descendants).cloned()
 }
 
 pub fn profile_directory_from_cmdline(cmdline: &str) -> Option<String> {
@@ -450,6 +460,32 @@ mod tests {
         let shell = select_terminal_process(&process_info, 1).expect("nested shell");
         assert_eq!(shell.pid, 30);
         assert_eq!(shell.cwd, PathBuf::from("/work/project"));
+    }
+
+    #[test]
+    fn test_terminal_selection_rejects_multiple_shells_for_one_terminal_pid() {
+        let mut children = HashMap::new();
+        children.insert(
+            1,
+            vec![
+                ChildProcess {
+                    pid: 20,
+                    cwd: PathBuf::from("/work/one"),
+                    cmdline: "zsh".to_string(),
+                },
+                ChildProcess {
+                    pid: 30,
+                    cwd: PathBuf::from("/work/two"),
+                    cmdline: "bash".to_string(),
+                },
+            ],
+        );
+        let process_info = MockProcessInfo {
+            cwds: HashMap::new(),
+            children,
+        };
+
+        assert!(select_terminal_process(&process_info, 1).is_none());
     }
 
     #[test]

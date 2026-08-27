@@ -388,12 +388,12 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if target.at == current.at {
         score += 120;
     } else {
-        score -= manhattan_distance(target.at, current.at).min(120);
+        score -= manhattan_distance(target.at, current.at).min(120) as i32;
     }
     if target.size == current.size {
         score += 90;
     } else {
-        score -= manhattan_distance(target.size, current.size).min(90);
+        score -= manhattan_distance(target.size, current.size).min(90) as i32;
     }
 
     Some((score, kind))
@@ -411,22 +411,27 @@ fn strong_identity_conflict(target: &SessionClient, observed: &ObservedClient) -
         || same_nonempty(&target.title, &current.initial_title)
         || same_nonempty(&target.initial_title, &current.title)
         || titles_similar(&target.title, &current.title);
+    let current_title_conflict = !target.title.is_empty()
+        && !current.title.is_empty()
+        && !same_nonempty(&target.title, &current.title)
+        && !titles_similar(&target.title, &current.title);
     let initial_title_conflict = !is_ghostty_class(target)
         && !target.initial_title.is_empty()
         && !current.initial_title.is_empty()
         && !same_nonempty(&target.initial_title, &current.initial_title)
         && !title_evidence_agrees;
-    let title_conflict = !target.title.is_empty()
-        && !current.title.is_empty()
-        && !same_nonempty(&target.title, &current.title)
-        && !same_nonempty(&target.initial_title, &current.initial_title)
-        && !titles_similar(&target.title, &current.title);
+    let same_initial_title_conflict = !is_ghostty_class(target)
+        && launch_cwd(target).is_none()
+        && same_nonempty(&target.initial_title, &current.initial_title)
+        && current_title_conflict;
+    let title_conflict =
+        current_title_conflict && !same_nonempty(&target.initial_title, &current.initial_title);
     let cwd_conflict = matches!(
         (launch_cwd(target), observed.cwd.as_ref()),
         (Some(target_cwd), Some(current_cwd)) if target_cwd != *current_cwd
     );
 
-    initial_title_conflict || title_conflict && cwd_conflict
+    same_initial_title_conflict || initial_title_conflict || title_conflict && cwd_conflict
 }
 
 fn classes_match(target: &SessionClient, current: &HyprClient) -> bool {
@@ -469,8 +474,9 @@ fn normalize_title(title: &str) -> String {
         .to_lowercase()
 }
 
-fn manhattan_distance(left: [i32; 2], right: [i32; 2]) -> i32 {
-    (left[0] - right[0]).abs() + (left[1] - right[1]).abs()
+fn manhattan_distance(left: [i32; 2], right: [i32; 2]) -> i64 {
+    (i64::from(left[0]) - i64::from(right[0])).abs()
+        + (i64::from(left[1]) - i64::from(right[1])).abs()
 }
 
 fn launch_cwd(client: &SessionClient) -> Option<PathBuf> {
@@ -518,6 +524,14 @@ fn restore_session_with_process_info(
     dry_run: bool,
     verbose: bool,
 ) -> Result<RestoreReport, RestoreError> {
+    let target_count = build_reconcile_targets(session, config).len();
+    if target_count > MAX_RECONCILIATION_WINDOWS {
+        return Err(RestoreError::TooManyWindows {
+            targets: target_count,
+            current: 0,
+            limit: MAX_RECONCILIATION_WINDOWS,
+        });
+    }
     let mut report = RestoreReport::default();
 
     // Fetch current windows once to detect already-running duplicates.
@@ -631,6 +645,23 @@ fn restore_session_with_process_info(
             }
 
             if dry_run {
+                let launch_command = build_launch_command(&restore_client);
+                if !launch_command_is_trusted(&restore_client, config) {
+                    report.details.push(format!(
+                        "[dry-run] FAIL: launch command '{}' for {} is not authorized by app identity or config",
+                        launch_command[0], client.class
+                    ));
+                    report.failed += 1;
+                    continue;
+                }
+                if resolve_launch_binary(&launch_command[0], &client.class).is_err() {
+                    report.details.push(format!(
+                        "[dry-run] FAIL: binary '{}' not found for {}",
+                        launch_command[0], client.class
+                    ));
+                    report.failed += 1;
+                    continue;
+                }
                 let cmds =
                     build_dispatch_commands_for_monitor(&restore_client, target_monitor_available);
                 report.details.push(format!(
@@ -655,14 +686,11 @@ fn restore_session_with_process_info(
                 continue;
             }
             if resolve_launch_binary(&launch_command[0], &client.class).is_err() {
-                let msg = format!(
-                    "SKIP: binary '{}' not found for {}",
+                report.details.push(format!(
+                    "FAIL: binary '{}' not found for {}",
                     launch_command[0], client.class
-                );
-                if verbose {
-                    report.details.push(msg);
-                }
-                report.skipped += 1;
+                ));
+                report.failed += 1;
                 continue;
             }
 
@@ -2103,7 +2131,19 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             let profile_confirmed_browser_reuse = is_brave_client(client)
                 && client.profile_directory.is_some()
                 && candidates.len() == 1
-                && before_pids.contains(&candidates[0].pid);
+                && before_pids.contains(&candidates[0].pid)
+                // A profile flag belongs to the shared browser process, not
+                // necessarily to the newly-created top-level window.  Once
+                // that PID already owns multiple visible Brave windows, a
+                // positive process-level profile is not enough to identify
+                // which window appeared for this launch.
+                && before_clients
+                    .iter()
+                    .filter(|before| {
+                        before.pid == candidates[0].pid && is_brave_hypr_client(before)
+                    })
+                    .count()
+                    == 1;
             if launched.pid.is_some() && !process_related && !profile_confirmed_browser_reuse {
                 // A same-class window can be opened by the user while the
                 // requested application is starting.  Never move that window
@@ -2607,6 +2647,45 @@ mod tests {
         let observed = ObservedClient::from_hypr_client(current, None, None);
 
         assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
+    fn test_matching_rejects_conflicting_current_title_when_initial_title_is_generic() {
+        let mut target = make_client(
+            "example-app",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "example-app",
+            vec![],
+            None,
+        );
+        target.initial_title = "Example App".to_string();
+        target.title = "Project A".to_string();
+
+        let mut current = make_reconcile_window(
+            "0xextra",
+            "example-app",
+            "Project B",
+            1,
+            0,
+            [10, 20],
+            [800, 600],
+        );
+        current.initial_title = "Example App".to_string();
+        let observed = ObservedClient::from_hypr_client(current, None, None);
+
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
+    }
+
+    #[test]
+    fn test_matching_distance_handles_extreme_coordinates_without_overflow() {
+        assert_eq!(
+            manhattan_distance([i32::MIN, i32::MIN], [i32::MAX, i32::MAX]),
+            8_589_934_590
+        );
     }
 
     #[test]
@@ -3142,12 +3221,25 @@ mod tests {
             [800, 600],
             false,
             0,
-            "kitty",
+            "true",
             vec!["--directory".to_string(), "/home/user".to_string()],
             Some("claude --continue".to_string()),
         );
         let session = make_session(vec![client]);
-        let config = Config::default();
+        let config = Config {
+            apps: HashMap::from([(
+                "kitty".to_string(),
+                AppConfig {
+                    binary: Some("true".to_string()),
+                    capture_cwd: None,
+                    capture_last_command: None,
+                    hint_template: None,
+                    profile_workspaces: None,
+                    default_workspace: None,
+                },
+            )]),
+            ..Config::default()
+        };
         // The mock will never be called for dispatches in dry-run mode.
         let mock = MockHyprctl::new(vec![]);
 
@@ -3643,10 +3735,10 @@ mod tests {
         assert!(mock.dispatches().is_empty());
     }
 
-    // ── Test: skips client when binary is missing ────────────────────────────
+    // ── Test: reports client when binary is missing ──────────────────────────
 
     #[test]
-    fn test_restore_skips_missing_binary() {
+    fn test_restore_reports_missing_binary_as_failure() {
         let client = make_client(
             "nonexistent_app_xyz",
             1,
@@ -3675,11 +3767,125 @@ mod tests {
 
         let report = restore_session(&session, &mock, &config, false, true).unwrap();
 
-        assert_eq!(report.skipped, 1, "missing binary should be skipped");
+        assert_eq!(report.skipped, 0);
         assert_eq!(report.restored, 0);
-        assert_eq!(report.failed, 0);
+        assert_eq!(report.failed, 1, "missing binary must be actionable");
         // No dispatches should have been sent.
         assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_restore_rejects_more_than_the_operational_window_limit() {
+        let clients: Vec<SessionClient> = (0..=MAX_RECONCILIATION_WINDOWS)
+            .map(|index| {
+                make_client(
+                    "example-app",
+                    1,
+                    [index as i32, 0],
+                    [800, 600],
+                    false,
+                    0,
+                    "true",
+                    vec![],
+                    None,
+                )
+            })
+            .collect();
+        let mock = MockHyprctl::new(vec![]);
+
+        let error = restore_session(
+            &make_session(clients),
+            &mock,
+            &Config::default(),
+            false,
+            true,
+        )
+        .expect_err("normal restore must be bounded");
+
+        assert!(matches!(
+            error,
+            RestoreError::TooManyWindows {
+                targets,
+                current: 0,
+                limit,
+            } if targets == MAX_RECONCILIATION_WINDOWS + 1
+                && limit == MAX_RECONCILIATION_WINDOWS
+        ));
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_restore_dry_run_reports_missing_launch_binary_as_failure() {
+        let client = make_client(
+            "missing-app",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "missing_binary_for_dry_run_xyz",
+            vec![],
+            None,
+        );
+        let mut config = Config::default();
+        config.apps.insert(
+            "missing-app".to_string(),
+            AppConfig {
+                binary: Some("missing_binary_for_dry_run_xyz".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
+            },
+        );
+
+        let report = restore_session(
+            &make_session(vec![client]),
+            &MockHyprctl::new(vec![]),
+            &config,
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.failed, 1);
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("missing_binary_for_dry_run_xyz")));
+    }
+
+    #[test]
+    fn test_restore_dry_run_reports_untrusted_launch_command_as_failure() {
+        let client = make_client(
+            "kitty",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+
+        let report = restore_session(
+            &make_session(vec![client]),
+            &MockHyprctl::new(vec![]),
+            &Config::default(),
+            true,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.failed, 1);
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("not authorized")));
     }
 
     // ── Test: skips duplicate class+workspace already running ────────────
@@ -3873,14 +4079,14 @@ mod tests {
 
         let report = restore_session(&session, &mock, &config, false, true).unwrap();
 
-        // 2 skipped as duplicates, 1 skipped as binary-not-found → total 3.
+        // 2 skipped as duplicates, 1 failed as binary-not-found.
         assert_eq!(
-            report.skipped, 3,
-            "expected 3 skipped; got {}",
+            report.skipped, 2,
+            "expected 2 skipped; got {}",
             report.skipped
         );
         assert_eq!(report.restored, 0);
-        assert_eq!(report.failed, 0);
+        assert_eq!(report.failed, 1);
 
         // Exactly 2 detail lines should mention "already on ws=".
         let dup_msgs: Vec<_> = report
@@ -3951,7 +4157,7 @@ mod tests {
                     [800, 600],
                     false,
                     0,
-                    "kitty",
+                    "true",
                     vec![],
                     None,
                 ),
@@ -3972,7 +4178,7 @@ mod tests {
         apps.insert(
             "brave-browser".to_string(),
             AppConfig {
-                binary: Some("brave".to_string()),
+                binary: Some("true".to_string()),
                 capture_cwd: None,
                 capture_last_command: None,
                 hint_template: None,
@@ -3981,6 +4187,17 @@ mod tests {
                     ("Profile 1".to_string(), 6),
                 ])),
                 default_workspace: Some(1),
+            },
+        );
+        apps.insert(
+            "kitty".to_string(),
+            AppConfig {
+                binary: Some("true".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
             },
         );
 
@@ -4052,7 +4269,7 @@ mod tests {
         apps.insert(
             "brave-browser".to_string(),
             AppConfig {
-                binary: Some("brave".to_string()),
+                binary: Some("true".to_string()),
                 capture_cwd: None,
                 capture_last_command: None,
                 hint_template: None,
@@ -4098,14 +4315,27 @@ mod tests {
                 [800, 600],
                 false,
                 0,
-                "brave",
+                "true",
                 vec![],
                 None,
             )],
             brave_profiles: vec![], // no profiles
         };
 
-        let config = Config::default();
+        let config = Config {
+            apps: HashMap::from([(
+                "brave-browser".to_string(),
+                AppConfig {
+                    binary: Some("true".to_string()),
+                    capture_cwd: None,
+                    capture_last_command: None,
+                    hint_template: None,
+                    profile_workspaces: None,
+                    default_workspace: None,
+                },
+            )]),
+            ..Config::default()
+        };
         let mock = MockHyprctl::new(vec![]);
         let report = restore_session(&session, &mock, &config, true, true).unwrap();
 
@@ -4469,6 +4699,75 @@ mod tests {
             .dispatches()
             .iter()
             .any(|dispatch| dispatch.contains("0xnew")));
+    }
+
+    #[test]
+    fn test_brave_launch_rejects_reused_pid_with_multiple_existing_windows() {
+        let mut target = make_client(
+            "brave-browser",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.profile_directory = Some("Default".to_string());
+        let mut first = make_reconcile_window(
+            "0xexisting-a",
+            "brave-browser",
+            "Work",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut second = make_reconcile_window(
+            "0xexisting-b",
+            "brave-browser",
+            "Personal",
+            2,
+            0,
+            [900, 0],
+            [800, 600],
+        );
+        first.pid = 1000;
+        second.pid = 1000;
+        let mut new_window = make_reconcile_window(
+            "0xnew",
+            "brave-browser",
+            "Unexpected",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        new_window.pid = 1000;
+        let mock = MockHyprctl::new(vec![
+            vec![first.clone(), second.clone()],
+            vec![first, second, new_window],
+        ]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.window_detect_timeout_ms = 500;
+        config.general.restore_delay_ms = 0;
+
+        let result = restore_single_client_with_launcher_and_process_info_with_address(
+            &target,
+            &mock,
+            &BraveProfileProcessInfo,
+            &config,
+            &launcher,
+            true,
+        );
+
+        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]
