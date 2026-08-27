@@ -71,6 +71,8 @@ pub enum SessionError {
     NotFound(String),
     #[error("session '{0}' already exists")]
     AlreadyExists(String),
+    #[error("invalid session name '{0}': use 1-128 ASCII letters, numbers, '.', '_' or '-'")]
+    InvalidName(String),
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +83,7 @@ pub struct SessionSummary {
 }
 
 pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), SessionError> {
+    validate_session_name(&session.name)?;
     std::fs::create_dir_all(sessions_dir)?;
     let path = sessions_dir.join(format!("{}.json", session.name));
     let json = serde_json::to_string_pretty(session)?;
@@ -89,6 +92,7 @@ pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), Sessio
 }
 
 pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionError> {
+    validate_session_name(name)?;
     let path = sessions_dir.join(format!("{name}.json"));
     if !path.exists() {
         return Err(SessionError::NotFound(name.to_string()));
@@ -122,6 +126,7 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
 }
 
 pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionError> {
+    validate_session_name(name)?;
     let path = sessions_dir.join(format!("{name}.json"));
     if !path.exists() {
         return Err(SessionError::NotFound(name.to_string()));
@@ -131,7 +136,24 @@ pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionErro
 }
 
 pub fn session_exists(name: &str, sessions_dir: &Path) -> bool {
+    if validate_session_name(name).is_err() {
+        return false;
+    }
     sessions_dir.join(format!("{name}.json")).exists()
+}
+
+pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(SessionError::InvalidName(name.to_string()));
+    }
+    Ok(())
 }
 
 /// Copy legacy hyprflow sessions into the fork's storage without removing or
@@ -210,14 +232,20 @@ pub fn parse_max_age(s: &str) -> Result<chrono::Duration, String> {
     let num: i64 = num_str
         .parse()
         .map_err(|_| format!("invalid duration: '{s}'"))?;
-    match unit {
-        "m" => Ok(chrono::Duration::minutes(num)),
-        "h" => Ok(chrono::Duration::hours(num)),
-        "d" => Ok(chrono::Duration::days(num)),
-        _ => Err(format!(
-            "invalid duration unit '{unit}' in '{s}'. Use m, h, or d."
-        )),
+    if num <= 0 {
+        return Err(format!("duration must be greater than zero: '{s}'"));
     }
+    let duration = match unit {
+        "m" => chrono::Duration::try_minutes(num),
+        "h" => chrono::Duration::try_hours(num),
+        "d" => chrono::Duration::try_days(num),
+        _ => {
+            return Err(format!(
+                "invalid duration unit '{unit}' in '{s}'. Use m, h, or d."
+            ))
+        }
+    };
+    duration.ok_or_else(|| format!("duration is out of range: '{s}'"))
 }
 
 // === Raw hyprctl JSON structs (what hyprctl returns) ===
@@ -476,6 +504,20 @@ mod tests {
     }
 
     #[test]
+    fn test_session_names_cannot_escape_storage_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["../escape", "nested/name", "..", "", "bad name"] {
+            let mut session = make_test_session("safe");
+            session.name = name.to_string();
+
+            assert!(save_session(&session, dir.path()).is_err());
+            assert!(load_session(name, dir.path()).is_err());
+            assert!(delete_session(name, dir.path()).is_err());
+            assert!(!session_exists(name, dir.path()));
+        }
+    }
+
+    #[test]
     fn test_autosave_name_format() {
         let name = autosave_name_now();
         assert!(name.starts_with("autosave-"));
@@ -559,6 +601,9 @@ mod tests {
         assert!(parse_max_age("abc").is_err());
         assert!(parse_max_age("10x").is_err());
         assert!(parse_max_age("").is_err());
+        assert!(parse_max_age("0m").is_err());
+        assert!(parse_max_age("-1h").is_err());
+        assert!(parse_max_age("9223372036854775807d").is_err());
     }
 
     #[test]

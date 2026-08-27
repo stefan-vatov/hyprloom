@@ -26,7 +26,7 @@ jobs:
         run: cargo fmt -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings -A clippy::too_many_arguments -A deprecated
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Unit tests
-        run: cargo test --lib
+      - name: Test all targets
+        run: cargo test --locked

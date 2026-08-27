@@ -1,6 +1,6 @@
 name: Release
 
-# Triggered by pushing a version tag (e.g., v0.2.0)
+# Triggered by pushing a version tag (e.g., v0.3.0)
 on:
   push:
     tags: ["v*"]
@@ -21,11 +21,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Unit tests
-        run: cargo test --lib
+      - name: Test all targets
+        run: cargo test --locked
 
       - name: Build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

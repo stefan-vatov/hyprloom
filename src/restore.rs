@@ -948,7 +948,10 @@ fn restore_single_client_with_launcher(
         hyprctl.dispatch(&format!("togglefloating address:{}", new_addr))?;
     }
     if client.fullscreen > 0 {
-        hyprctl.dispatch(&format!("fullscreen {}", client.fullscreen))?;
+        hyprctl.dispatch(&format!(
+            "fullscreenstate {} {},address:{}",
+            client.fullscreen, client.fullscreen, new_addr
+        ))?;
     }
 
     // 7. Throttle subsequent launches to give the compositor time to settle.
@@ -1029,7 +1032,10 @@ pub fn build_dispatch_commands(client: &SessionClient) -> Vec<String> {
         cmds.push(format!("togglefloating {addr}"));
     }
     if client.fullscreen > 0 {
-        cmds.push(format!("fullscreen {}", client.fullscreen));
+        cmds.push(format!(
+            "fullscreenstate {} {},{}",
+            client.fullscreen, client.fullscreen, addr
+        ));
     }
 
     cmds
@@ -1392,6 +1398,45 @@ mod tests {
             !cmds.iter().any(|c| c.starts_with("fullscreen")),
             "non-fullscreen client should not have fullscreen dispatch"
         );
+    }
+
+    #[test]
+    fn test_new_fullscreen_window_is_targeted_by_address() {
+        let target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            1,
+            "true",
+            vec![],
+            None,
+        );
+        let new_window = make_reconcile_window(
+            "0xnew-fullscreen",
+            "kitty",
+            "kitty",
+            1,
+            0,
+            [0, 0],
+            [400, 300],
+        );
+        let mock = MockHyprctl::new(vec![vec![], vec![new_window]]);
+        let launcher = RecordingLauncher::default();
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        restore_single_client_with_launcher(&target, &mock, &config, &launcher).unwrap();
+
+        assert!(mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch == "fullscreenstate 1 1,address:0xnew-fullscreen"));
+        assert!(!mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch == "fullscreen 1"));
     }
 
     // ── Test: skips client when binary is missing ────────────────────────────
