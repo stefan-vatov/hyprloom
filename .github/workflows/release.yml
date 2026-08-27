@@ -62,6 +62,8 @@ jobs:
     name: Publish to AUR
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
@@ -78,6 +80,8 @@ jobs:
           test -s source.tar.gz
           tar -tzf source.tar.gz >/dev/null
           sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)
+          expected_sha256=$(sed -n "s/^sha256sums=('\\([^']*\\)').*/\\1/p" PKGBUILD)
+          test "$sha256" = "$expected_sha256"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
 
       - name: Configure SSH for AUR
@@ -93,19 +97,19 @@ jobs:
       - name: Clone AUR repo
         run: git clone ssh://aur@aur.archlinux.org/hyprloom.git aur-repo
 
-      - name: Update PKGBUILD
+      - name: Use tagged repository package metadata
         working-directory: aur-repo
         run: |
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.version.outputs.version }}/" PKGBUILD
-          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
-          sed -i "s/^sha256sums=.*/sha256sums=('${{ steps.checksum.outputs.sha256 }}')/" PKGBUILD
+          cp "$GITHUB_WORKSPACE/PKGBUILD" PKGBUILD
+          cp "$GITHUB_WORKSPACE/.SRCINFO" .SRCINFO
 
       - name: Validate Arch package
         working-directory: aur-repo
         run: |
-          docker run --rm -v "$PWD":/pkg -w /pkg archlinux:latest \
+          docker run --rm -v "$PWD":/pkg -w /pkg \
+            archlinux@sha256:c9dc8b5d1b06d8d50ace6d42b2c93fbb1e34c9e1332d1a2102936e497d3187ae \
             bash -euxo pipefail -c '
-              pacman -Sy --noconfirm base-devel rust
+              pacman -Syu --noconfirm base-devel rust
               useradd -m builder
               chown -R builder:builder /pkg
               su builder -c "makepkg --verifysource --nodeps"
@@ -116,8 +120,9 @@ jobs:
       - name: Generate .SRCINFO
         working-directory: aur-repo
         run: |
-          docker run --rm -v "$PWD":/pkg -w /pkg archlinux:latest bash -c "
-            pacman -Sy --noconfirm base-devel &&
+          docker run --rm -v "$PWD":/pkg -w /pkg \
+            archlinux@sha256:c9dc8b5d1b06d8d50ace6d42b2c93fbb1e34c9e1332d1a2102936e497d3187ae bash -c "
+            pacman -Syu --noconfirm base-devel &&
             useradd -m builder &&
             chown -R builder:builder /pkg &&
             su builder -c 'makepkg --printsrcinfo > .SRCINFO'
