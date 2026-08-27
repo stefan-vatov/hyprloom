@@ -30,6 +30,8 @@ pub struct HyprClient {
     pub size: [i32; 2],
     pub floating: bool,
     pub fullscreen: u8,
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i32,
     pub pid: u32,
@@ -42,6 +44,10 @@ pub struct HyprMonitor {
     pub width: u32,
     pub height: u32,
     pub transform: u32,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
 }
 
 // ── Error type ─────────────────────────────────────────────────────────────
@@ -95,9 +101,10 @@ impl HyprctlClient for RealHyprctl {
     }
 
     fn dispatch(&self, args: &str) -> Result<(), HyprctlError> {
+        let parsed_args = parse_dispatch_args(args).map_err(HyprctlError::CommandFailed)?;
         let output = Command::new("hyprctl")
             .arg("dispatch")
-            .args(args.split_whitespace())
+            .args(parsed_args)
             .output()?;
         if !output.status.success() {
             return Err(HyprctlError::CommandFailed(
@@ -122,6 +129,71 @@ impl HyprctlClient for RealHyprctl {
             .unwrap_or("unknown")
             .to_string())
     }
+}
+
+/// Parse the argument string accepted by `HyprctlClient::dispatch` without
+/// destroying quoted workspace or monitor names.  The old whitespace split
+/// made a named workspace such as `name:Writing Desk` impossible to dispatch.
+fn parse_dispatch_args(input: &str) -> Result<Vec<String>, String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut token_started = false;
+
+    for character in input.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            token_started = true;
+            continue;
+        }
+
+        if character == '\\' {
+            escaped = true;
+            token_started = true;
+            continue;
+        }
+
+        if let Some(quote_character) = quote {
+            if character == quote_character {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            token_started = true;
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => {
+                quote = Some(character);
+                token_started = true;
+            }
+            character if character.is_whitespace() => {
+                if token_started {
+                    args.push(std::mem::take(&mut current));
+                    token_started = false;
+                }
+            }
+            character => {
+                current.push(character);
+                token_started = true;
+            }
+        }
+    }
+
+    if escaped {
+        return Err("dispatch arguments end with an escape".to_string());
+    }
+    if quote.is_some() {
+        return Err("dispatch arguments contain an unterminated quote".to_string());
+    }
+    if token_started {
+        args.push(current);
+    }
+
+    Ok(args)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -215,5 +287,37 @@ mod tests {
         for (i, cmd) in commands.iter().enumerate() {
             assert_eq!(&calls[i], cmd);
         }
+    }
+
+    #[test]
+    fn test_parse_dispatch_args_preserves_quoted_names_and_escapes() {
+        let args =
+            parse_dispatch_args("movetoworkspacesilent 'name:Writing Desk',address:0x1").unwrap();
+
+        assert_eq!(
+            args,
+            vec!["movetoworkspacesilent", "name:Writing Desk,address:0x1"]
+        );
+
+        assert_eq!(
+            parse_dispatch_args("movetomonitor DP-1,address:0x1").unwrap(),
+            vec!["movetomonitor", "DP-1,address:0x1"]
+        );
+    }
+
+    #[test]
+    fn test_parse_dispatch_args_rejects_unterminated_quotes() {
+        assert!(parse_dispatch_args("workspace 'name:Writing Desk").is_err());
+    }
+
+    #[test]
+    fn test_monitor_origin_stays_unknown_when_hyprland_omits_it() {
+        let monitor: HyprMonitor = serde_json::from_str(
+            r#"{"id":0,"name":"DP-1","width":1920,"height":1080,"transform":0}"#,
+        )
+        .expect("monitor without optional origin should still parse");
+
+        assert_eq!(monitor.x, None);
+        assert_eq!(monitor.y, None);
     }
 }

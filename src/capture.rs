@@ -1,6 +1,9 @@
-use crate::config::{AppConfig, Config};
+use crate::config::{app_config_for, is_ignored_class, AppConfig, Config};
 use crate::hyprctl::{HyprctlClient, HyprctlError};
-use crate::process::{ProcessError, ProcessInfoProvider};
+use crate::process::{
+    find_profile_directory, is_helper_process, is_plain_shell, select_terminal_process,
+    ProcessError, ProcessInfoProvider,
+};
 use crate::session::{LaunchInfo, Monitor, Session, SessionClient};
 use chrono::Utc;
 use std::collections::HashMap;
@@ -48,24 +51,30 @@ pub fn capture_session(
             width: m.width,
             height: m.height,
             transform: m.transform,
+            x: m.x,
+            y: m.y,
         })
         .collect();
 
     let clients: Vec<SessionClient> = raw_clients
         .iter()
-        .filter(|c| !config.filters.ignore_classes.contains(&c.class))
+        .filter(|c| {
+            !is_ignored_class(&c.class, &config.filters.ignore_classes)
+                && !is_ignored_class(&c.initial_class, &config.filters.ignore_classes)
+        })
         .map(|c| build_session_client(c, &monitor_map, process_info, config))
         .collect();
 
-    let brave_profiles = if clients.iter().any(|c| c.class == "brave-browser") {
+    let brave_profiles = if clients.iter().any(|c| {
+        c.class.eq_ignore_ascii_case("brave-browser")
+            || c.initial_class.eq_ignore_ascii_case("brave-browser")
+    }) {
         let all_profiles = crate::brave::read_profiles().unwrap_or_else(|e| {
             eprintln!("Warning: could not read Brave profiles: {e}");
             vec![]
         });
-        let profile_ws = config
-            .apps
-            .get("brave-browser")
-            .and_then(|c| c.profile_workspaces.as_ref());
+        let profile_ws =
+            app_config_for(config, "brave-browser", "").and_then(|c| c.profile_workspaces.as_ref());
         crate::brave::filter_profiles_by_config(all_profiles, profile_ws)
     } else {
         vec![]
@@ -83,26 +92,6 @@ pub fn capture_session(
 
 // ── Private helpers ────────────────────────────────────────────────────────
 
-/// Returns `true` when `cmdline` is a bare shell invocation (no arguments,
-/// no running command).  Used to suppress noisy hints like `/bin/zsh`.
-fn is_plain_shell(cmdline: &str) -> bool {
-    const PLAIN_SHELLS: &[&str] = &[
-        "zsh",
-        "bash",
-        "fish",
-        "sh",
-        "/bin/zsh",
-        "/usr/bin/zsh",
-        "/bin/bash",
-        "/usr/bin/bash",
-        "/bin/fish",
-        "/usr/bin/fish",
-        "/bin/sh",
-        "/usr/bin/sh",
-    ];
-    PLAIN_SHELLS.contains(&cmdline)
-}
-
 fn build_session_client(
     client: &crate::hyprctl::HyprClient,
     monitor_map: &HashMap<i32, String>,
@@ -114,10 +103,7 @@ fn build_session_client(
         .cloned()
         .unwrap_or_else(|| format!("monitor-{}", client.monitor));
 
-    let app_config = config
-        .apps
-        .get(&client.class)
-        .or_else(|| config.apps.get(&client.initial_class));
+    let app_config = app_config_for(config, &client.class, &client.initial_class);
     let launch = build_launch_info(client, app_config, process_info);
 
     SessionClient {
@@ -134,11 +120,14 @@ fn build_session_client(
             client.initial_title.clone()
         },
         workspace: client.workspace.id,
+        workspace_name: client.workspace.name.clone(),
         monitor: monitor_name,
         at: client.at,
         size: client.size,
         floating: client.floating,
         fullscreen: client.fullscreen,
+        pinned: client.pinned,
+        profile_directory: find_profile_directory(process_info, client.pid),
         focus_history_id: client.focus_history_id,
         launch,
     }
@@ -168,48 +157,41 @@ fn build_launch_info(
     let mut hint: Option<String> = None;
 
     if capture_cwd || capture_cmd {
-        if let Ok(children) = process_info.get_children(client.pid) {
+        if let Some(shell) = select_terminal_process(process_info, client.pid) {
             // Find the actual shell child, skipping helper processes like
             // kitty's "kitten __atexit__" which has CWD=/home but is not the
             // interactive shell.
-            const SKIP_COMMANDS: &[&str] = &["kitten", "/usr/bin/kitten"];
-            if let Some(shell) = children
-                .iter()
-                .filter(|c| !c.cwd.as_os_str().is_empty())
-                .find(|c| !SKIP_COMMANDS.iter().any(|s| c.cmdline.starts_with(s)))
-            {
-                if capture_cwd {
-                    args.push(
-                        if is_ghostty_class(&client.class)
-                            || is_ghostty_class(&client.initial_class)
-                        {
-                            "--working-directory".to_string()
-                        } else {
-                            "--directory".to_string()
-                        },
-                    );
-                    args.push(shell.cwd.to_string_lossy().to_string());
+            if capture_cwd {
+                args.push(
+                    if is_ghostty_class(&client.class) || is_ghostty_class(&client.initial_class) {
+                        "--working-directory".to_string()
+                    } else {
+                        "--directory".to_string()
+                    },
+                );
+                args.push(shell.cwd.to_string_lossy().to_string());
+            }
+
+            if capture_cmd {
+                // Prefer a grandchild process (the command running inside the shell),
+                // but only when it is not itself a plain shell.
+                if let Ok(grandchildren) = process_info.get_descendants(shell.pid) {
+                    if let Some(cmd) = grandchildren
+                        .iter()
+                        .filter(|gc| {
+                            !gc.cmdline.is_empty()
+                                && !is_helper_process(&gc.cmdline)
+                                && !is_plain_shell(&gc.cmdline)
+                        })
+                        .min_by_key(|gc| gc.pid)
+                    {
+                        hint = Some(cmd.cmdline.clone());
+                    }
                 }
 
-                if capture_cmd {
-                    // Prefer a grandchild process (the command running inside the shell),
-                    // but only when it is not itself a plain shell.
-                    if let Ok(grandchildren) = process_info.get_children(shell.pid) {
-                        if let Some(cmd) = grandchildren
-                            .iter()
-                            .find(|gc| !gc.cmdline.is_empty() && !is_plain_shell(&gc.cmdline))
-                        {
-                            hint = Some(cmd.cmdline.clone());
-                        }
-                    }
-
-                    // Fall back to the shell's own cmdline if it is not a plain shell.
-                    if hint.is_none()
-                        && !shell.cmdline.is_empty()
-                        && !is_plain_shell(&shell.cmdline)
-                    {
-                        hint = Some(shell.cmdline.clone());
-                    }
+                // Fall back to the shell's own cmdline if it is not a plain shell.
+                if hint.is_none() && !shell.cmdline.is_empty() && !is_plain_shell(&shell.cmdline) {
+                    hint = Some(shell.cmdline.clone());
                 }
             }
         }
@@ -218,12 +200,7 @@ fn build_launch_info(
     // Render hint through the app-level template when one is configured.
     if let (Some(h), Some(ac)) = (&hint, app_config) {
         if let Some(template) = &ac.hint_template {
-            let cwd_str = args
-                .iter()
-                .skip_while(|s| s.as_str() != "--directory")
-                .nth(1)
-                .map(|s| s.as_str())
-                .unwrap_or("");
+            let cwd_str = launch_cwd_arg(&args).unwrap_or("");
             hint = Some(
                 template
                     .replace("{last_command}", h)
@@ -237,6 +214,18 @@ fn build_launch_info(
         args,
         hint,
     }
+}
+
+fn launch_cwd_arg(args: &[String]) -> Option<&str> {
+    args.iter().enumerate().find_map(|(index, arg)| {
+        if arg == "--directory" || arg == "--working-directory" {
+            args.get(index + 1).map(String::as_str)
+        } else if let Some(value) = arg.strip_prefix("--directory=") {
+            Some(value)
+        } else {
+            arg.strip_prefix("--working-directory=")
+        }
+    })
 }
 
 fn is_ghostty_class(class: &str) -> bool {
@@ -316,6 +305,7 @@ mod tests {
             size: [800, 600],
             floating: false,
             fullscreen: 0,
+            pinned: false,
             focus_history_id: 0,
             pid,
         }
@@ -332,6 +322,8 @@ mod tests {
             width: 1920,
             height: 1080,
             transform: 0,
+            x: Some(0),
+            y: Some(0),
         }
     }
 
@@ -374,6 +366,26 @@ mod tests {
             "brave-browser must be present"
         );
         assert!(!classes.contains(&"waybar"), "waybar must be absent");
+    }
+
+    #[test]
+    fn test_capture_filters_ignored_initial_class_case_insensitively() {
+        let mut client = make_hypr_client("wrapper", 1004);
+        client.initial_class = "WayBar".to_string();
+        let hyprctl = MockHyprctl {
+            clients: vec![client],
+            monitors: vec![make_monitor("DP-1")],
+        };
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig {
+                ignore_classes: vec!["waybar".to_string()],
+            },
+            apps: HashMap::new(),
+        };
+
+        let session = capture_session("test", &hyprctl, &empty_process(), &config).unwrap();
+        assert!(session.clients.is_empty());
     }
 
     // ── Test 2: kitty with CWD capture ───────────────────────────────────
@@ -560,6 +572,27 @@ mod tests {
             capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
 
         assert_eq!(session.clients[0].monitor, "DP-2");
+    }
+
+    #[test]
+    fn test_capture_preserves_named_workspace_and_pinned_state() {
+        let mut client = make_hypr_client("kitty", 4002);
+        client.workspace = RawWorkspace {
+            id: -99,
+            name: "special:magic".to_string(),
+        };
+        client.pinned = true;
+        let hyprctl = MockHyprctl {
+            clients: vec![client],
+            monitors: vec![make_monitor("DP-1")],
+        };
+
+        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default())
+            .expect("capture failed");
+        let saved = &session.clients[0];
+        assert_eq!(saved.workspace, -99);
+        assert_eq!(saved.workspace_name, "special:magic");
+        assert!(saved.pinned);
     }
 
     // ── Additional: version propagated ───────────────────────────────────

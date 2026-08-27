@@ -1,6 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
+use std::fs::OpenOptions;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // === Hyprloom session structs (what we save to disk) ===
 
@@ -27,6 +32,13 @@ pub struct Monitor {
     pub width: u32,
     pub height: u32,
     pub transform: u32,
+    /// Monitor origin in Hyprland's global coordinate space.  `None` keeps
+    /// older session files from being treated as if they were captured at
+    /// (0, 0), which would make geometry adaptation unsafe.
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,11 +53,17 @@ pub struct SessionClient {
     #[serde(default)]
     pub initial_title: String,
     pub workspace: i32,
+    #[serde(default)]
+    pub workspace_name: String,
     pub monitor: String,
     pub at: [i32; 2],
     pub size: [i32; 2],
     pub floating: bool,
     pub fullscreen: u8,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub profile_directory: Option<String>,
     pub focus_history_id: i32,
     pub launch: LaunchInfo,
 }
@@ -73,6 +91,8 @@ pub enum SessionError {
     AlreadyExists(String),
     #[error("invalid session name '{0}': use 1-128 ASCII letters, numbers, '.', '_' or '-'")]
     InvalidName(String),
+    #[error("unsafe session path for '{0}'")]
+    UnsafePath(String),
 }
 
 #[derive(Debug, Clone)]
@@ -84,32 +104,69 @@ pub struct SessionSummary {
 
 pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), SessionError> {
     validate_session_name(&session.name)?;
-    std::fs::create_dir_all(sessions_dir)?;
+    ensure_sessions_dir(sessions_dir)?;
     let path = sessions_dir.join(format!("{}.json", session.name));
     let json = serde_json::to_string_pretty(session)?;
-    std::fs::write(path, json)?;
+    atomic_write(&path, json.as_bytes())?;
     Ok(())
+}
+
+fn ensure_sessions_dir(sessions_dir: &Path) -> Result<(), SessionError> {
+    match std::fs::symlink_metadata(sessions_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => Err(SessionError::UnsafePath(sessions_dir.display().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(sessions_dir)?;
+            match std::fs::symlink_metadata(sessions_dir) {
+                Ok(metadata) if metadata.is_dir() => Ok(()),
+                Ok(_) => Err(SessionError::UnsafePath(sessions_dir.display().to_string())),
+                Err(error) => Err(SessionError::Io(error)),
+            }
+        }
+        Err(error) => Err(SessionError::Io(error)),
+    }
+}
+
+fn existing_sessions_dir(sessions_dir: &Path) -> Result<bool, SessionError> {
+    match std::fs::symlink_metadata(sessions_dir) {
+        Ok(metadata) if metadata.is_dir() => Ok(true),
+        Ok(_) => Err(SessionError::UnsafePath(sessions_dir.display().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(SessionError::Io(error)),
+    }
 }
 
 pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionError> {
     validate_session_name(name)?;
-    let path = sessions_dir.join(format!("{name}.json"));
-    if !path.exists() {
+    if !existing_sessions_dir(sessions_dir)? {
         return Err(SessionError::NotFound(name.to_string()));
+    }
+    let path = sessions_dir.join(format!("{name}.json"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(SessionError::UnsafePath(name.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SessionError::NotFound(name.to_string()))
+        }
+        Err(error) => return Err(SessionError::Io(error)),
     }
     let content = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&content)?)
 }
 
 pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
-    if !sessions_dir.exists() {
+    if !existing_sessions_dir(sessions_dir)? {
         return Ok(vec![]);
     }
     let mut summaries = Vec::new();
     for entry in std::fs::read_dir(sessions_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
+        let is_regular_file = entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false);
+        if is_regular_file && path.extension().map(|e| e == "json").unwrap_or(false) {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if let Ok(session) = serde_json::from_str::<Session>(&content) {
                     summaries.push(SessionSummary {
@@ -121,15 +178,27 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
             }
         }
     }
-    summaries.sort_by_key(|summary| Reverse(summary.created_at));
+    summaries.sort_by(|left, right| {
+        Reverse(left.created_at)
+            .cmp(&Reverse(right.created_at))
+            .then(left.name.cmp(&right.name))
+    });
     Ok(summaries)
 }
 
 pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionError> {
     validate_session_name(name)?;
-    let path = sessions_dir.join(format!("{name}.json"));
-    if !path.exists() {
+    if !existing_sessions_dir(sessions_dir)? {
         return Err(SessionError::NotFound(name.to_string()));
+    }
+    let path = sessions_dir.join(format!("{name}.json"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(SessionError::UnsafePath(name.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SessionError::NotFound(name.to_string()))
+        }
+        Err(error) => return Err(SessionError::Io(error)),
     }
     std::fs::remove_file(path)?;
     Ok(())
@@ -139,7 +208,12 @@ pub fn session_exists(name: &str, sessions_dir: &Path) -> bool {
     if validate_session_name(name).is_err() {
         return false;
     }
-    sessions_dir.join(format!("{name}.json")).exists()
+    if !matches!(existing_sessions_dir(sessions_dir), Ok(true)) {
+        return false;
+    }
+    std::fs::symlink_metadata(sessions_dir.join(format!("{name}.json")))
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
 }
 
 pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
@@ -163,21 +237,40 @@ pub fn migrate_legacy_sessions(
     sessions_dir: &Path,
     legacy_sessions_dir: &Path,
 ) -> Result<usize, SessionError> {
-    if sessions_dir == legacy_sessions_dir || !legacy_sessions_dir.exists() {
+    if sessions_dir == legacy_sessions_dir {
         return Ok(0);
     }
+    match std::fs::symlink_metadata(legacy_sessions_dir) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => return Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(SessionError::Io(error)),
+    }
 
-    std::fs::create_dir_all(sessions_dir)?;
+    ensure_sessions_dir(sessions_dir)?;
     let mut copied = 0;
     for entry in std::fs::read_dir(legacy_sessions_dir)? {
         let entry = entry?;
         let source = entry.path();
-        if source.extension().map(|ext| ext == "json").unwrap_or(false) {
+        let source_is_regular = entry
+            .file_type()
+            .map(|file_type| file_type.is_file())
+            .unwrap_or(false);
+        if source_is_regular && source.extension().map(|ext| ext == "json").unwrap_or(false) {
             let destination = sessions_dir.join(entry.file_name());
-            if !destination.exists() {
-                std::fs::copy(source, destination)?;
-                copied += 1;
+            if std::fs::symlink_metadata(&destination).is_ok() {
+                continue;
             }
+            let name = source
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            if validate_session_name(name).is_err() {
+                continue;
+            }
+            let content = std::fs::read(source)?;
+            atomic_write(&destination, &content)?;
+            copied += 1;
         }
     }
     Ok(copied)
@@ -186,15 +279,22 @@ pub fn migrate_legacy_sessions(
 // === Autosave helpers ===
 
 pub const AUTOSAVE_PREFIX: &str = "autosave-";
+static AUTOSAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub fn autosave_name_now() -> String {
     let now = Utc::now();
-    format!("autosave-{}", now.format("%Y%m%dT%H%M%S"))
+    let sequence = AUTOSAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "autosave-{}-{}-{}",
+        now.format("%Y%m%dT%H%M%S%f"),
+        std::process::id(),
+        sequence
+    )
 }
 
 /// Returns autosave sessions only (name starts with `AUTOSAVE_PREFIX`),
-/// sorted by name descending. The timestamp format `YYYYMMDDTHHMMSS` sorts
-/// lexicographically, so newest autosave is always first.
+/// sorted by name descending. The timestamp, process ID, and sequence suffix
+/// make names unique even when multiple captures happen in one second.
 pub fn list_autosave_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
     let mut all = list_sessions(sessions_dir)?;
     all.retain(|s| s.name.starts_with(AUTOSAVE_PREFIX));
@@ -213,11 +313,70 @@ pub fn rotate_autosaves(sessions_dir: &Path, retain: usize) -> Result<usize, Ses
     let mut pruned = 0;
     if autosaves.len() > retain {
         for session in &autosaves[retain..] {
-            delete_session(&session.name, sessions_dir)?;
-            pruned += 1;
+            match delete_session(&session.name, sessions_dir) {
+                Ok(()) => pruned += 1,
+                // Another autosave rotation may have removed it already.
+                // Rotation is intentionally idempotent in that case.
+                Err(SessionError::NotFound(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(pruned)
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
+    let parent = path.parent().ok_or_else(|| {
+        SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "session path has no parent directory",
+        ))
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session.json");
+
+    for _ in 0..100 {
+        let sequence = AUTOSAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{file_name}.{}.{}.tmp",
+            std::process::id(),
+            sequence
+        ));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+
+        let mut file = match options.open(&temporary) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(SessionError::Io(error)),
+        };
+
+        let write_result = file.write_all(contents).and_then(|_| file.sync_all());
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(SessionError::Io(error));
+        }
+
+        if let Err(error) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(SessionError::Io(error));
+        }
+        #[cfg(unix)]
+        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+            let _ = directory.sync_all();
+        }
+        return Ok(());
+    }
+
+    Err(SessionError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary session path",
+    )))
 }
 
 /// Parses a human-readable duration string into a `chrono::Duration`.
@@ -265,6 +424,8 @@ pub struct HyprClient {
     pub size: [i32; 2],
     pub floating: bool,
     pub fullscreen: u8,
+    #[serde(default)]
+    pub pinned: bool,
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i32,
     pub pid: u32,
@@ -282,6 +443,10 @@ pub struct HyprMonitor {
     pub width: u32,
     pub height: u32,
     pub transform: u32,
+    #[serde(default)]
+    pub x: Option<i32>,
+    #[serde(default)]
+    pub y: Option<i32>,
 }
 
 #[cfg(test)]
@@ -302,6 +467,8 @@ mod tests {
                 width: 2560,
                 height: 1440,
                 transform: 0,
+                x: None,
+                y: None,
             }],
             clients: vec![SessionClient {
                 class: "kitty".to_string(),
@@ -309,11 +476,14 @@ mod tests {
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 4,
+                workspace_name: "4".to_string(),
                 monitor: "DP-4".to_string(),
                 at: [12, 50],
                 size: [842, 1378],
                 floating: false,
                 fullscreen: 0,
+                pinned: false,
+                profile_directory: None,
                 focus_history_id: 3,
                 launch: LaunchInfo {
                     command: "kitty".to_string(),
@@ -366,11 +536,14 @@ mod tests {
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 1,
+                workspace_name: "1".to_string(),
                 monitor: "DP-4".to_string(),
                 at: [0, 0],
                 size: [800, 600],
                 floating: false,
                 fullscreen: 0,
+                pinned: false,
+                profile_directory: None,
                 focus_history_id: 0,
                 launch: LaunchInfo {
                     command: "kitty".to_string(),
@@ -431,6 +604,34 @@ mod tests {
             0,
             "missing brave_profiles field should default to empty vec"
         );
+    }
+
+    #[test]
+    fn test_session_backward_compat_defaults_new_client_fields() {
+        let json = r#"{
+            "name": "old-client",
+            "created_at": "2026-03-08T10:00:00Z",
+            "hyprland_version": "0.54.0",
+            "monitors": [],
+            "clients": [{
+                "class": "kitty",
+                "title": "kitty",
+                "workspace": 1,
+                "monitor": "DP-1",
+                "at": [0, 0],
+                "size": [800, 600],
+                "floating": false,
+                "fullscreen": 0,
+                "focus_history_id": 0,
+                "launch": {"command": "kitty", "args": [], "hint": null}
+            }]
+        }"#;
+
+        let session: Session = serde_json::from_str(json).expect("old session must load");
+        let client = &session.clients[0];
+        assert_eq!(client.workspace_name, "");
+        assert!(!client.pinned);
+        assert!(client.profile_directory.is_none());
     }
 
     #[test]
@@ -521,11 +722,15 @@ mod tests {
     fn test_autosave_name_format() {
         let name = autosave_name_now();
         assert!(name.starts_with("autosave-"));
-        // Format: autosave-YYYYMMDDTHHMMSS — total 24 chars
-        assert_eq!(name.len(), 24);
-        let ts = &name[9..];
-        assert_eq!(ts.len(), 15);
-        assert_eq!(&ts[8..9], "T");
+        let parts: Vec<&str> = name[9..].split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 24);
+        assert_eq!(&parts[0][8..9], "T");
+    }
+
+    #[test]
+    fn test_autosave_names_are_unique_within_a_process() {
+        assert_ne!(autosave_name_now(), autosave_name_now());
     }
 
     #[test]
@@ -604,6 +809,43 @@ mod tests {
         assert!(parse_max_age("0m").is_err());
         assert!(parse_max_age("-1h").is_err());
         assert!(parse_max_age("9223372036854775807d").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_replaces_destination_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let original = b"must remain untouched";
+        std::fs::write(outside.path(), original).unwrap();
+        symlink(outside.path(), dir.path().join("work.json")).unwrap();
+
+        save_session(&make_test_session("work"), dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(outside.path()).unwrap(), original);
+        assert_eq!(load_session("work", dir.path()).unwrap().name, "work");
+        assert!(!std::fs::symlink_metadata(dir.path().join("work.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_rejects_symlinked_sessions_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        symlink(outside.path(), &sessions_dir).unwrap();
+
+        let error = save_session(&make_test_session("work"), &sessions_dir)
+            .expect_err("symlinked sessions directory must be rejected");
+        assert!(matches!(error, SessionError::UnsafePath(_)));
+        assert!(!outside.path().join("work.json").exists());
     }
 
     #[test]

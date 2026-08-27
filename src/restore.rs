@@ -1,7 +1,9 @@
-use crate::config::Config;
-use crate::hyprctl::{HyprClient, HyprctlClient, HyprctlError};
-use crate::process::ProcessInfoProvider;
-use crate::session::{Session, SessionClient};
+use crate::config::{app_config_for, is_ignored_class, Config};
+use crate::hyprctl::{HyprClient, HyprMonitor, HyprctlClient, HyprctlError};
+use crate::process::{
+    find_profile_directory, select_terminal_process, ProcessInfoProvider, RealProcessInfo,
+};
+use crate::session::{Monitor, Session, SessionClient};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -16,6 +18,10 @@ pub enum RestoreError {
     Hyprctl(#[from] HyprctlError),
     #[error("no session found")]
     NoSession,
+    #[error("could not unambiguously identify the new '{class}' window; candidates: {addresses}")]
+    AmbiguousWindow { class: String, addresses: String },
+    #[error("window {address} disappeared before reconciliation completed")]
+    WindowDisappeared { address: String },
 }
 
 // ── Report ──────────────────────────────────────────────────────────────────
@@ -32,19 +38,28 @@ pub struct RestoreReport {
 /// used by the CLI, while tests can provide a deterministic launcher without
 /// starting applications on the developer's desktop.
 pub trait ProcessLauncher {
-    fn spawn(&self, command: &str, args: &[String]) -> Result<(), std::io::Error>;
+    fn spawn(&self, command: &str, args: &[String]) -> Result<LaunchedProcess, std::io::Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LaunchedProcess {
+    /// PID returned by the launcher.  Some test or desktop launchers cannot
+    /// provide one, so reconciliation retains an identity-based fallback.
+    pub pid: Option<u32>,
 }
 
 pub struct RealProcessLauncher;
 
 impl ProcessLauncher for RealProcessLauncher {
-    fn spawn(&self, command: &str, args: &[String]) -> Result<(), std::io::Error> {
+    fn spawn(&self, command: &str, args: &[String]) -> Result<LaunchedProcess, std::io::Error> {
         Command::new(command)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map(|_| ())
+            .map(|child| LaunchedProcess {
+                pid: Some(child.id()),
+            })
     }
 }
 
@@ -70,6 +85,7 @@ pub struct ObservedClient {
     pub client: HyprClient,
     pub monitor_name: Option<String>,
     pub cwd: Option<PathBuf>,
+    pub profile_directory: Option<String>,
 }
 
 impl ObservedClient {
@@ -82,6 +98,21 @@ impl ObservedClient {
             client,
             monitor_name,
             cwd,
+            profile_directory: None,
+        }
+    }
+
+    pub fn with_profile_directory(
+        client: HyprClient,
+        monitor_name: Option<String>,
+        cwd: Option<PathBuf>,
+        profile_directory: Option<String>,
+    ) -> Self {
+        Self {
+            client,
+            monitor_name,
+            cwd,
+            profile_directory,
         }
     }
 }
@@ -90,6 +121,7 @@ impl ObservedClient {
 pub enum MatchKind {
     ExactIdentity,
     AppIdentity,
+    ProfileIdentity,
     ClassFallback,
 }
 
@@ -109,12 +141,16 @@ pub fn plan_reconciliation(
     targets: &[SessionClient],
     current: &[ObservedClient],
 ) -> Vec<Option<ReconcilePair>> {
-    let mut candidates = Vec::new();
+    if targets.is_empty() {
+        return vec![];
+    }
+
+    let mut candidates = vec![vec![None; current.len()]; targets.len()];
 
     for (target_index, target) in targets.iter().enumerate() {
         for (current_index, observed) in current.iter().enumerate() {
             if let Some((score, kind)) = match_score(target, observed) {
-                candidates.push(ReconcilePair {
+                candidates[target_index][current_index] = Some(ReconcilePair {
                     target_index,
                     current_index,
                     score,
@@ -124,34 +160,114 @@ pub fn plan_reconciliation(
         }
     }
 
-    // This is a greedy maximum-weight assignment.  It is intentionally small
-    // and predictable for desktop-sized window sets: the best identity match
-    // is committed first, then the remaining windows are assigned by the
-    // same rules without ever reusing an existing address.
-    candidates.sort_by(|a, b| {
-        b.score
-            .cmp(&a.score)
-            .then(a.target_index.cmp(&b.target_index))
-            .then(a.current_index.cmp(&b.current_index))
-    });
+    // Add dummy rows and columns so a target may remain unmatched when no
+    // suitable window exists, and an existing window may remain an extra.  A
+    // valid match always has a positive score; dummy edges have weight zero.
+    let size = targets.len() + current.len();
+    let mut weights = vec![vec![0_i64; size]; size];
+    let impossible = -1_000_000_000_000_i64;
+    for (target_index, row) in candidates.iter().enumerate() {
+        for (current_index, candidate) in row.iter().enumerate() {
+            weights[target_index][current_index] = candidate
+                .map(|pair| i64::from(pair.score))
+                .unwrap_or(impossible);
+        }
+    }
 
-    let mut assigned_targets = HashSet::new();
-    let mut assigned_current = HashSet::new();
+    let assignment = maximum_weight_assignment(&weights);
     let mut plan = vec![None; targets.len()];
 
-    for candidate in candidates {
-        if assigned_targets.contains(&candidate.target_index)
-            || assigned_current.contains(&candidate.current_index)
-        {
-            continue;
+    for target_index in 0..targets.len() {
+        if let Some(Some(current_index)) = assignment.get(target_index) {
+            if *current_index < current.len() {
+                plan[target_index] = candidates[target_index][*current_index];
+            }
         }
-
-        assigned_targets.insert(candidate.target_index);
-        assigned_current.insert(candidate.current_index);
-        plan[candidate.target_index] = Some(candidate);
     }
 
     plan
+}
+
+/// Solve a square maximum-weight assignment problem using the Hungarian
+/// algorithm.  Returning one column per row keeps the caller's unmatched
+/// handling explicit through dummy edges, rather than silently forcing a bad
+/// app/window pairing.
+fn maximum_weight_assignment(weights: &[Vec<i64>]) -> Vec<Option<usize>> {
+    let size = weights.len();
+    if size == 0 {
+        return vec![];
+    }
+    assert!(weights.iter().all(|row| row.len() == size));
+
+    // This is the standard primal-dual Hungarian formulation for minimising
+    // costs.  Negating weights turns it into the maximum-weight variant.
+    let infinity = i64::MAX / 4;
+    let mut u = vec![0_i64; size + 1];
+    let mut v = vec![0_i64; size + 1];
+    let mut p = vec![0_usize; size + 1];
+    let mut way = vec![0_usize; size + 1];
+
+    for row in 1..=size {
+        p[0] = row;
+        let mut column = 0;
+        let mut minv = vec![infinity; size + 1];
+        let mut used = vec![false; size + 1];
+
+        loop {
+            used[column] = true;
+            let current_row = p[column];
+            let mut delta = infinity;
+            let mut next_column = 0;
+
+            for candidate_column in 1..=size {
+                if used[candidate_column] {
+                    continue;
+                }
+                let cost = -weights[current_row - 1][candidate_column - 1]
+                    - u[current_row]
+                    - v[candidate_column];
+                if cost < minv[candidate_column] {
+                    minv[candidate_column] = cost;
+                    way[candidate_column] = column;
+                }
+                if minv[candidate_column] < delta {
+                    delta = minv[candidate_column];
+                    next_column = candidate_column;
+                }
+            }
+
+            for candidate_column in 0..=size {
+                if used[candidate_column] {
+                    u[p[candidate_column]] += delta;
+                    v[candidate_column] -= delta;
+                } else if candidate_column > 0 {
+                    minv[candidate_column] -= delta;
+                }
+            }
+
+            column = next_column;
+            if p[column] == 0 {
+                break;
+            }
+        }
+
+        loop {
+            let previous_column = way[column];
+            p[column] = p[previous_column];
+            column = previous_column;
+            if column == 0 {
+                break;
+            }
+        }
+    }
+
+    let mut assignment = vec![None; size];
+    for column in 1..=size {
+        if p[column] != 0 {
+            assignment[p[column] - 1] = Some(column - 1);
+        }
+    }
+    assignment
 }
 
 fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32, MatchKind)> {
@@ -162,6 +278,21 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
 
     let mut score = 1_000;
     let mut kind = MatchKind::ClassFallback;
+
+    if let Some(target_profile) = &target.profile_directory {
+        if let Some(current_profile) = &observed.profile_directory {
+            if !same_nonempty(target_profile, current_profile) {
+                return None;
+            }
+            score += 1_200;
+            kind = MatchKind::ProfileIdentity;
+        } else {
+            // Profile flags are not always visible from a browser window's
+            // PID.  Keep the candidate usable, but make a known profile beat
+            // an unknown one whenever another piece of identity agrees.
+            score -= 250;
+        }
+    }
 
     if same_nonempty(&target.class, &current.class) {
         score += 150;
@@ -199,11 +330,11 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
         }
     }
 
-    if target.workspace == current.workspace.id {
+    if workspace_matches(target, current) {
         score += 180;
     }
     if let Some(monitor_name) = &observed.monitor_name {
-        if !target.monitor.is_empty() && target.monitor == *monitor_name {
+        if same_nonempty(&target.monitor, monitor_name) {
             score += 140;
         }
     }
@@ -232,6 +363,14 @@ fn classes_match(target: &SessionClient, current: &HyprClient) -> bool {
                 !current_class.is_empty() && target_class.eq_ignore_ascii_case(current_class)
             })
     })
+}
+
+fn is_brave_client(client: &SessionClient) -> bool {
+    is_brave_class(&client.class) || is_brave_class(&client.initial_class)
+}
+
+fn is_brave_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("brave-browser")
 }
 
 fn same_nonempty(left: &str, right: &str) -> bool {
@@ -292,20 +431,18 @@ pub fn restore_session(
     let mut report = RestoreReport::default();
 
     // Fetch current windows once to detect already-running duplicates.
-    let mut existing_counts: HashMap<(String, i32), usize> = HashMap::new();
+    let mut existing_clients = Vec::new();
     if !dry_run {
         if let Ok(current) = hyprctl.get_clients() {
-            for c in &current {
-                *existing_counts
-                    .entry((c.class.clone(), c.workspace.id))
-                    .or_insert(0) += 1;
-            }
+            existing_clients = current;
         }
     }
+    let mut consumed_existing = HashSet::new();
+    let current_monitors = hyprctl.get_monitors().unwrap_or_default();
 
     // Detect if profile-based Brave restore applies.
     let has_brave_profiles =
-        !session.brave_profiles.is_empty() && config.apps.contains_key("brave-browser");
+        !session.brave_profiles.is_empty() && app_config_for(config, "brave-browser", "").is_some();
 
     // Group by workspace (BTreeMap gives us sorted workspace order for free).
     let mut by_workspace: BTreeMap<i32, Vec<&SessionClient>> = BTreeMap::new();
@@ -322,12 +459,28 @@ pub fn restore_session(
 
         for client in clients {
             // Skip brave-browser windows when profiles are available (handled after main loop).
-            if has_brave_profiles && client.class == "brave-browser" {
+            if has_brave_profiles && is_brave_client(client) {
                 continue;
             }
+            if is_ignored_class(&client.class, &config.filters.ignore_classes)
+                || is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
+            {
+                report.skipped += 1;
+                if verbose {
+                    report
+                        .details
+                        .push(format!("SKIP: ignored class '{}'", client.class));
+                }
+                continue;
+            }
+            let restore_client = adapt_client_geometry(
+                client,
+                &session.monitors,
+                find_monitor_by_name(&current_monitors, &client.monitor),
+            );
 
             if dry_run {
-                let cmds = build_dispatch_commands(client);
+                let cmds = build_dispatch_commands(&restore_client);
                 report.details.push(format!(
                     "[dry-run] ws={} {} → {}",
                     ws, client.class, client.launch.command
@@ -339,20 +492,34 @@ pub fn restore_session(
                 continue;
             }
 
-            // Count-based duplicate detection: skip if enough instances already exist.
-            let key = (client.class.clone(), client.workspace);
-            if let Some(count) = existing_counts.get_mut(&key) {
-                if *count > 0 {
-                    let msg = format!("SKIP: {} already on ws={}", client.class, client.workspace);
-                    report.details.push(msg);
-                    report.skipped += 1;
-                    *count -= 1;
-                    continue;
-                }
+            // Legacy restore remains additive, but uses the same robust class
+            // and workspace identity rules as reconciliation so a changed
+            // runtime class cannot cause an avoidable duplicate launch.
+            if let Some(existing_index) = existing_clients.iter().position(|current| {
+                !consumed_existing.contains(&current.address)
+                    && !is_ignored_class(&current.class, &config.filters.ignore_classes)
+                    && !is_ignored_class(&current.initial_class, &config.filters.ignore_classes)
+                    && classes_match(client, current)
+                    && workspace_matches(client, current)
+            }) {
+                let current = &existing_clients[existing_index];
+                let msg = format!("SKIP: {} already on ws={}", current.class, client.workspace);
+                report.details.push(msg);
+                report.skipped += 1;
+                consumed_existing.insert(existing_clients[existing_index].address.clone());
+                continue;
             }
 
             // Validate the effective binary is available before attempting to spawn.
-            let launch_command = build_launch_command(client);
+            let launch_command = build_launch_command(&restore_client);
+            if !launch_command_is_trusted(&restore_client, config) {
+                report.details.push(format!(
+                    "FAIL: launch command '{}' for {} is not authorized by app identity or config",
+                    launch_command[0], client.class
+                ));
+                report.failed += 1;
+                continue;
+            }
             if which::which(&launch_command[0]).is_err() {
                 let msg = format!(
                     "SKIP: binary '{}' not found for {}",
@@ -365,7 +532,7 @@ pub fn restore_session(
                 continue;
             }
 
-            match restore_single_client(client, hyprctl, config, verbose) {
+            match restore_single_client(&restore_client, hyprctl, config, verbose) {
                 Ok(msg) => {
                     if verbose {
                         report.details.push(msg);
@@ -381,111 +548,74 @@ pub fn restore_session(
         }
     }
 
-    // Restore Brave profiles (one window per profile).
+    // Restore Brave profiles (one window per profile) through the same
+    // correlation and placement path as every other client.  Chromium may
+    // reuse a browser process, so selecting the first newly-created class
+    // match is unsafe when two profiles start together.
     if has_brave_profiles {
-        let brave_config = config.apps.get("brave-browser");
-        let binary = brave_config
-            .and_then(|c| c.binary.clone())
-            .unwrap_or_else(|| "brave".to_string());
-        let default_ws = brave_config.and_then(|c| c.default_workspace).unwrap_or(1);
-        let profile_ws = brave_config.and_then(|c| c.profile_workspaces.as_ref());
+        let profile_targets: Vec<ReconcileTarget> = build_reconcile_targets(session, config)
+            .into_iter()
+            .filter(|target| {
+                is_brave_client(&target.client) && target.client.profile_directory.is_some()
+            })
+            .collect();
+        let process_info = RealProcessInfo;
+        let launcher = RealProcessLauncher;
 
-        if !dry_run && which::which(&binary).is_err() {
-            let msg = format!("SKIP: binary '{}' not found for Brave profiles", binary);
-            report.details.push(msg);
-            report.skipped += session.brave_profiles.len();
-        } else {
-            for profile in &session.brave_profiles {
-                let ws = profile_ws
-                    .and_then(|m| m.get(&profile.directory))
-                    .copied()
-                    .unwrap_or(default_ws);
-
-                if dry_run {
-                    report.details.push(format!(
-                        "[dry-run] brave profile \"{}\" ({}) → ws={}",
-                        profile.name, profile.directory, ws
-                    ));
-                    report.details.push(format!(
-                        "  {} --profile-directory={}",
-                        binary, profile.directory
-                    ));
-                    report.details.push(format!(
-                        "  hyprctl dispatch movetoworkspacesilent {},address:0xNEW",
-                        ws
-                    ));
-                    report.restored += 1;
-                    continue;
+        for mut target in profile_targets {
+            target.client = adapt_client_geometry(
+                &target.client,
+                &session.monitors,
+                find_monitor_by_name(&current_monitors, &target.client.monitor),
+            );
+            if dry_run {
+                report.details.push(format!(
+                    "[dry-run] {} → ws={}",
+                    target.label, target.client.workspace
+                ));
+                for command in build_dispatch_commands(&target.client) {
+                    report.details.push(format!("  hyprctl dispatch {command}"));
                 }
+                report.restored += 1;
+                continue;
+            }
 
-                // Snapshot existing addresses BEFORE spawning (avoid race condition).
-                let before: HashSet<String> = hyprctl
-                    .get_clients()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|c| c.address)
-                    .collect();
+            let launch_command = build_launch_command(&target.client);
+            if !launch_command_is_trusted(&target.client, config) {
+                report.details.push(format!(
+                    "FAIL: launch command '{}' for {} is not authorized by app identity or config",
+                    launch_command[0], target.label
+                ));
+                report.failed += 1;
+                continue;
+            }
+            if which::which(&launch_command[0]).is_err() {
+                report.details.push(format!(
+                    "SKIP: binary '{}' not found for {}",
+                    launch_command[0], target.label
+                ));
+                report.skipped += 1;
+                continue;
+            }
 
-                // Launch brave with profile directory.
-                let spawn_result = Command::new(&binary)
-                    .arg(format!("--profile-directory={}", profile.directory))
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .spawn();
-
-                match spawn_result {
-                    Ok(_) => {
-                        let timeout =
-                            Duration::from_millis(config.general.window_detect_timeout_ms);
-                        let poll_interval = Duration::from_millis(100);
-                        let start = Instant::now();
-
-                        let new_addr = loop {
-                            if start.elapsed() > timeout {
-                                report.details.push(format!(
-                                    "FAIL: timeout waiting for brave profile \"{}\"",
-                                    profile.name
-                                ));
-                                report.failed += 1;
-                                break None;
-                            }
-                            thread::sleep(poll_interval);
-
-                            if let Ok(current) = hyprctl.get_clients() {
-                                if let Some(w) = current.into_iter().find(|c| {
-                                    !before.contains(&c.address) && c.class == "brave-browser"
-                                }) {
-                                    break Some(w.address);
-                                }
-                            }
-                        };
-
-                        if let Some(addr) = new_addr {
-                            // Move to target workspace (no pixel positioning for Brave).
-                            let _ = hyprctl.dispatch(&format!(
-                                "movetoworkspacesilent {},address:{}",
-                                ws, addr
-                            ));
-
-                            if verbose {
-                                report.details.push(format!(
-                                    "OK: brave profile \"{}\" ({}) → ws={}",
-                                    profile.name, profile.directory, ws
-                                ));
-                            }
-                            report.restored += 1;
-                        }
-
-                        // Throttle between launches.
-                        thread::sleep(Duration::from_millis(config.general.restore_delay_ms));
+            match restore_single_client_with_launcher_and_process_info(
+                &target.client,
+                hyprctl,
+                &process_info,
+                config,
+                &launcher,
+            ) {
+                Ok(message) => {
+                    if verbose {
+                        report.details.push(message);
                     }
-                    Err(e) => {
-                        report.details.push(format!(
-                            "FAIL: brave profile \"{}\" — spawn error: {}",
-                            profile.name, e
-                        ));
-                        report.failed += 1;
-                    }
+                    report.restored += 1;
+                }
+                Err(error) => {
+                    report
+                        .details
+                        .push(format!("FAIL: {} — {error}", target.label));
+                    report.failed += 1;
                 }
             }
         }
@@ -538,9 +668,18 @@ pub fn reconcile_session_with_launcher(
     launcher: &dyn ProcessLauncher,
 ) -> Result<ReconcileReport, RestoreError> {
     let targets = build_reconcile_targets(session, config);
+    let current_monitors = hyprctl.get_monitors().unwrap_or_default();
     let observed = observe_clients(hyprctl, process_info, config)?;
-    let target_clients: Vec<SessionClient> =
-        targets.iter().map(|target| target.client.clone()).collect();
+    let target_clients: Vec<SessionClient> = targets
+        .iter()
+        .map(|target| {
+            adapt_client_geometry(
+                &target.client,
+                &session.monitors,
+                find_monitor_by_name(&current_monitors, &target.client.monitor),
+            )
+        })
+        .collect();
     let plan = plan_reconciliation(&target_clients, &observed);
 
     let mut report = ReconcileReport::default();
@@ -548,12 +687,50 @@ pub fn reconcile_session_with_launcher(
 
     for (target_index, target) in targets.iter().enumerate() {
         if let Some(pair) = plan[target_index] {
-            let current = &observed[pair.current_index];
+            let current = if dry_run {
+                observed[pair.current_index].clone()
+            } else {
+                match observe_client_by_address(
+                    &observed[pair.current_index].client.address,
+                    hyprctl,
+                    process_info,
+                    config,
+                ) {
+                    Ok(Some(current)) => current,
+                    Ok(None) => {
+                        report.failed += 1;
+                        report.details.push(format!(
+                            "FAIL: {} — window {} disappeared before repair",
+                            target.label, observed[pair.current_index].client.address
+                        ));
+                        continue;
+                    }
+                    Err(error) => {
+                        report.failed += 1;
+                        report
+                            .details
+                            .push(format!("FAIL: {} — {error}", target.label));
+                        continue;
+                    }
+                }
+            };
             used_current.insert(pair.current_index);
             report.matched += 1;
 
-            let commands = build_reconcile_dispatch_commands(
+            let current_target_monitor = if target.client.monitor.is_empty() {
+                None
+            } else {
+                hyprctl.get_monitors().ok().and_then(|monitors| {
+                    find_monitor_by_name(&monitors, &target.client.monitor).cloned()
+                })
+            };
+            let command_target = adapt_client_geometry(
                 &target.client,
+                &session.monitors,
+                current_target_monitor.as_ref(),
+            );
+            let commands = build_reconcile_dispatch_commands(
+                &command_target,
                 &current.client,
                 current.monitor_name.as_deref(),
             );
@@ -587,6 +764,27 @@ pub fn reconcile_session_with_launcher(
 
             let mut applied = true;
             for command in &commands {
+                match window_is_present(&current.client.address, hyprctl) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        report.details.push(format!(
+                            "FAIL: {} at address {} — window disappeared before '{command}'",
+                            target.label, current.client.address
+                        ));
+                        report.failed += 1;
+                        applied = false;
+                        break;
+                    }
+                    Err(error) => {
+                        report.details.push(format!(
+                            "FAIL: {} at address {} — could not verify window before '{command}': {error}",
+                            target.label, current.client.address
+                        ));
+                        report.failed += 1;
+                        applied = false;
+                        break;
+                    }
+                }
                 if let Err(error) = hyprctl.dispatch(command) {
                     report.details.push(format!(
                         "FAIL: {} at address {} — {error}",
@@ -610,15 +808,32 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
-        let launch_command = build_launch_command(&target.client);
+        let target_client = &target_clients[target_index];
+        let launch_command = build_launch_command(target_client);
+        if !launch_command_is_trusted(target_client, config) {
+            report.failed += 1;
+            report.details.push(format!(
+                "FAIL: launch command '{}' for {} is not authorized by app identity or config",
+                launch_command[0], target.label
+            ));
+            continue;
+        }
         if dry_run {
+            if which::which(&launch_command[0]).is_err() {
+                report.failed += 1;
+                report.details.push(format!(
+                    "[dry-run] FAIL: binary '{}' not found for {}",
+                    launch_command[0], target.label
+                ));
+                continue;
+            }
             report.launched += 1;
             report.details.push(format!(
                 "[dry-run] missing {} → {}",
                 target.label,
                 launch_command.join(" ")
             ));
-            for command in build_dispatch_commands(&target.client) {
+            for command in build_dispatch_commands(target_client) {
                 report.details.push(format!("  hyprctl dispatch {command}"));
             }
             continue;
@@ -633,7 +848,13 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
-        match restore_single_client_with_launcher(&target.client, hyprctl, config, launcher) {
+        match restore_single_client_with_launcher_and_process_info(
+            target_client,
+            hyprctl,
+            process_info,
+            config,
+            launcher,
+        ) {
             Ok(_) => {
                 report.launched += 1;
                 if verbose {
@@ -671,12 +892,16 @@ pub fn reconcile_session_with_launcher(
 
 fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileTarget> {
     let has_brave_profiles =
-        !session.brave_profiles.is_empty() && config.apps.contains_key("brave-browser");
+        !session.brave_profiles.is_empty() && app_config_for(config, "brave-browser", "").is_some();
 
     let mut targets: Vec<ReconcileTarget> = session
         .clients
         .iter()
-        .filter(|client| !(has_brave_profiles && client.class == "brave-browser"))
+        .filter(|client| {
+            !is_ignored_class(&client.class, &config.filters.ignore_classes)
+                && !is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
+        })
+        .filter(|client| !(has_brave_profiles && is_brave_client(client)))
         .cloned()
         .map(|client| ReconcileTarget {
             label: format!("{} '{}'", client.class, client.title),
@@ -685,7 +910,7 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
         .collect();
 
     if has_brave_profiles {
-        let brave_config = config.apps.get("brave-browser");
+        let brave_config = app_config_for(config, "brave-browser", "");
         let binary = brave_config
             .and_then(|app| app.binary.clone())
             .unwrap_or_else(|| "brave".to_string());
@@ -697,7 +922,11 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
         let mut brave_clients: Vec<SessionClient> = session
             .clients
             .iter()
-            .filter(|client| client.class == "brave-browser")
+            .filter(|client| {
+                is_brave_client(client)
+                    && !is_ignored_class(&client.class, &config.filters.ignore_classes)
+                    && !is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
+            })
             .cloned()
             .collect();
         brave_clients.sort_by(|left, right| {
@@ -707,10 +936,31 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                 .then(left.at[0].cmp(&right.at[0]))
         });
 
-        for (index, profile) in session.brave_profiles.iter().enumerate() {
-            let mut client = brave_clients
-                .get(index)
-                .cloned()
+        let mut used_brave_clients = HashSet::new();
+        for profile in &session.brave_profiles {
+            let matching_index = brave_clients
+                .iter()
+                .enumerate()
+                .find(|(index, client)| {
+                    !used_brave_clients.contains(index)
+                        && client
+                            .profile_directory
+                            .as_deref()
+                            .map(|directory| directory.eq_ignore_ascii_case(&profile.directory))
+                            .unwrap_or(false)
+                })
+                .map(|(index, _)| index);
+            let fallback_index = brave_clients
+                .iter()
+                .enumerate()
+                .find(|(index, _)| !used_brave_clients.contains(index))
+                .map(|(index, _)| index);
+            let mut client = matching_index
+                .or(fallback_index)
+                .and_then(|index| {
+                    used_brave_clients.insert(index);
+                    brave_clients.get(index).cloned()
+                })
                 .or_else(|| brave_clients.first().cloned())
                 .unwrap_or_else(|| SessionClient {
                     class: "brave-browser".to_string(),
@@ -718,11 +968,14 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                     initial_class: "brave-browser".to_string(),
                     initial_title: "Brave".to_string(),
                     workspace: default_workspace,
+                    workspace_name: default_workspace.to_string(),
                     monitor: String::new(),
                     at: [0, 0],
                     size: [1280, 800],
                     floating: false,
                     fullscreen: 0,
+                    pinned: false,
+                    profile_directory: None,
                     focus_history_id: 0,
                     launch: crate::session::LaunchInfo {
                         command: binary.clone(),
@@ -735,6 +988,8 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                 .and_then(|workspaces| workspaces.get(&profile.directory))
                 .copied()
                 .unwrap_or(default_workspace);
+            client.workspace_name = client.workspace.to_string();
+            client.profile_directory = Some(profile.directory.clone());
             client.launch.command = binary.clone();
             client.launch.args = vec![format!("--profile-directory={}", profile.directory)];
             client.launch.hint = None;
@@ -769,50 +1024,188 @@ fn observe_clients(
         .map(|monitor| (monitor.id, monitor.name))
         .collect();
 
-    Ok(hyprctl
+    let mut clients: Vec<ObservedClient> = hyprctl
         .get_clients()?
         .into_iter()
         .filter(|client| {
-            !config.filters.ignore_classes.contains(&client.class)
-                && !config
-                    .filters
-                    .ignore_classes
-                    .contains(&client.initial_class)
+            !is_ignored_class(&client.class, &config.filters.ignore_classes)
+                && !is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
         })
         .map(|client| {
             let monitor_name = monitor_names.get(&client.monitor).cloned();
             let cwd = observe_cwd(&client, process_info);
-            ObservedClient::from_hypr_client(client, monitor_name, cwd)
+            let profile_directory = find_profile_directory(process_info, client.pid);
+            ObservedClient::with_profile_directory(client, monitor_name, cwd, profile_directory)
         })
-        .collect())
+        .collect();
+    clients.sort_by(|left, right| left.client.address.cmp(&right.client.address));
+    Ok(clients)
+}
+
+fn observe_client_by_address(
+    address: &str,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
+    config: &Config,
+) -> Result<Option<ObservedClient>, RestoreError> {
+    Ok(observe_clients(hyprctl, process_info, config)?
+        .into_iter()
+        .find(|observed| observed.client.address == address))
+}
+
+fn window_is_present(address: &str, hyprctl: &dyn HyprctlClient) -> Result<bool, RestoreError> {
+    Ok(hyprctl
+        .get_clients()?
+        .into_iter()
+        .any(|client| client.address == address))
 }
 
 fn observe_cwd(client: &HyprClient, process_info: &dyn ProcessInfoProvider) -> Option<PathBuf> {
-    const SKIP_COMMANDS: &[&str] = &["kitten", "/usr/bin/kitten"];
-
-    process_info
-        .get_children(client.pid)
-        .ok()
-        .and_then(|children| {
-            children
-                .into_iter()
-                .filter(|child| !child.cwd.as_os_str().is_empty())
-                .find(|child| {
-                    !SKIP_COMMANDS
-                        .iter()
-                        .any(|skip| child.cmdline.starts_with(skip))
-                })
-                .map(|child| child.cwd)
-        })
+    select_terminal_process(process_info, client.pid)
+        .map(|child| child.cwd)
         .or_else(|| process_info.get_cwd(client.pid).ok())
+}
+
+fn find_monitor_by_name<'a>(monitors: &'a [HyprMonitor], name: &str) -> Option<&'a HyprMonitor> {
+    if name.is_empty() {
+        return None;
+    }
+    monitors
+        .iter()
+        .find(|monitor| monitor.name.eq_ignore_ascii_case(name))
+}
+
+/// Adapt captured absolute coordinates to a monitor whose origin or
+/// resolution changed since the snapshot.  Older sessions have `None` for
+/// monitor origins and deliberately keep their original geometry.
+fn adapt_client_geometry(
+    target: &SessionClient,
+    saved_monitors: &[Monitor],
+    current_monitor: Option<&HyprMonitor>,
+) -> SessionClient {
+    let Some(current_monitor) = current_monitor else {
+        return target.clone();
+    };
+    let Some(saved_monitor) = saved_monitors
+        .iter()
+        .find(|monitor| monitor.name.eq_ignore_ascii_case(&target.monitor))
+    else {
+        return target.clone();
+    };
+    let (Some(saved_x), Some(saved_y)) = (saved_monitor.x, saved_monitor.y) else {
+        return target.clone();
+    };
+    let (Some(current_x), Some(current_y)) = (current_monitor.x, current_monitor.y) else {
+        return target.clone();
+    };
+    if saved_monitor.width == 0
+        || saved_monitor.height == 0
+        || current_monitor.width == 0
+        || current_monitor.height == 0
+    {
+        return target.clone();
+    }
+
+    let scale_x = current_monitor.width as f64 / saved_monitor.width as f64;
+    let scale_y = current_monitor.height as f64 / saved_monitor.height as f64;
+    let width = scaled_extent(target.size[0], scale_x, current_monitor.width);
+    let height = scaled_extent(target.size[1], scale_y, current_monitor.height);
+    let relative_x = i64::from(target.at[0]) - i64::from(saved_x);
+    let relative_y = i64::from(target.at[1]) - i64::from(saved_y);
+    let proposed_x = i64::from(current_x) + scale_coordinate(relative_x, scale_x);
+    let proposed_y = i64::from(current_y) + scale_coordinate(relative_y, scale_y);
+    let at = [
+        clamp_coordinate(proposed_x, current_x, current_monitor.width, width),
+        clamp_coordinate(proposed_y, current_y, current_monitor.height, height),
+    ];
+
+    let mut adapted = target.clone();
+    adapted.at = at;
+    adapted.size = [width, height];
+    adapted
+}
+
+fn scale_coordinate(value: i64, scale: f64) -> i64 {
+    (value as f64 * scale).round() as i64
+}
+
+fn scaled_extent(value: i32, scale: f64, monitor_extent: u32) -> i32 {
+    let scaled = (i64::from(value.max(1)) as f64 * scale).round() as i64;
+    scaled.clamp(1, i64::from(monitor_extent.min(i32::MAX as u32))) as i32
+}
+
+fn clamp_coordinate(coordinate: i64, origin: i32, monitor_extent: u32, window_extent: i32) -> i32 {
+    let origin = i64::from(origin);
+    let monitor_end = origin + i64::from(monitor_extent.min(i32::MAX as u32));
+    let minimum = origin;
+    let maximum = (monitor_end - i64::from(window_extent)).max(minimum);
+    coordinate
+        .clamp(minimum, maximum)
+        .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn match_kind_label(kind: MatchKind) -> &'static str {
     match kind {
         MatchKind::ExactIdentity => "exact identity",
         MatchKind::AppIdentity => "app identity",
+        MatchKind::ProfileIdentity => "profile identity",
         MatchKind::ClassFallback => "class fallback",
     }
+}
+
+fn workspace_matches(target: &SessionClient, current: &HyprClient) -> bool {
+    let saved_name = target.workspace_name.trim();
+    if saved_name.is_empty() || saved_name.parse::<i32>().is_ok() {
+        return target.workspace == current.workspace.id;
+    }
+    workspace_names_match(saved_name, current.workspace.name.trim())
+}
+
+fn workspace_names_match(saved_name: &str, current_name: &str) -> bool {
+    if has_workspace_prefix(saved_name, "special:")
+        || has_workspace_prefix(current_name, "special:")
+    {
+        return saved_name.eq_ignore_ascii_case(current_name);
+    }
+    strip_workspace_prefix(saved_name, "name:")
+        .eq_ignore_ascii_case(strip_workspace_prefix(current_name, "name:"))
+}
+
+fn workspace_selector(target: &SessionClient) -> String {
+    let saved_name = target.workspace_name.trim();
+    if saved_name.is_empty() || saved_name.parse::<i32>().is_ok() {
+        target.workspace.to_string()
+    } else if has_workspace_prefix(saved_name, "special:")
+        || has_workspace_prefix(saved_name, "name:")
+    {
+        saved_name.to_string()
+    } else {
+        format!("name:{saved_name}")
+    }
+}
+
+fn has_workspace_prefix(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .map(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .unwrap_or(false)
+}
+
+fn strip_workspace_prefix<'a>(value: &'a str, prefix: &str) -> &'a str {
+    if has_workspace_prefix(value, prefix) {
+        &value[prefix.len()..]
+    } else {
+        value
+    }
+}
+
+fn quote_dispatch_token(value: &str) -> String {
+    if value.chars().all(|character| {
+        !character.is_whitespace() && character != '\'' && character != '"' && character != '\\'
+    }) {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "'\\''"))
 }
 
 /// Return only the compositor operations needed to make an existing window
@@ -823,23 +1216,50 @@ pub fn build_reconcile_dispatch_commands(
     current: &HyprClient,
     current_monitor: Option<&str>,
 ) -> Vec<String> {
+    build_reconcile_dispatch_commands_with_geometry(
+        target,
+        current,
+        current_monitor,
+        target.at,
+        target.size,
+    )
+}
+
+fn build_reconcile_dispatch_commands_with_geometry(
+    target: &SessionClient,
+    current: &HyprClient,
+    current_monitor: Option<&str>,
+    desired_at: [i32; 2],
+    desired_size: [i32; 2],
+) -> Vec<String> {
     let monitor_mismatch = !target.monitor.is_empty()
         && current_monitor
-            .map(|monitor| monitor != target.monitor)
+            .map(|monitor| !monitor.eq_ignore_ascii_case(&target.monitor))
             .unwrap_or(false);
-    let workspace_mismatch = current.workspace.id != target.workspace || monitor_mismatch;
+    let workspace_mismatch = !workspace_matches(target, current);
     let leaving_fullscreen = current.fullscreen > 0 && target.fullscreen == 0;
     let entering_or_changing_fullscreen =
         target.fullscreen > 0 && current.fullscreen != target.fullscreen;
 
     let mut commands = Vec::new();
+    if current.pinned && !target.pinned {
+        commands.push(format!("pin address:{}", current.address));
+    }
     if leaving_fullscreen {
         commands.push(format!("fullscreenstate 0 0,address:{}", current.address));
+    }
+    if monitor_mismatch {
+        commands.push(format!(
+            "movetomonitor {},address:{}",
+            quote_dispatch_token(&target.monitor),
+            current.address
+        ));
     }
     if workspace_mismatch {
         commands.push(format!(
             "movetoworkspacesilent {},address:{}",
-            target.workspace, current.address
+            quote_dispatch_token(&workspace_selector(target)),
+            current.address
         ));
     }
     if current.floating != target.floating {
@@ -847,16 +1267,16 @@ pub fn build_reconcile_dispatch_commands(
     }
 
     if target.fullscreen == 0 {
-        if current.size != target.size {
+        if current.size != desired_size {
             commands.push(format!(
                 "resizewindowpixel exact {} {},address:{}",
-                target.size[0], target.size[1], current.address
+                desired_size[0], desired_size[1], current.address
             ));
         }
-        if current.at != target.at {
+        if current.at != desired_at {
             commands.push(format!(
                 "movewindowpixel exact {} {},address:{}",
-                target.at[0], target.at[1], current.address
+                desired_at[0], desired_at[1], current.address
             ));
         }
     }
@@ -866,6 +1286,10 @@ pub fn build_reconcile_dispatch_commands(
             "fullscreenstate {} {},address:{}",
             target.fullscreen, target.fullscreen, current.address
         ));
+    }
+
+    if !current.pinned && target.pinned {
+        commands.push(format!("pin address:{}", current.address));
     }
 
     commands
@@ -880,12 +1304,37 @@ fn restore_single_client(
     _verbose: bool,
 ) -> Result<String, RestoreError> {
     let launcher = RealProcessLauncher;
-    restore_single_client_with_launcher(client, hyprctl, config, &launcher)
+    let process_info = RealProcessInfo;
+    restore_single_client_with_launcher_and_process_info(
+        client,
+        hyprctl,
+        &process_info,
+        config,
+        &launcher,
+    )
 }
 
+#[cfg(test)]
 fn restore_single_client_with_launcher(
     client: &SessionClient,
     hyprctl: &dyn HyprctlClient,
+    config: &Config,
+    launcher: &dyn ProcessLauncher,
+) -> Result<String, RestoreError> {
+    let process_info = RealProcessInfo;
+    restore_single_client_with_launcher_and_process_info(
+        client,
+        hyprctl,
+        &process_info,
+        config,
+        launcher,
+    )
+}
+
+fn restore_single_client_with_launcher_and_process_info(
+    client: &SessionClient,
+    hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
     config: &Config,
     launcher: &dyn ProcessLauncher,
 ) -> Result<String, RestoreError> {
@@ -898,7 +1347,7 @@ fn restore_single_client_with_launcher(
 
     // 2. Build and spawn the launch command.
     let launch_cmd = build_launch_command(client);
-    launcher
+    let launched = launcher
         .spawn(&launch_cmd[0], &launch_cmd[1..])
         .map_err(|e| {
             HyprctlError::CommandFailed(format!("spawn '{}' failed: {e}", launch_cmd[0]))
@@ -907,9 +1356,11 @@ fn restore_single_client_with_launcher(
     // 3. Poll for the new window (address not in snapshot + class match).
     let timeout = Duration::from_millis(config.general.window_detect_timeout_ms);
     let poll_interval = Duration::from_millis(100);
+    let candidate_settle = Duration::from_millis(250).min(timeout);
     let start = Instant::now();
+    let mut first_candidate_at = None;
 
-    let new_addr = loop {
+    let new_window = loop {
         if start.elapsed() > timeout {
             return Err(RestoreError::Hyprctl(HyprctlError::CommandFailed(format!(
                 "timeout waiting for '{}' window to appear",
@@ -919,39 +1370,51 @@ fn restore_single_client_with_launcher(
         thread::sleep(poll_interval);
 
         let current = hyprctl.get_clients()?;
-        if let Some(w) = current
+        let candidates: Vec<HyprClient> = current
             .into_iter()
-            .find(|c| !before.contains(&c.address) && classes_match(client, c))
-        {
-            break w.address;
+            .filter(|window| {
+                !before.contains(&window.address)
+                    && classes_match(client, window)
+                    && candidate_matches_profile(client, window, process_info)
+            })
+            .collect();
+        if !candidates.is_empty() {
+            let candidate_seen_at = first_candidate_at.get_or_insert_with(Instant::now);
+            let process_related = launched.pid.is_some()
+                && candidates.iter().any(|candidate| {
+                    process_info.is_process_related(launched.pid.unwrap(), candidate.pid)
+                });
+            if candidates.len() == 1
+                && !process_related
+                && candidate_seen_at.elapsed() < candidate_settle
+            {
+                continue;
+            }
+            break choose_launched_window(client, candidates, launched, process_info)?;
         }
     };
 
-    // 4. Move to target workspace (silently, without switching).
-    hyprctl.dispatch(&format!(
-        "movetoworkspacesilent {},address:{}",
-        client.workspace, new_addr
-    ))?;
-
-    // 5. Resize then position (order matters: resize first, then move).
-    hyprctl.dispatch(&format!(
-        "resizewindowpixel exact {} {},address:{}",
-        client.size[0], client.size[1], new_addr
-    ))?;
-    hyprctl.dispatch(&format!(
-        "movewindowpixel exact {} {},address:{}",
-        client.at[0], client.at[1], new_addr
-    ))?;
-
-    // 6. Apply floating / fullscreen state.
-    if client.floating {
-        hyprctl.dispatch(&format!("togglefloating address:{}", new_addr))?;
+    // 4. Use the same minimal repair logic as reconciliation.  The launch
+    // PID/window correlation above prevents this address from belonging to a
+    // different same-class window that appeared during startup.
+    let mut commands = build_reconcile_dispatch_commands(client, &new_window, None);
+    if !client.monitor.is_empty() {
+        commands.insert(
+            0,
+            format!(
+                "movetomonitor {},address:{}",
+                quote_dispatch_token(&client.monitor),
+                new_window.address
+            ),
+        );
     }
-    if client.fullscreen > 0 {
-        hyprctl.dispatch(&format!(
-            "fullscreenstate {} {},address:{}",
-            client.fullscreen, client.fullscreen, new_addr
-        ))?;
+    for command in commands {
+        if !window_is_present(&new_window.address, hyprctl)? {
+            return Err(RestoreError::WindowDisappeared {
+                address: new_window.address.clone(),
+            });
+        }
+        hyprctl.dispatch(&command)?;
     }
 
     // 7. Throttle subsequent launches to give the compositor time to settle.
@@ -961,6 +1424,91 @@ fn restore_single_client_with_launcher(
         "OK: {} → ws={} at {:?}",
         client.class, client.workspace, client.at
     ))
+}
+
+fn candidate_matches_profile(
+    target: &SessionClient,
+    candidate: &HyprClient,
+    process_info: &dyn ProcessInfoProvider,
+) -> bool {
+    let Some(target_profile) = &target.profile_directory else {
+        return true;
+    };
+    find_profile_directory(process_info, candidate.pid)
+        .map(|candidate_profile| candidate_profile.eq_ignore_ascii_case(target_profile))
+        .unwrap_or(true)
+}
+
+fn choose_launched_window(
+    target: &SessionClient,
+    candidates: Vec<HyprClient>,
+    launched: LaunchedProcess,
+    process_info: &dyn ProcessInfoProvider,
+) -> Result<HyprClient, RestoreError> {
+    let candidates: Vec<HyprClient> = candidates
+        .into_iter()
+        .filter(|candidate| candidate_matches_profile(target, candidate, process_info))
+        .collect();
+    let related: Vec<HyprClient> = launched
+        .pid
+        .map(|pid| {
+            candidates
+                .iter()
+                .filter(|candidate| process_info.is_process_related(pid, candidate.pid))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    let candidates = if related.is_empty() {
+        candidates
+    } else {
+        related
+    };
+
+    if candidates.len() == 1 {
+        return Ok(candidates
+            .into_iter()
+            .next()
+            .expect("candidate list was checked as non-empty"));
+    }
+
+    let mut scored: Vec<(i32, String, HyprClient)> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let profile_directory = find_profile_directory(process_info, candidate.pid);
+            let observed = ObservedClient::with_profile_directory(
+                candidate.clone(),
+                None,
+                None,
+                profile_directory,
+            );
+            match_score(target, &observed)
+                .map(|(score, _)| (score, candidate.address.clone(), candidate))
+        })
+        .collect();
+    scored.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
+
+    let Some((best_score, _, best)) = scored.first() else {
+        return Err(RestoreError::AmbiguousWindow {
+            class: target.class.clone(),
+            addresses: "no identifiable candidate".to_string(),
+        });
+    };
+    if scored
+        .get(1)
+        .map(|second| second.0 == *best_score)
+        .unwrap_or(false)
+    {
+        return Err(RestoreError::AmbiguousWindow {
+            class: target.class.clone(),
+            addresses: scored
+                .iter()
+                .map(|(_, address, _)| address.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
+    Ok(best.clone())
 }
 
 // ── Command builders (pure functions, unit-testable) ─────────────────────────
@@ -974,7 +1522,7 @@ pub fn build_launch_command(client: &SessionClient) -> Vec<String> {
     let mut cmd = vec![effective_binary(client)];
     cmd.extend(client.launch.args.clone());
 
-    if client.class == "kitty" {
+    if client.class.eq_ignore_ascii_case("kitty") {
         if let Some(hint) = &client.launch.hint {
             // Single-quote-escape the hint so it survives the shell invocation.
             let escaped = hint.replace('\'', "'\\''");
@@ -991,13 +1539,39 @@ pub fn build_launch_command(client: &SessionClient) -> Vec<String> {
 fn effective_binary(client: &SessionClient) -> String {
     if is_ghostty_class(client)
         && (client.launch.command.is_empty()
-            || client.launch.command == client.class
-            || client.launch.command == client.initial_class)
+            || client.launch.command.eq_ignore_ascii_case(&client.class)
+            || client
+                .launch
+                .command
+                .eq_ignore_ascii_case(&client.initial_class))
     {
         "ghostty".to_string()
     } else {
         client.launch.command.clone()
     }
+}
+
+/// Saved sessions are user-owned state, but automatic restore must not turn a
+/// hand-edited launch command into an arbitrary executable hook.  Commands
+/// captured from the app identity remain valid; apps whose executable differs
+/// from their Hyprland class must explicitly opt in through `apps.<class>.binary`.
+fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
+    let command = effective_binary(client);
+    if app_config_for(config, &client.class, &client.initial_class)
+        .and_then(|app| app.binary.as_deref())
+        .map(|configured| configured == command)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    if is_ghostty_class(client) && command.eq_ignore_ascii_case("ghostty") {
+        return true;
+    }
+
+    [client.class.as_str(), client.initial_class.as_str()]
+        .iter()
+        .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command))
 }
 
 fn is_ghostty_class(client: &SessionClient) -> bool {
@@ -1015,9 +1589,20 @@ pub fn build_dispatch_commands(client: &SessionClient) -> Vec<String> {
     let addr = "address:0xNEW";
     let launch = build_launch_command(client);
 
-    let mut cmds = vec![
-        format!("exec {}", launch.join(" ")),
-        format!("movetoworkspacesilent {},{}", client.workspace, addr),
+    let mut cmds = vec![format!("exec {}", launch.join(" "))];
+    if !client.monitor.is_empty() {
+        cmds.push(format!(
+            "movetomonitor {},{}",
+            quote_dispatch_token(&client.monitor),
+            addr
+        ));
+    }
+    cmds.extend([
+        format!(
+            "movetoworkspacesilent {},{}",
+            quote_dispatch_token(&workspace_selector(client)),
+            addr
+        ),
         format!(
             "resizewindowpixel exact {} {},{}",
             client.size[0], client.size[1], addr
@@ -1026,7 +1611,7 @@ pub fn build_dispatch_commands(client: &SessionClient) -> Vec<String> {
             "movewindowpixel exact {} {},{}",
             client.at[0], client.at[1], addr
         ),
-    ];
+    ]);
 
     if client.floating {
         cmds.push(format!("togglefloating {addr}"));
@@ -1036,6 +1621,9 @@ pub fn build_dispatch_commands(client: &SessionClient) -> Vec<String> {
             "fullscreenstate {} {},{}",
             client.fullscreen, client.fullscreen, addr
         ));
+    }
+    if client.pinned {
+        cmds.push(format!("pin {addr}"));
     }
 
     cmds
@@ -1052,6 +1640,7 @@ mod tests {
     use crate::session::{BraveProfile, LaunchInfo, Session, SessionClient};
     use chrono::Utc;
     use std::cell::RefCell;
+    use std::collections::HashMap;
     use std::path::PathBuf;
 
     // ── Helpers ──────────────────────────────────────────────────────────────
@@ -1074,11 +1663,14 @@ mod tests {
             initial_class: class.to_string(),
             initial_title: class.to_string(),
             workspace,
+            workspace_name: workspace.to_string(),
             monitor: "DP-1".to_string(),
             at,
             size,
             floating,
             fullscreen,
+            pinned: false,
+            profile_directory: None,
             focus_history_id: 0,
             launch: LaunchInfo {
                 command: command.to_string(),
@@ -1097,6 +1689,89 @@ mod tests {
             clients,
             brave_profiles: vec![],
         }
+    }
+
+    #[test]
+    fn test_maximum_weight_assignment_is_global_not_greedy() {
+        // A greedy pass takes 100 for the first row and leaves only 0 for the
+        // second.  The global optimum is 99 + 98.
+        let assignment = maximum_weight_assignment(&[vec![100, 99], vec![98, 0]]);
+
+        assert_eq!(assignment, vec![Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn test_geometry_adapts_to_changed_monitor_origin_and_resolution() {
+        let target = make_client(
+            "kitty",
+            1,
+            [100, 50],
+            [960, 540],
+            true,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        let saved_monitor = Monitor {
+            name: "DP-1".to_string(),
+            width: 1920,
+            height: 1080,
+            transform: 0,
+            x: Some(0),
+            y: Some(0),
+        };
+        let current_monitor = HyprMonitor {
+            id: 0,
+            name: "DP-1".to_string(),
+            width: 2560,
+            height: 1440,
+            transform: 0,
+            x: Some(1920),
+            y: Some(0),
+        };
+
+        let adapted = adapt_client_geometry(&target, &[saved_monitor], Some(&current_monitor));
+
+        assert_eq!(adapted.at, [2053, 67]);
+        assert_eq!(adapted.size, [1280, 720]);
+    }
+
+    #[test]
+    fn test_geometry_keeps_legacy_session_coordinates_without_monitor_origin() {
+        let target = make_client(
+            "kitty",
+            1,
+            [100, 50],
+            [960, 540],
+            true,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        let saved_monitor = Monitor {
+            name: "DP-1".to_string(),
+            width: 1920,
+            height: 1080,
+            transform: 0,
+            x: None,
+            y: None,
+        };
+        let current_monitor = HyprMonitor {
+            id: 0,
+            name: "DP-1".to_string(),
+            width: 2560,
+            height: 1440,
+            transform: 0,
+            x: Some(1920),
+            y: Some(0),
+        };
+
+        let adapted = adapt_client_geometry(&target, &[saved_monitor], Some(&current_monitor));
+
+        assert_eq!(adapted.at, target.at);
+        assert_eq!(adapted.size, target.size);
     }
 
     fn make_reconcile_window(
@@ -1123,6 +1798,7 @@ mod tests {
             size,
             floating: false,
             fullscreen: 0,
+            pinned: false,
             focus_history_id: 0,
             pid: 1000,
         }
@@ -1159,17 +1835,32 @@ mod tests {
         }
     }
 
+    struct RelatedProcessInfo {
+        children: HashMap<u32, Vec<ChildProcess>>,
+    }
+
+    impl ProcessInfoProvider for RelatedProcessInfo {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Ok(self.children.get(&pid).cloned().unwrap_or_default())
+        }
+    }
+
     #[derive(Default)]
     struct RecordingLauncher {
         launches: RefCell<Vec<(String, Vec<String>)>>,
+        pid: Option<u32>,
     }
 
     impl ProcessLauncher for RecordingLauncher {
-        fn spawn(&self, command: &str, args: &[String]) -> Result<(), std::io::Error> {
+        fn spawn(&self, command: &str, args: &[String]) -> Result<LaunchedProcess, std::io::Error> {
             self.launches
                 .borrow_mut()
                 .push((command.to_string(), args.to_vec()));
-            Ok(())
+            Ok(LaunchedProcess { pid: self.pid })
         }
     }
 
@@ -1270,6 +1961,77 @@ mod tests {
             mock.dispatches().is_empty(),
             "dry-run must not send real hyprctl dispatches"
         );
+    }
+
+    #[test]
+    fn test_reconcile_dry_run_reports_missing_launch_binary_as_failure() {
+        let client = make_client(
+            "missing-app",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "missing_binary_for_preflight_xyz",
+            vec![],
+            None,
+        );
+        let mock = MockHyprctl::new(vec![vec![]]);
+
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![client]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            true,
+            true,
+            &RecordingLauncher::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.launched, 0);
+        assert_eq!(report.failed, 1);
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("missing_binary_for_preflight_xyz")));
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_rejects_unconfigured_launch_command() {
+        let client = make_client(
+            "kitty",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        let mock = MockHyprctl::new(vec![vec![]]);
+        let launcher = RecordingLauncher::default();
+
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![client]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.launched, 0);
+        assert!(report
+            .details
+            .iter()
+            .any(|detail| detail.contains("not authorized")));
+        assert!(launcher.launches.borrow().is_empty());
     }
 
     // ── Test: build_launch_command for kitty with hint ───────────────────────
@@ -1439,6 +2201,91 @@ mod tests {
             .any(|dispatch| dispatch == "fullscreen 1"));
     }
 
+    #[test]
+    fn test_launch_correlation_prefers_window_from_spawned_process_tree() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.title = "target".to_string();
+        let related =
+            make_reconcile_window("0xrelated", "kitty", "other", 1, 0, [0, 0], [400, 300]);
+        let mut related = related;
+        related.pid = 6000;
+        let unrelated =
+            make_reconcile_window("0xunrelated", "kitty", "target", 1, 0, [10, 20], [800, 600]);
+        let mock = MockHyprctl::new(vec![vec![], vec![related, unrelated]]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let process_info = RelatedProcessInfo {
+            children: HashMap::from([(
+                5000,
+                vec![ChildProcess {
+                    pid: 6000,
+                    cwd: PathBuf::from("/tmp"),
+                    cmdline: "kitty".to_string(),
+                }],
+            )]),
+        };
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        restore_single_client_with_launcher_and_process_info(
+            &target,
+            &mock,
+            &process_info,
+            &config,
+            &launcher,
+        )
+        .unwrap();
+
+        assert!(mock
+            .dispatches()
+            .iter()
+            .all(|dispatch| !dispatch.contains("0xunrelated")));
+        assert!(mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch.contains("0xrelated")));
+    }
+
+    #[test]
+    fn test_launch_correlation_fails_instead_of_picking_ambiguous_window() {
+        let target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        let first =
+            make_reconcile_window("0xambiguous-a", "kitty", "kitty", 1, 0, [0, 0], [400, 300]);
+        let second =
+            make_reconcile_window("0xambiguous-b", "kitty", "kitty", 1, 0, [0, 0], [400, 300]);
+        let mock = MockHyprctl::new(vec![vec![], vec![first, second]]);
+        let launcher = RecordingLauncher::default();
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        let error = restore_single_client_with_launcher(&target, &mock, &config, &launcher)
+            .expect_err("ambiguous candidates must not be targeted arbitrarily");
+        assert!(error.to_string().contains("unambiguously identify"));
+        assert!(mock.dispatches().is_empty());
+    }
+
     // ── Test: skips client when binary is missing ────────────────────────────
 
     #[test]
@@ -1455,7 +2302,18 @@ mod tests {
             None,
         );
         let session = make_session(vec![client]);
-        let config = Config::default();
+        let mut config = Config::default();
+        config.apps.insert(
+            "nonexistent_app_xyz".to_string(),
+            AppConfig {
+                binary: Some("nonexistent_app_xyz_abc_123".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
+            },
+        );
         let mock = MockHyprctl::new(vec![]);
 
         let report = restore_session(&session, &mock, &config, false, true).unwrap();
@@ -1473,9 +2331,9 @@ mod tests {
     fn test_restore_skips_duplicate_class_workspace() {
         let existing_window = HyprClient {
             address: "0xexisting".to_string(),
-            class: "kitty".to_string(),
+            class: "KITTY".to_string(),
             title: "kitty".to_string(),
-            initial_class: "kitty".to_string(),
+            initial_class: "TerminalWrapper".to_string(),
             initial_title: "kitty".to_string(),
             workspace: crate::hyprctl::HyprWorkspace {
                 id: 1,
@@ -1486,6 +2344,7 @@ mod tests {
             size: [800, 600],
             floating: false,
             fullscreen: 0,
+            pinned: false,
             focus_history_id: 0,
             pid: 9999,
         };
@@ -1517,7 +2376,7 @@ mod tests {
             report
                 .details
                 .iter()
-                .any(|d| d.contains("SKIP: kitty already on ws=1")),
+                .any(|d| d.contains("SKIP: KITTY already on ws=1")),
             "details should mention the skipped duplicate; got: {:?}",
             report.details
         );
@@ -1544,6 +2403,7 @@ mod tests {
             size: [800, 600],
             floating: false,
             fullscreen: 0,
+            pinned: false,
             focus_history_id: 0,
             pid: 9999,
         };
@@ -1595,6 +2455,7 @@ mod tests {
                 size: [800, 600],
                 floating: false,
                 fullscreen: 0,
+                pinned: false,
                 focus_history_id: 0,
                 pid: 1001,
             },
@@ -1613,6 +2474,7 @@ mod tests {
                 size: [800, 600],
                 floating: false,
                 fullscreen: 0,
+                pinned: false,
                 focus_history_id: 0,
                 pid: 1002,
             },
@@ -1638,7 +2500,18 @@ mod tests {
             .collect();
 
         let session = make_session(clients);
-        let config = Config::default();
+        let mut config = Config::default();
+        config.apps.insert(
+            "testapp".to_string(),
+            AppConfig {
+                binary: Some("nonexistent_binary_xyz_123".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
+            },
+        );
 
         let report = restore_session(&session, &mock, &config, false, true).unwrap();
 
@@ -1936,6 +2809,76 @@ mod tests {
     }
 
     #[test]
+    fn test_reconcile_refreshes_a_match_before_repairing_it() {
+        let target = make_client(
+            "kitty",
+            1,
+            [100, 100],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        let stale = make_reconcile_window("0xrefresh", "kitty", "kitty", 1, 0, [0, 0], [400, 300]);
+        let current =
+            make_reconcile_window("0xrefresh", "kitty", "kitty", 1, 0, [100, 100], [800, 600]);
+        let mock = MockHyprctl::new(vec![vec![stale], vec![current]]);
+        let launcher = RecordingLauncher::default();
+
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+        )
+        .unwrap();
+
+        assert_eq!(report.unchanged, 1);
+        assert_eq!(report.moved, 0);
+        assert_eq!(report.failed, 0);
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_stops_safely_when_a_matched_window_disappears() {
+        let target = make_client(
+            "kitty",
+            1,
+            [100, 100],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        let existing = make_reconcile_window("0xgone", "kitty", "kitty", 1, 0, [0, 0], [400, 300]);
+        let mock = MockHyprctl::new(vec![vec![existing], vec![]]);
+        let launcher = RecordingLauncher::default();
+
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+        )
+        .unwrap();
+
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.moved, 0);
+        assert!(mock.dispatches().is_empty());
+        assert!(launcher.launches.borrow().is_empty());
+    }
+
+    #[test]
     fn test_reconcile_moves_only_a_target_in_the_wrong_place() {
         let target = make_client(
             "kitty",
@@ -2041,6 +2984,7 @@ mod tests {
         let initial_state = vec![existing, extra];
         let mock = MockHyprctl::new(vec![
             initial_state.clone(),
+            initial_state.clone(),
             initial_state,
             vec![
                 make_reconcile_window(
@@ -2065,12 +3009,24 @@ mod tests {
             ],
         ]);
         let launcher = RecordingLauncher::default();
+        let mut config = Config::default();
+        config.apps.insert(
+            "kitty".to_string(),
+            AppConfig {
+                binary: Some("true".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
+            },
+        );
 
         let report = reconcile_session_with_launcher(
             &make_session(vec![existing_target, missing_target]),
             &mock,
             &EmptyProcessInfo,
-            &Config::default(),
+            &config,
             false,
             true,
             &launcher,
@@ -2194,10 +3150,109 @@ mod tests {
         let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-2"));
 
         assert_eq!(commands.len(), 1);
-        assert_eq!(
-            commands[0],
-            "movetoworkspacesilent 3,address:0xwrong-monitor"
+        assert_eq!(commands[0], "movetomonitor DP-1,address:0xwrong-monitor");
+    }
+
+    #[test]
+    fn test_reconcile_uses_named_workspace_and_restores_pinned_state() {
+        let mut target = make_client(
+            "kitty",
+            -99,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
         );
+        target.workspace_name = "special:magic".to_string();
+        target.pinned = true;
+        let mut current =
+            make_reconcile_window("0xspecial", "kitty", "kitty", 1, 0, [10, 20], [800, 600]);
+        current.workspace.name = "1".to_string();
+
+        let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-1"));
+
+        assert!(commands
+            .iter()
+            .any(|command| command == "movetoworkspacesilent special:magic,address:0xspecial"));
+        assert_eq!(
+            commands.last().map(String::as_str),
+            Some("pin address:0xspecial")
+        );
+    }
+
+    #[test]
+    fn test_reconcile_preserves_case_insensitive_named_workspace_prefixes() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.workspace_name = "Name:Writing Desk".to_string();
+        let mut current =
+            make_reconcile_window("0xnamed", "kitty", "kitty", 99, 0, [10, 20], [800, 600]);
+        current.workspace.name = "writing desk".to_string();
+
+        let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-1"));
+
+        assert!(!commands
+            .iter()
+            .any(|command| command.starts_with("movetoworkspacesilent")));
+    }
+
+    #[test]
+    fn test_reconcile_quotes_backslashes_in_named_monitor_tokens() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.monitor = "Desk \\ A".to_string();
+        let current =
+            make_reconcile_window("0xmonitor", "kitty", "kitty", 1, 0, [10, 20], [800, 600]);
+
+        let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-1"));
+
+        assert_eq!(
+            commands,
+            vec!["movetomonitor 'Desk \\\\ A',address:0xmonitor"]
+        );
+    }
+
+    #[test]
+    fn test_reconcile_unpins_before_moving_when_saved_state_is_not_pinned() {
+        let target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        let mut current =
+            make_reconcile_window("0xpinned", "kitty", "kitty", 1, 0, [10, 20], [800, 600]);
+        current.pinned = true;
+
+        let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-1"));
+
+        assert_eq!(commands, vec!["pin address:0xpinned"]);
     }
 
     #[test]
@@ -2256,6 +3311,96 @@ mod tests {
         );
 
         assert_eq!(plan[0].map(|pair| pair.kind), Some(MatchKind::AppIdentity));
+    }
+
+    #[test]
+    fn test_reconcile_uses_profile_identity_when_available() {
+        let mut target = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [1280, 800],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+        target.profile_directory = Some("Profile 1".to_string());
+
+        let client = make_reconcile_window(
+            "0xprofile",
+            "brave-browser",
+            "Brave",
+            1,
+            0,
+            [0, 0],
+            [1280, 800],
+        );
+        let observed = ObservedClient::with_profile_directory(
+            client.clone(),
+            None,
+            None,
+            Some("Profile 1".to_string()),
+        );
+        assert!(plan_reconciliation(&[target.clone()], &[observed])[0].is_some());
+
+        let wrong_profile =
+            ObservedClient::with_profile_directory(client, None, None, Some("Default".to_string()));
+        assert!(plan_reconciliation(&[target], &[wrong_profile])[0].is_none());
+    }
+
+    #[test]
+    fn test_reconcile_routes_brave_initial_class_through_profile_targets() {
+        let mut brave_window = make_client(
+            "browser-wrapper",
+            1,
+            [0, 0],
+            [1280, 800],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+        brave_window.initial_class = "BRAVE-BROWSER".to_string();
+
+        let session = Session {
+            name: "test".to_string(),
+            created_at: Utc::now(),
+            hyprland_version: "0.54.1".to_string(),
+            monitors: vec![],
+            clients: vec![brave_window],
+            brave_profiles: vec![BraveProfile {
+                directory: "Default".to_string(),
+                name: "Default".to_string(),
+            }],
+        };
+        let mut apps = HashMap::new();
+        apps.insert(
+            "brave-browser".to_string(),
+            AppConfig {
+                binary: Some("brave".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: Some(1),
+            },
+        );
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig::default(),
+            apps,
+        };
+
+        let targets = build_reconcile_targets(&session, &config);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].label.starts_with("brave profile"));
+        assert_eq!(
+            targets[0].client.profile_directory.as_deref(),
+            Some("Default")
+        );
     }
 
     #[test]

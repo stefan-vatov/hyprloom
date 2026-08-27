@@ -19,8 +19,22 @@ fn service_content() -> String {
          [Service]\n\
          Type=oneshot\n\
          ExecStart={} autosave --now\n",
-        binary.display()
+        systemd_quote_path(&binary)
     )
+}
+
+fn systemd_quote_path(path: &Path) -> String {
+    let mut escaped = String::from("\"");
+    for character in path.to_string_lossy().chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '%' => escaped.push_str("%%"),
+            character => escaped.push(character),
+        }
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn timer_content() -> String {
@@ -140,6 +154,14 @@ mod tests {
         let content = service_content();
         assert!(content.contains("Type=oneshot"));
         assert!(content.contains("autosave --now"));
+    }
+
+    #[test]
+    fn test_systemd_quote_path_protects_spaces_and_specifiers() {
+        assert_eq!(
+            systemd_quote_path(Path::new("/tmp/Desk Loom/100%/hyprloom")),
+            "\"/tmp/Desk Loom/100%%/hyprloom\""
+        );
     }
 
     #[test]

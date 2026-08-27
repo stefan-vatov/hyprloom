@@ -12,7 +12,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `restore --reconcile` additive reconciliation mode with one-to-one matching
 - Placement-only repair for existing windows, missing-window launches, and extra-window preservation
 - Initial class/title capture and Ghostty binary/working-directory support
+- Pinned/special-workspace fidelity and monitor-aware geometry adaptation
+- Process-tree launch correlation, deterministic terminal discovery, and profile-aware matching
 - Non-destructive migration of existing Hyprflow session files
+
+### Fixed
+
+- Reconciliation now uses global one-to-one matching, refreshes windows before repair, and exits safely when an address disappears
+- Session writes are atomic and protected against symlinked session paths; autosave names remain unique under concurrent captures
 
 ## [0.2.1] - 2026-03-11
 

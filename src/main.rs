@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use hyprloom::capture::capture_session;
-use hyprloom::config::{config_path, legacy_sessions_dir, load_config, sessions_dir};
+use hyprloom::config::{
+    app_config_for, config_path, legacy_sessions_dir, load_config, sessions_dir,
+};
 use hyprloom::hyprctl::RealHyprctl;
 use hyprloom::process::RealProcessInfo;
 use hyprloom::restore::restore_session;
@@ -231,6 +233,9 @@ fn main() {
                         for detail in &report.details {
                             println!("  {}", detail);
                         }
+                        if report.failed > 0 {
+                            std::process::exit(1);
+                        }
                     }
                     Err(e) => {
                         eprintln!("Error reconciling session: {}", e);
@@ -251,6 +256,9 @@ fn main() {
                         );
                         for detail in &report.details {
                             println!("  {}", detail);
+                        }
+                        if report.failed > 0 {
+                            std::process::exit(1);
                         }
                     }
                     Err(e) => {
@@ -322,9 +330,7 @@ fn main() {
             match hyprloom::brave::read_profiles() {
                 Ok(profiles) if !profiles.is_empty() => {
                     println!("Brave profiles detected:");
-                    let profile_ws = config
-                        .apps
-                        .get("brave-browser")
+                    let profile_ws = app_config_for(&config, "brave-browser", "")
                         .and_then(|c| c.profile_workspaces.as_ref());
                     for profile in &profiles {
                         if let Some(ws) = profile_ws.and_then(|m| m.get(&profile.directory)) {

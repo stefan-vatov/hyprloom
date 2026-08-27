@@ -21,6 +21,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Validate release version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          pkg_version="$(sed -n 's/^pkgver=//p' PKGBUILD | head -n 1)"
+          test "$tag_version" = "$cargo_version"
+          test "$tag_version" = "$pkg_version"
+
       - name: Test all targets
         run: cargo test --locked
 
@@ -97,5 +105,9 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           git add PKGBUILD .SRCINFO
-          git commit -m "Update to ${{ steps.version.outputs.version }}"
-          git push
+          if git diff --cached --quiet; then
+            echo "AUR metadata is already current."
+          else
+            git commit -m "Update to ${{ steps.version.outputs.version }}"
+            git push
+          fi

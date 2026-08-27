@@ -22,7 +22,7 @@ Hyprloom is a Rust CLI that captures and restores Hyprland window sessions via `
 
 - **main.rs** — clap-derived CLI with subcommands: `save`, `restore`, `list`, `delete`, `config`
 - **capture.rs** — Queries `hyprctl clients/monitors`, resolves CWD/last-command per window, builds `Session`
-- **restore.rs** — Groups clients by workspace, spawns binaries sequentially, polls for new window address, positions via `hyprctl dispatch` (movetoworkspacesilent → resizewindowpixel exact → movewindowpixel exact)
+- **restore.rs** — Plans one-to-one reconciliation, refreshes matched addresses, spawns missing binaries sequentially, polls for new window identity, and positions via `hyprctl dispatch`
 - **session.rs** — `Session`/`SessionClient`/`LaunchInfo` data model, JSON file I/O under `$XDG_DATA_HOME/hyprloom/sessions/`
 - **config.rs** — TOML config at `$XDG_CONFIG_HOME/hyprloom/config.toml`, per-app capture settings, ignore-class filters
 - **hyprctl.rs** — `HyprctlClient` trait + `RealHyprctl` (shells out to `hyprctl`) + `MockHyprctl` for tests
@@ -37,10 +37,11 @@ Trait-based dependency injection (`HyprctlClient`, `ProcessInfoProvider`) enable
 
 Each window is restored sequentially: spawn → poll for new address (100ms intervals, configurable timeout) → position via hyprctl dispatch commands. The address-diff approach detects which new window belongs to which spawn.
 
-Reconciliation captures current clients once, matches targets one-to-one using
-initial identity, title, working-directory, and geometry evidence, repairs
-only matched windows that differ, and launches only unmatched targets. Extra
-current windows are preserved.
+Reconciliation captures current clients, matches targets one-to-one using
+initial identity, title, working-directory, profile, and geometry evidence,
+refreshes each matched address before repair, and launches only unmatched
+targets. Extra current windows are preserved. Saved monitor origins and sizes
+are used to adapt geometry when the same monitor changes layout.
 
 ### Test Fixtures
 
@@ -48,4 +49,4 @@ current windows are preserved.
 
 ## Active Development
 
-Branch `feat/v0.2` is active development for v0.2.0. All P0 bugs from v0.1.0 are resolved.
+Branch `main` contains the Hyprloom fork and its reconciliation implementation.

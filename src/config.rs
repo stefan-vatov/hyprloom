@@ -30,6 +30,34 @@ pub struct FilterConfig {
     pub ignore_classes: Vec<String>,
 }
 
+/// Compare compositor classes case-insensitively.  Hyprland normally reports
+/// stable casing, but app wrappers and older sessions do not always agree.
+pub fn is_ignored_class(class: &str, ignored_classes: &[String]) -> bool {
+    ignored_classes
+        .iter()
+        .any(|ignored| !ignored.is_empty() && ignored.eq_ignore_ascii_case(class))
+}
+
+/// Find the most specific per-app configuration while tolerating compositor
+/// class casing and wrappers that expose a different runtime class from their
+/// initial class.
+pub fn app_config_for<'a>(
+    config: &'a Config,
+    class: &str,
+    initial_class: &str,
+) -> Option<&'a AppConfig> {
+    config
+        .apps
+        .get(class)
+        .or_else(|| config.apps.get(initial_class))
+        .or_else(|| {
+            config.apps.iter().find_map(|(name, app)| {
+                (name.eq_ignore_ascii_case(class) || name.eq_ignore_ascii_case(initial_class))
+                    .then_some(app)
+            })
+        })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub binary: Option<String>,
@@ -218,6 +246,28 @@ autosave_retain = 10
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.autosave_retain, 10);
+    }
+
+    #[test]
+    fn test_ignored_classes_are_case_insensitive() {
+        assert!(is_ignored_class("WayBar", &["waybar".to_string()]));
+        assert!(!is_ignored_class("kitty", &["waybar".to_string()]));
+    }
+
+    #[test]
+    fn test_app_config_lookup_is_case_insensitive() {
+        let config: Config = toml::from_str(
+            r#"
+[apps."com.mitchellh.ghostty"]
+binary = "ghostty"
+capture_cwd = true
+"#,
+        )
+        .unwrap();
+
+        let app = app_config_for(&config, "Com.MitchellH.Ghostty", "").unwrap();
+        assert_eq!(app.binary.as_deref(), Some("ghostty"));
+        assert_eq!(app.capture_cwd, Some(true));
     }
 
     #[test]

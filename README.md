@@ -9,6 +9,7 @@ When you reboot or after a power loss, hyprloom restores your applications to th
 - **Save** current session — captures all windows, positions, workspaces, and monitor layout
 - **Restore** saved session — relaunches apps and positions them precisely
 - **Reconcile** saved session — reuses open windows, repairs only mismatches, and leaves extras alone
+- **Monitor-aware geometry** — adapts captured positions and sizes when a known monitor moves or changes resolution
 - **Kitty terminal support** — restores working directory + shows hint of last command
 - **Ghostty-aware restore** — recognizes the Linux app class and restores its working directory when configured
 - **Smart filtering** — ignores transient windows (Waybar, Wofi, popups)
@@ -98,6 +99,7 @@ once. It then:
 
 - does nothing for targets already in place;
 - moves or resizes matched targets that are in the wrong workspace, monitor, or position;
+- adapts geometry to the saved monitor origin and dimensions when available;
 - launches only targets that are genuinely missing;
 - leaves extra windows open and reports them.
 
@@ -128,8 +130,9 @@ configured workspace. Profiles not in `profile_workspaces` are skipped.
 ### Autosave
 
 Hyprloom can automatically save sessions at regular intervals using a systemd
-timer. Autosave sessions are named with timestamps (`autosave-20260309T143000`)
-and automatically rotated, keeping only the last N saves.
+timer. Autosave sessions are named with timestamps plus a process/sequence
+suffix (`autosave-20260309T143000000000-1234-0`) and automatically rotated,
+keeping only the last N saves.
 
 ```bash
 # Check autosave status
@@ -169,6 +172,10 @@ exec-once = hyprloom restore --reconcile --max-age 24h
 The `--max-age` flag prevents restoring stale sessions. Accepted formats:
 `30m` (minutes), `24h` (hours), `7d` (days).
 
+Restore only launches commands captured from the app identity or explicitly
+authorized with an `apps.<class>.binary` setting. This keeps automatic restore
+from executing an arbitrary command inserted into a session file.
+
 ### Sessions storage
 
 Sessions are stored as JSON files in `~/.local/share/hyprloom/sessions/`.
@@ -181,9 +188,9 @@ first use and are never removed.
 
 **Restore:** Launches apps sequentially, polls for new windows via address diff, then positions each window using `hyprctl dispatch` with exact pixel coordinates.
 
-**Reconcile:** Captures the current client list once, creates a deterministic
-one-to-one assignment to saved targets, applies only the required dispatches to
-matched windows, and uses the normal launch-and-detect path for missing targets.
+**Reconcile:** Captures the current client list, creates a deterministic
+one-to-one assignment to saved targets, refreshes each matched address before
+repairing it, and uses the normal launch-and-detect path for missing targets.
 Unmatched current windows are never closed by reconciliation.
 
 ## Requirements
