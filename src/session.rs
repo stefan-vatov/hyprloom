@@ -430,10 +430,20 @@ pub fn migrate_legacy_sessions(
             if validate_session_name(name).is_err() {
                 continue;
             }
-            ensure_private_file(&source, name)?;
-            let content = read_limited_file(&source, name)?;
-            let session: Session = serde_json::from_slice(&content)?;
-            validate_session_structure(&session)?;
+            if ensure_private_file(&source, name).is_err() {
+                // A single unsafe legacy file must not prevent healthy
+                // snapshots beside it from being migrated.
+                continue;
+            }
+            let Ok(content) = read_limited_file(&source, name) else {
+                continue;
+            };
+            let Ok(session) = serde_json::from_slice::<Session>(&content) else {
+                continue;
+            };
+            if validate_session_structure(&session).is_err() {
+                continue;
+            }
             if session.name != name {
                 // Never copy a payload under a filename that names a
                 // different session.  This also keeps a later load from
@@ -1277,6 +1287,32 @@ mod tests {
             0
         );
         assert_eq!(load_session("work", current.path()).unwrap().name, "work");
+    }
+
+    #[test]
+    fn test_migrate_legacy_sessions_skips_bad_files_and_keeps_valid_files() {
+        let legacy = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        let malformed = legacy.path().join("malformed.json");
+        std::fs::write(&malformed, b"not json").unwrap();
+        ensure_private_file(&malformed, "malformed").unwrap();
+
+        let oversized = legacy.path().join("oversized.json");
+        std::fs::write(&oversized, vec![b'x'; MAX_SESSION_FILE_BYTES as usize + 1]).unwrap();
+        ensure_private_file(&oversized, "oversized").unwrap();
+
+        save_session(&make_test_session("healthy"), legacy.path()).unwrap();
+
+        assert_eq!(
+            migrate_legacy_sessions(current.path(), legacy.path()).unwrap(),
+            1
+        );
+        assert_eq!(
+            load_session("healthy", current.path()).unwrap().name,
+            "healthy"
+        );
+        assert!(!current.path().join("malformed.json").exists());
+        assert!(!current.path().join("oversized.json").exists());
     }
 
     #[test]

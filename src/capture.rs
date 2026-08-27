@@ -490,6 +490,9 @@ fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<Desk
         .unwrap_or(false);
     let matches = if command.eq_ignore_ascii_case("omarchy-launch-webapp") {
         url_argument_matches
+            && identities
+                .iter()
+                .any(|identity| webapp_class_uses_default_profile(identity))
     } else {
         (class_argument_matches || startup_class_matches) && url_argument_matches
     };
@@ -562,7 +565,7 @@ pub(crate) fn webapp_class_matches_url(class: &str, url: &str) -> bool {
     if !prefix.eq_ignore_ascii_case("chrome-") {
         return false;
     }
-    let Some(class_host) = class["chrome-".len()..].split("__").next() else {
+    let Some((class_host, class_suffix)) = class["chrome-".len()..].split_once("__") else {
         return false;
     };
     if class_host.is_empty() {
@@ -571,7 +574,30 @@ pub(crate) fn webapp_class_matches_url(class: &str, url: &str) -> bool {
     let Some(url_host) = webapp_url_host(url) else {
         return false;
     };
-    class_host.eq_ignore_ascii_case(url_host)
+    let Some(url_route) = webapp_url_route(url) else {
+        return false;
+    };
+    let class_route = class_suffix
+        .rsplit_once('-')
+        .map(|(route, _profile)| route)
+        .unwrap_or(class_suffix);
+    class_host.eq_ignore_ascii_case(url_host) && class_route == url_route.replace('/', "_")
+}
+
+fn webapp_class_uses_default_profile(class: &str) -> bool {
+    let Some(prefix) = class.get(.."chrome-".len()) else {
+        return false;
+    };
+    if !prefix.eq_ignore_ascii_case("chrome-") {
+        return false;
+    }
+    let Some((_host, suffix)) = class["chrome-".len()..].split_once("__") else {
+        return false;
+    };
+    suffix
+        .rsplit_once('-')
+        .map(|(_route, profile)| profile.eq_ignore_ascii_case("Default"))
+        .unwrap_or(false)
 }
 
 fn webapp_url_host(url: &str) -> Option<&str> {
@@ -587,6 +613,22 @@ fn webapp_url_host(url: &str) -> Option<&str> {
         .filter(|authority| !authority.is_empty())?;
     let host = authority.rsplit('@').next()?.split(':').next()?;
     (!host.is_empty()).then_some(host)
+}
+
+fn webapp_url_route(url: &str) -> Option<&str> {
+    let scheme_end = url.find("://")?;
+    let authority = &url[scheme_end + 3..];
+    let route = authority
+        .find(['/', '?', '#'])
+        .map(|index| &authority[index..])
+        .unwrap_or("");
+    if route.contains('?') {
+        // Chromium's class route encoding is not stable for arbitrary query
+        // strings.  Refuse to guess rather than map two different web apps to
+        // the same launcher.
+        return None;
+    }
+    Some(route.split('#').next()?.trim_matches('/'))
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -911,6 +953,24 @@ mod tests {
 
         assert_eq!(launch.command, "omarchy-launch-webapp");
         assert_eq!(launch.args, vec!["https://chatgpt.com/"]);
+    }
+
+    #[test]
+    fn test_webapp_route_and_profile_suffixes_must_match() {
+        let class = "chrome-discord.com__channels_@me-Default";
+
+        assert!(webapp_class_matches_url(
+            class,
+            "https://discord.com/channels/@me"
+        ));
+        assert!(!webapp_class_matches_url(
+            class,
+            "https://discord.com/other"
+        ));
+        assert!(webapp_class_uses_default_profile(class));
+        assert!(!webapp_class_uses_default_profile(
+            "chrome-discord.com__channels_@me-Profile_1"
+        ));
     }
 
     #[test]
