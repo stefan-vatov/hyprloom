@@ -11,8 +11,8 @@ use hyprloom::restore::{
 };
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
-    mark_replace_in_progress, migrate_legacy_sessions, replace_marker, save_session,
-    session_exists, validate_user_session_name, OperationLock, ReplacePhase,
+    mark_replace_prepared, migrate_legacy_sessions, replace_marker, save_session, session_exists,
+    validate_user_session_name, OperationLock, ReplacePhase,
 };
 use std::path::Path;
 
@@ -346,7 +346,7 @@ fn main() {
                 eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
             }
-            if let Err(error) = mark_replace_in_progress(&backup_name, &sessions_dir) {
+            if let Err(error) = mark_replace_prepared(&backup_name, &sessions_dir) {
                 eprintln!("Replace cancelled: could not record recovery marker: {error}");
                 std::process::exit(1);
             }
@@ -403,15 +403,32 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("Error replacing desktop: {error}");
-                    eprintln!("Attempting safety recovery from '{backup_name}' before giving up.");
-                    if report_safety_recovery(
-                        &backup,
-                        &hyprctl,
-                        &process_info,
-                        &config,
-                        cli.verbose,
-                    ) {
-                        clear_recovery_marker(&sessions_dir);
+                    match replacement_has_started(&sessions_dir) {
+                        Some(true) => {
+                            eprintln!(
+                                "Attempting safety recovery from '{backup_name}' before giving up."
+                            );
+                            if report_safety_recovery(
+                                &backup,
+                                &hyprctl,
+                                &process_info,
+                                &config,
+                                cli.verbose,
+                            ) {
+                                clear_recovery_marker(&sessions_dir);
+                            }
+                        }
+                        Some(false) => {
+                            eprintln!(
+                                "Replacement did not start closing windows; leaving the desktop unchanged."
+                            );
+                            clear_recovery_marker(&sessions_dir);
+                        }
+                        None => {
+                            eprintln!(
+                                "Could not determine whether replacement started; leaving the recovery marker for manual recovery."
+                            );
+                        }
                     }
                     std::process::exit(1);
                 }
@@ -646,6 +663,12 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
         );
         return clear_recovery_marker(sessions_dir);
     }
+    if marker.phase == ReplacePhase::Prepared {
+        eprintln!(
+            "Found a replacement that was prepared but never started; leaving the current desktop unchanged."
+        );
+        return clear_recovery_marker(sessions_dir);
+    }
     let backup_name = marker.backup_name;
     eprintln!(
         "Found an interrupted desktop replacement; attempting recovery from '{backup_name}'."
@@ -663,6 +686,17 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
         return clear_recovery_marker(sessions_dir);
     }
     false
+}
+
+fn replacement_has_started(sessions_dir: &Path) -> Option<bool> {
+    match replace_marker(sessions_dir) {
+        Ok(Some(marker)) => Some(marker.phase == ReplacePhase::InProgress),
+        Ok(None) => Some(false),
+        Err(error) => {
+            eprintln!("Warning: could not inspect replacement recovery marker: {error}");
+            None
+        }
+    }
 }
 
 fn command_requires_clean_recovery(command: &Commands) -> bool {

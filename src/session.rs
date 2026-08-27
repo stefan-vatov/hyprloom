@@ -116,6 +116,7 @@ pub struct SessionSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplacePhase {
+    Prepared,
     InProgress,
     Committed,
 }
@@ -434,6 +435,24 @@ pub fn mark_replace_in_progress(
     )
 }
 
+/// Record that a replacement has been prepared but has not started closing
+/// the desktop yet.  A crash in this phase must not roll back user activity
+/// that happened after the safety snapshot was captured.
+pub fn mark_replace_prepared(
+    backup_name: &str,
+    sessions_dir: &std::path::Path,
+) -> Result<(), SessionError> {
+    validate_session_name(backup_name)?;
+    ensure_sessions_dir(sessions_dir)?;
+    write_replace_marker(
+        &ReplaceMarker {
+            backup_name: backup_name.to_string(),
+            phase: ReplacePhase::Prepared,
+        },
+        sessions_dir,
+    )
+}
+
 pub fn mark_replace_committed(
     backup_name: &str,
     sessions_dir: &std::path::Path,
@@ -476,6 +495,7 @@ pub fn replace_marker(
     let mut lines = text.lines();
     let first = lines.next().unwrap_or_default();
     let (phase, name) = match first {
+        "prepared" => (ReplacePhase::Prepared, lines.next().unwrap_or_default()),
         // Older builds wrote only the backup name.  Treat that format as an
         // interrupted replacement so upgrading cannot silently skip recovery.
         "in-progress" => (ReplacePhase::InProgress, lines.next().unwrap_or_default()),
@@ -506,6 +526,7 @@ fn write_replace_marker(
     sessions_dir: &std::path::Path,
 ) -> Result<(), SessionError> {
     let phase = match marker.phase {
+        ReplacePhase::Prepared => "prepared",
         ReplacePhase::InProgress => "in-progress",
         ReplacePhase::Committed => "committed",
     };
@@ -1113,6 +1134,14 @@ mod tests {
     #[test]
     fn test_replace_recovery_marker_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
+        mark_replace_prepared("autosave-recovery", dir.path()).unwrap();
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::Prepared,
+            })
+        );
         mark_replace_in_progress("autosave-recovery", dir.path()).unwrap();
         assert_eq!(
             pending_replace_backup(dir.path()).unwrap().as_deref(),

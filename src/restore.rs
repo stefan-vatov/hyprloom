@@ -528,7 +528,8 @@ fn restore_session_with_process_info(
                 continue;
             }
             let target_monitor = find_monitor_by_name(&current_monitors, &client.monitor);
-            let target_monitor_available = client.monitor.is_empty() || target_monitor.is_some();
+            let target_monitor_available =
+                target_monitor_is_available(&current_monitors, &client.monitor);
             let restore_client = adapt_client_geometry(client, &session.monitors, target_monitor);
 
             if dry_run {
@@ -652,7 +653,7 @@ fn restore_session_with_process_info(
         for mut target in profile_targets {
             let target_monitor = find_monitor_by_name(&current_monitors, &target.client.monitor);
             let target_monitor_available =
-                target.client.monitor.is_empty() || target_monitor.is_some();
+                target_monitor_is_available(&current_monitors, &target.client.monitor);
             target.client =
                 adapt_client_geometry(&target.client, &session.monitors, target_monitor);
             if dry_run {
@@ -666,6 +667,55 @@ fn restore_session_with_process_info(
                     report.details.push(format!("  hyprctl dispatch {command}"));
                 }
                 report.restored += 1;
+                continue;
+            }
+
+            // Profile-aware normal restore is idempotent too.  Reuse a
+            // currently open window whose profile was positively identified
+            // before considering a new browser launch; otherwise every plain
+            // `restore` would duplicate already-open Brave profiles.
+            if let Some(existing_index) = find_existing_restore_match(
+                &target.client,
+                &existing_clients,
+                &consumed_existing,
+                config,
+            ) {
+                let current = existing_clients[existing_index].clone();
+                consumed_existing.insert(current.client.address.clone());
+                let commands = build_reconcile_dispatch_commands_with_geometry(
+                    &target.client,
+                    &current.client,
+                    current.monitor_name.as_deref(),
+                    target.client.at,
+                    target.client.size,
+                    target_monitor_available,
+                );
+                if commands.is_empty() {
+                    report.details.push(format!(
+                        "SKIP: {} already on ws={}",
+                        current.client.class, target.client.workspace
+                    ));
+                    report.skipped += 1;
+                } else {
+                    match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
+                        Ok(()) => {
+                            report.restored += 1;
+                            if verbose {
+                                report.details.push(format!(
+                                    "OK: repaired {} at address {}",
+                                    target.label, current.client.address
+                                ));
+                            }
+                        }
+                        Err(error) => {
+                            report.failed += 1;
+                            report.details.push(format!(
+                                "FAIL: {} at address {} — {error}",
+                                target.label, current.client.address
+                            ));
+                        }
+                    }
+                }
                 continue;
             }
 
@@ -818,7 +868,9 @@ pub fn replace_session(
     )
 }
 
-/// Marker information for a replacement transaction managed by the CLI.
+/// Marker information for a replacement transaction managed by the CLI.  The
+/// caller writes a prepared marker before entering this function; the helper
+/// advances it to in-progress immediately before the first close.
 pub struct ReplaceMarkerContext<'a> {
     pub dry_run: bool,
     pub verbose: bool,
@@ -906,6 +958,13 @@ fn replace_session_inner(
     }
 
     let current = hyprctl.get_clients()?;
+    if let Some((backup_name, sessions_dir)) = options.marker {
+        // Keep the prepared marker until the first close is about to happen.
+        // A compositor query failure must not make startup restore a snapshot
+        // over the user's desktop.
+        crate::session::mark_replace_in_progress(backup_name, sessions_dir)
+            .map_err(|error| RestoreError::Transaction(error.to_string()))?;
+    }
     for client in current {
         if !client.address.is_empty() {
             hyprctl.dispatch(&format!("closewindow address:{}", client.address))?;
@@ -1067,10 +1126,8 @@ pub fn reconcile_session_with_launcher(
             used_current_addresses.insert(current.client.address.clone());
             report.matched += 1;
 
-            let current_target_monitor =
-                find_monitor_by_name(&current_monitors, &target_client.monitor).cloned();
             let target_monitor_available =
-                target_client.monitor.is_empty() || current_target_monitor.is_some();
+                target_monitor_is_available(&current_monitors, &target_client.monitor);
             let commands = build_reconcile_dispatch_commands_with_geometry(
                 target_client,
                 &current.client,
@@ -1152,8 +1209,8 @@ pub fn reconcile_session_with_launcher(
                 target.label,
                 launch_command.join(" ")
             ));
-            let target_monitor_available = target_client.monitor.is_empty()
-                || find_monitor_by_name(&current_monitors, &target_client.monitor).is_some();
+            let target_monitor_available =
+                target_monitor_is_available(&current_monitors, &target_client.monitor);
             for command in
                 build_dispatch_commands_for_monitor(target_client, target_monitor_available)
             {
@@ -1177,8 +1234,7 @@ pub fn reconcile_session_with_launcher(
             process_info,
             config,
             launcher,
-            target_client.monitor.is_empty()
-                || find_monitor_by_name(&current_monitors, &target_client.monitor).is_some(),
+            target_monitor_is_available(&current_monitors, &target_client.monitor),
         ) {
             Ok(restored) => {
                 used_current_addresses.insert(restored.address);
@@ -1391,6 +1447,10 @@ fn find_monitor_by_name<'a>(monitors: &'a [HyprMonitor], name: &str) -> Option<&
     monitors
         .iter()
         .find(|monitor| monitor.name.eq_ignore_ascii_case(name))
+}
+
+fn target_monitor_is_available(monitors: &[HyprMonitor], name: &str) -> bool {
+    name.is_empty() || monitors.is_empty() || find_monitor_by_name(monitors, name).is_some()
 }
 
 /// Adapt captured absolute coordinates to a monitor whose origin or
@@ -1688,9 +1748,6 @@ fn build_reconcile_dispatch_commands_with_geometry(
     if leaving_fullscreen {
         commands.push(format!("fullscreenstate 0 0,address:{}", current.address));
     }
-    if monitor_mismatch {
-        commands.extend(monitor_move_commands(&target.monitor, &current.address));
-    }
     if workspace_mismatch {
         commands.push(format!(
             "movetoworkspacesilent {},address:{}",
@@ -1698,11 +1755,17 @@ fn build_reconcile_dispatch_commands_with_geometry(
             current.address
         ));
     }
+    // Workspace bindings can move a window to their preferred monitor.  Apply
+    // the explicit monitor correction afterwards so the final placement wins.
+    if monitor_mismatch {
+        commands.extend(monitor_move_commands(&target.monitor, &current.address));
+    }
     if current.floating != target.floating {
         commands.push(format!("togglefloating address:{}", current.address));
     }
 
-    if target.fullscreen == 0 {
+    // Do not apply stale absolute coordinates when the saved monitor is gone.
+    if target.fullscreen == 0 && (target.monitor.is_empty() || target_monitor_available) {
         if current.size != desired_size {
             commands.push(format!(
                 "resizewindowpixel exact {} {},address:{}",
@@ -1863,11 +1926,16 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
         None,
         client.at,
         client.size,
-        false,
+        target_monitor_available,
     );
     if target_monitor_available && !client.monitor.is_empty() {
         let monitor_commands = monitor_move_commands(&client.monitor, &new_window.address);
-        commands.splice(0..0, monitor_commands);
+        let insertion = commands
+            .iter()
+            .position(|command| command.starts_with("movetoworkspacesilent "))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        commands.splice(insertion..insertion, monitor_commands);
     }
     for command in commands {
         if !window_is_present(&new_window.address, hyprctl)? {
@@ -2093,25 +2161,26 @@ fn build_dispatch_commands_for_monitor(
     let launch = build_launch_command(client);
 
     let mut cmds = vec![format!("exec {}", launch.join(" "))];
+    cmds.push(format!(
+        "movetoworkspacesilent {},{}",
+        quote_dispatch_token(&workspace_selector(client)),
+        addr
+    ));
     if target_monitor_available && !client.monitor.is_empty() {
         cmds.extend(monitor_move_commands(&client.monitor, addr));
     }
-    cmds.extend([
-        format!(
-            "movetoworkspacesilent {},{}",
-            quote_dispatch_token(&workspace_selector(client)),
-            addr
-        ),
-        format!(
-            "resizewindowpixel exact {} {},{}",
-            client.size[0], client.size[1], addr
-        ),
-        format!(
-            "movewindowpixel exact {} {},{}",
-            client.at[0], client.at[1], addr
-        ),
-    ]);
-
+    if client.monitor.is_empty() || target_monitor_available {
+        cmds.extend([
+            format!(
+                "resizewindowpixel exact {} {},{}",
+                client.size[0], client.size[1], addr
+            ),
+            format!(
+                "movewindowpixel exact {} {},{}",
+                client.at[0], client.at[1], addr
+            ),
+        ]);
+    }
     if client.floating {
         cmds.push(format!("togglefloating {addr}"));
     }
@@ -2401,6 +2470,25 @@ mod tests {
             _pid: u32,
         ) -> Result<Vec<crate::process::ChildProcess>, ProcessError> {
             Ok(vec![])
+        }
+    }
+
+    struct BraveProfileProcessInfo;
+
+    impl ProcessInfoProvider for BraveProfileProcessInfo {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, _pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Ok(vec![])
+        }
+
+        fn get_cmdline(&self, pid: u32) -> Result<String, ProcessError> {
+            match pid {
+                1000 => Ok("brave --profile-directory=Default".to_string()),
+                _ => Err(ProcessError::NotFound(pid)),
+            }
         }
     }
 
@@ -2986,6 +3074,7 @@ mod tests {
             None,
         );
         target.title = "target".to_string();
+        target.monitor.clear();
         let related =
             make_reconcile_window("0xrelated", "kitty", "other", 1, 0, [0, 0], [400, 300]);
         let mut related = related;
@@ -3532,6 +3621,73 @@ mod tests {
     }
 
     #[test]
+    fn test_normal_restore_reuses_open_brave_profile_instead_of_launching_duplicate() {
+        let mut brave = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+        brave.title = "Brave".to_string();
+        brave.initial_title = "Brave".to_string();
+        let session = Session {
+            name: "test".to_string(),
+            created_at: Utc::now(),
+            hyprland_version: "0.54.1".to_string(),
+            monitors: vec![],
+            clients: vec![brave],
+            brave_profiles: vec![BraveProfile {
+                directory: "Default".to_string(),
+                name: "Personal".to_string(),
+            }],
+        };
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig::default(),
+            apps: HashMap::from([(
+                "brave-browser".to_string(),
+                AppConfig {
+                    binary: Some("brave".to_string()),
+                    capture_cwd: None,
+                    capture_last_command: None,
+                    hint_template: None,
+                    profile_workspaces: Some(HashMap::from([("Default".to_string(), 1)])),
+                    default_workspace: Some(1),
+                },
+            )]),
+        };
+        let mock = MockHyprctl::new(vec![vec![make_reconcile_window(
+            "0xprofile",
+            "brave-browser",
+            "Brave",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        )]]);
+
+        let report = restore_session_with_process_info(
+            &session,
+            &mock,
+            &BraveProfileProcessInfo,
+            &config,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.failed, 0);
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
     fn test_reconcile_does_nothing_when_target_is_already_in_place() {
         let target = make_client(
             "kitty",
@@ -4012,9 +4168,12 @@ mod tests {
         assert!(dispatches
             .iter()
             .any(|dispatch| dispatch.contains("movetoworkspacesilent 2")));
-        assert!(dispatches
-            .iter()
-            .any(|dispatch| dispatch.contains("movewindowpixel exact 30 40")));
+        assert!(
+            dispatches
+                .iter()
+                .any(|dispatch| dispatch.contains("movewindowpixel exact 30 40")),
+            "dispatches: {dispatches:?}"
+        );
         assert!(!dispatches
             .iter()
             .any(|dispatch| dispatch.contains("0xextra")));
@@ -4122,6 +4281,78 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0], "focuswindow address:0xwrong-monitor");
         assert_eq!(commands[1], "movewindow mon:DP-1 silent");
+    }
+
+    #[test]
+    fn test_reconcile_applies_workspace_before_monitor_correction() {
+        let mut target = make_client(
+            "obsidian",
+            2,
+            [50, 100],
+            [1200, 900],
+            false,
+            0,
+            "obsidian",
+            vec![],
+            None,
+        );
+        target.monitor = "DP-1".to_string();
+        let current = make_reconcile_window(
+            "0xworkspace-and-monitor",
+            "obsidian",
+            "obsidian",
+            3,
+            1,
+            [50, 100],
+            [1200, 900],
+        );
+
+        let commands = build_reconcile_dispatch_commands(&target, &current, Some("DP-2"));
+
+        assert_eq!(
+            commands,
+            vec![
+                "movetoworkspacesilent 2,address:0xworkspace-and-monitor",
+                "focuswindow address:0xworkspace-and-monitor",
+                "movewindow mon:DP-1 silent",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_reconcile_skips_stale_geometry_when_saved_monitor_is_missing() {
+        let mut target = make_client(
+            "obsidian",
+            2,
+            [50, 100],
+            [1200, 900],
+            false,
+            0,
+            "obsidian",
+            vec![],
+            None,
+        );
+        target.monitor = "DP-1".to_string();
+        let current = make_reconcile_window(
+            "0xmissing-monitor",
+            "obsidian",
+            "obsidian",
+            2,
+            1,
+            [4000, 4000],
+            [300, 200],
+        );
+
+        let commands = build_reconcile_dispatch_commands_with_geometry(
+            &target,
+            &current,
+            Some("DP-2"),
+            target.at,
+            target.size,
+            false,
+        );
+
+        assert!(commands.is_empty());
     }
 
     #[test]

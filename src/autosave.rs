@@ -1,7 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -61,8 +61,140 @@ fn timer_content() -> String {
         .to_string()
 }
 
-pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+fn ensure_no_symlink_ancestors(path: &Path) -> std::io::Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("refusing symlinked autosave path: {}", current.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_safe_parent_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("autosave parent is not a directory: {}", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o022 != 0 && metadata.permissions().mode() & 0o1000 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "autosave parent is writable by another user: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_owned_directory(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("autosave path is not a directory: {}", path.display()),
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "autosave directory is not user-owned and private: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_systemd_directory(systemd_dir: &Path) -> std::io::Result<()> {
+    ensure_no_symlink_ancestors(systemd_dir)?;
+    if let Some(parent) = systemd_dir.parent() {
+        ensure_no_symlink_ancestors(parent)?;
+        if parent.exists() {
+            ensure_safe_parent_directory(parent)?;
+        }
+    }
     std::fs::create_dir_all(systemd_dir)?;
+    ensure_no_symlink_ancestors(systemd_dir)?;
+    ensure_owned_directory(systemd_dir)
+}
+
+fn ensure_existing_systemd_directory(systemd_dir: &Path) -> std::io::Result<bool> {
+    ensure_no_symlink_ancestors(systemd_dir)?;
+    match std::fs::symlink_metadata(systemd_dir) {
+        Ok(_metadata) => {
+            ensure_owned_directory(systemd_dir)?;
+            if let Some(parent) = systemd_dir.parent() {
+                ensure_safe_parent_directory(parent)?;
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_private_marker(path: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "autosave transaction marker is not a regular file: {}",
+                path.display()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "autosave transaction marker is not user-owned: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(0o600);
+            std::fs::set_permissions(path, permissions)?;
+        }
+        let verified = std::fs::symlink_metadata(path)?;
+        if verified.uid() != unsafe { libc::geteuid() }
+            || verified.permissions().mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "autosave transaction marker is not private: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
+    ensure_systemd_directory(systemd_dir)?;
     recover_install_transaction(systemd_dir)?;
 
     if which::which("hyprloom").is_err() {
@@ -107,7 +239,16 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
 
 fn read_optional_unit(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_file() => std::fs::read(path).map(Some),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            #[cfg(unix)]
+            if metadata.uid() != unsafe { libc::geteuid() } {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("systemd unit is not user-owned: {}", path.display()),
+                ));
+            }
+            std::fs::read(path).map(Some)
+        }
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("systemd unit is not a regular file: {}", path.display()),
@@ -125,16 +266,30 @@ fn write_optional_backup(path: &Path, contents: Option<&[u8]>) -> std::io::Resul
 }
 
 fn write_transaction_marker(systemd_dir: &Path, phase: &str) -> std::io::Result<()> {
-    atomic_write(
-        &systemd_dir.join(TRANSACTION_MARKER_NAME),
-        format!("{phase}\n").as_bytes(),
-    )
+    let path = systemd_dir.join(TRANSACTION_MARKER_NAME);
+    atomic_write(&path, format!("{phase}\n").as_bytes())?;
+    ensure_private_marker(&path)
 }
 
 fn recover_install_transaction(systemd_dir: &Path) -> std::io::Result<()> {
+    if !ensure_existing_systemd_directory(systemd_dir)? {
+        return Ok(());
+    }
     let marker_path = systemd_dir.join(TRANSACTION_MARKER_NAME);
-    let marker = match std::fs::read_to_string(&marker_path) {
-        Ok(marker) => marker.trim().to_string(),
+    let marker = match std::fs::symlink_metadata(&marker_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            ensure_private_marker(&marker_path)?;
+            std::fs::read_to_string(&marker_path)?.trim().to_string()
+        }
+        Ok(_) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "autosave transaction marker is not a regular file: {}",
+                    marker_path.display()
+                ),
+            ));
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
@@ -239,6 +394,9 @@ pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
     // If an earlier install was interrupted, settle that transaction before
     // deleting units.  This keeps backup files and the transaction marker from
     // being stranded by an uninstall performed during recovery.
+    if !ensure_existing_systemd_directory(systemd_dir)? {
+        return Ok(());
+    }
     recover_install_transaction(systemd_dir)?;
     for timer in [TIMER_NAME, LEGACY_TIMER_NAME] {
         disable_timer(timer);
@@ -251,17 +409,30 @@ pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
         LEGACY_TIMER_NAME,
     ] {
         let path = systemd_dir.join(unit);
-        if path.exists() {
-            std::fs::remove_file(path)?;
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(path)?,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to remove non-regular systemd unit: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
     }
     Ok(())
 }
 
 pub fn is_installed(systemd_dir: &Path) -> bool {
-    [TIMER_NAME, LEGACY_TIMER_NAME]
-        .iter()
-        .any(|name| systemd_dir.join(name).exists())
+    [TIMER_NAME, LEGACY_TIMER_NAME].iter().any(|name| {
+        std::fs::symlink_metadata(systemd_dir.join(name))
+            .map(|metadata| metadata.file_type().is_file())
+            .unwrap_or(false)
+    })
 }
 
 pub fn is_active() -> bool {
@@ -422,5 +593,34 @@ mod tests {
         assert!(!service_backup.exists());
         assert!(!timer_backup.exists());
         assert!(!dir.path().join(TRANSACTION_MARKER_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_install_rejects_symlinked_systemd_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real_dir = root.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let linked_dir = root.path().join("linked");
+        symlink(&real_dir, &linked_dir).unwrap();
+
+        assert!(install(&linked_dir).is_err());
+        assert!(!real_dir.join(SERVICE_NAME).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_recovery_rejects_symlinked_transaction_marker() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "prepared\n").unwrap();
+        symlink(outside.path(), dir.path().join(TRANSACTION_MARKER_NAME)).unwrap();
+
+        assert!(recover_install_transaction(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), "prepared\n");
     }
 }
