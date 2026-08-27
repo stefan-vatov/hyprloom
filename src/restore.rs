@@ -503,11 +503,6 @@ fn restore_session_with_process_info(
     // Fetch current windows once to detect already-running duplicates.
     let mut consumed_existing = HashSet::new();
     let current_monitors = hyprctl.get_monitors()?;
-    let existing_clients = if dry_run {
-        Vec::new()
-    } else {
-        observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?
-    };
 
     // Detect if profile-based Brave restore applies.
     let has_brave_profiles =
@@ -517,10 +512,10 @@ fn restore_session_with_process_info(
     } else {
         0
     };
-    let mut brave_windows_accounted = existing_clients
-        .iter()
-        .filter(|client| is_brave_hypr_client(&client.client))
-        .count();
+    // Only positively matched or causally correlated profile targets count as
+    // accounted for.  An ambiguous shared-process Brave window is not enough
+    // evidence to suppress a missing profile launch.
+    let mut brave_targets_accounted = 0;
 
     // Group by workspace (BTreeMap gives us sorted workspace order for free).
     let mut by_workspace: BTreeMap<i32, Vec<&SessionClient>> = BTreeMap::new();
@@ -556,28 +551,16 @@ fn restore_session_with_process_info(
                 target_monitor_is_available(&current_monitors, &client.monitor);
             let restore_client = adapt_client_geometry(client, &session.monitors, target_monitor);
 
-            if dry_run {
-                let cmds =
-                    build_dispatch_commands_for_monitor(&restore_client, target_monitor_available);
-                report.details.push(format!(
-                    "[dry-run] ws={} {} → {}",
-                    ws, client.class, client.launch.command
-                ));
-                for cmd in &cmds {
-                    report.details.push(format!("  hyprctl dispatch {cmd}"));
-                }
-                report.restored += 1;
-                continue;
-            }
-
             // An existing target is repaired in place, even when it is on a
             // different workspace or monitor.  This keeps the legacy command
             // useful on its own while sharing the same placement semantics as
             // --reconcile.
+            let current_existing =
+                observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
             if let Some(existing_index) =
-                find_existing_restore_match(client, &existing_clients, &consumed_existing, config)
+                find_existing_restore_match(client, &current_existing, &consumed_existing, config)
             {
-                let current = existing_clients[existing_index].clone();
+                let current = current_existing[existing_index].clone();
                 consumed_existing.insert(current.client.address.clone());
                 let commands = build_reconcile_dispatch_commands_with_geometry(
                     &restore_client,
@@ -589,10 +572,21 @@ fn restore_session_with_process_info(
                 );
                 if commands.is_empty() {
                     report.details.push(format!(
-                        "SKIP: {} already on ws={}",
-                        current.client.class, client.workspace
+                        "{}: {} already on ws={}",
+                        if dry_run { "[dry-run]" } else { "SKIP" },
+                        current.client.class,
+                        client.workspace
                     ));
                     report.skipped += 1;
+                } else if dry_run {
+                    report.details.push(format!(
+                        "[dry-run] repair {} at address {}",
+                        client.class, current.client.address
+                    ));
+                    for command in &commands {
+                        report.details.push(format!("  hyprctl dispatch {command}"));
+                    }
+                    report.restored += 1;
                 } else {
                     match dispatch_existing_repairs(&current.client, &commands, hyprctl) {
                         Ok(()) => {
@@ -613,6 +607,20 @@ fn restore_session_with_process_info(
                         }
                     }
                 }
+                continue;
+            }
+
+            if dry_run {
+                let cmds =
+                    build_dispatch_commands_for_monitor(&restore_client, target_monitor_available);
+                report.details.push(format!(
+                    "[dry-run] ws={} {} → {}",
+                    ws, client.class, client.launch.command
+                ));
+                for cmd in &cmds {
+                    report.details.push(format!("  hyprctl dispatch {cmd}"));
+                }
+                report.restored += 1;
                 continue;
             }
 
@@ -638,7 +646,7 @@ fn restore_session_with_process_info(
                 continue;
             }
 
-            match restore_single_client_with_launcher_and_process_info(
+            match restore_single_client_with_launcher_and_process_info_with_address(
                 &restore_client,
                 hyprctl,
                 process_info,
@@ -646,9 +654,10 @@ fn restore_session_with_process_info(
                 &RealProcessLauncher,
                 target_monitor_available,
             ) {
-                Ok(msg) => {
+                Ok(restored) => {
+                    consumed_existing.insert(restored.address);
                     if verbose {
-                        report.details.push(msg);
+                        report.details.push(restored.message);
                     }
                     report.restored += 1;
                 }
@@ -680,31 +689,20 @@ fn restore_session_with_process_info(
                 target_monitor_is_available(&current_monitors, &target.client.monitor);
             target.client =
                 adapt_client_geometry(&target.client, &session.monitors, target_monitor);
-            if dry_run {
-                report.details.push(format!(
-                    "[dry-run] {} → ws={}",
-                    target.label, target.client.workspace
-                ));
-                for command in
-                    build_dispatch_commands_for_monitor(&target.client, target_monitor_available)
-                {
-                    report.details.push(format!("  hyprctl dispatch {command}"));
-                }
-                report.restored += 1;
-                continue;
-            }
 
             // Profile-aware normal restore is idempotent too.  Reuse a
             // currently open window whose profile was positively identified
             // before considering a new browser launch; otherwise every plain
             // `restore` would duplicate already-open Brave profiles.
+            let current_existing =
+                observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
             if let Some(existing_index) = find_existing_restore_match(
                 &target.client,
-                &existing_clients,
+                &current_existing,
                 &consumed_existing,
                 config,
             ) {
-                let current = existing_clients[existing_index].clone();
+                let current = current_existing[existing_index].clone();
                 consumed_existing.insert(current.client.address.clone());
                 let commands = build_reconcile_dispatch_commands_with_geometry(
                     &target.client,
@@ -740,13 +738,28 @@ fn restore_session_with_process_info(
                         }
                     }
                 }
+                brave_targets_accounted += 1;
                 continue;
             }
 
-            if brave_windows_accounted >= brave_target_count
+            if dry_run {
+                report.details.push(format!(
+                    "[dry-run] {} → ws={}",
+                    target.label, target.client.workspace
+                ));
+                for command in
+                    build_dispatch_commands_for_monitor(&target.client, target_monitor_available)
+                {
+                    report.details.push(format!("  hyprctl dispatch {command}"));
+                }
+                report.restored += 1;
+                continue;
+            }
+
+            if brave_targets_accounted >= brave_target_count
                 && has_ambiguous_profile_candidate(
                     &target.client,
-                    &existing_clients,
+                    &current_existing,
                     &consumed_existing,
                     config,
                 )
@@ -786,9 +799,8 @@ fn restore_session_with_process_info(
                 target_monitor_available,
             ) {
                 Ok(restored) => {
-                    if is_brave_client(&target.client) {
-                        brave_windows_accounted += 1;
-                    }
+                    consumed_existing.insert(restored.address);
+                    brave_targets_accounted += 1;
                     if verbose {
                         report.details.push(restored.message);
                     }
@@ -1046,6 +1058,18 @@ fn replace_session_inner(
         }
     }
 
+    // An empty desktop has no close dispatch to mark the transition into the
+    // destructive phase.  Record that the replacement has nevertheless
+    // started before launching any target, so an interruption during launch
+    // still recovers from the safety snapshot instead of treating the marker
+    // as a harmless preflight.
+    if !close_started {
+        if let Some((backup_name, sessions_dir)) = options.marker {
+            crate::session::mark_replace_in_progress(backup_name, sessions_dir)
+                .map_err(|error| RestoreError::Transaction(error.to_string()))?;
+        }
+    }
+
     let timeout = Duration::from_millis(config.general.window_detect_timeout_ms.clamp(
         crate::config::MIN_WINDOW_DETECT_TIMEOUT_MS,
         crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS,
@@ -1149,10 +1173,7 @@ pub fn reconcile_session_with_launcher(
         .iter()
         .filter(|target| is_brave_client(&target.client))
         .count();
-    let mut brave_windows_accounted = observed
-        .iter()
-        .filter(|client| is_brave_hypr_client(&client.client))
-        .count();
+    let mut brave_targets_accounted = 0;
 
     for (target_index, target) in targets.iter().enumerate() {
         let target_client = &target_clients[target_index];
@@ -1208,6 +1229,9 @@ pub fn reconcile_session_with_launcher(
         if let Some((current, match_kind)) = matched {
             used_current_addresses.insert(current.client.address.clone());
             report.matched += 1;
+            if is_brave_client(target_client) {
+                brave_targets_accounted += 1;
+            }
 
             let target_monitor_available =
                 target_monitor_is_available(&current_monitors, &target_client.monitor);
@@ -1311,7 +1335,7 @@ pub fn reconcile_session_with_launcher(
             continue;
         }
 
-        if brave_windows_accounted >= brave_target_count
+        if brave_targets_accounted >= brave_target_count
             && has_ambiguous_profile_candidate(
                 target_client,
                 &observed,
@@ -1338,7 +1362,7 @@ pub fn reconcile_session_with_launcher(
             Ok(restored) => {
                 used_current_addresses.insert(restored.address);
                 if is_brave_client(target_client) {
-                    brave_windows_accounted += 1;
+                    brave_targets_accounted += 1;
                 }
                 report.launched += 1;
                 if verbose {
@@ -1936,6 +1960,7 @@ fn restore_single_client_with_launcher(
     )
 }
 
+#[cfg(test)]
 fn restore_single_client_with_launcher_and_process_info(
     client: &SessionClient,
     hyprctl: &dyn HyprctlClient,
@@ -2113,15 +2138,12 @@ fn candidate_matches_profile(
         return true;
     };
     match find_profile_directory(process_info, candidate.pid) {
-        Some(candidate_profile) => {
-            candidate_profile.eq_ignore_ascii_case(target_profile)
-                || (is_brave_client(target) && existing_pids.contains(&candidate.pid))
-        }
+        Some(candidate_profile) => candidate_profile.eq_ignore_ascii_case(target_profile),
         // A shared Brave browser process can advertise the profile of a
         // different window.  For a newly-created Brave candidate, the
         // single-candidate/settle checks provide the remaining correlation;
         // never apply this unknown-profile fallback to other applications.
-        None => is_brave_client(target),
+        None => is_brave_client(target) && existing_pids.contains(&candidate.pid),
     }
 }
 
@@ -2319,7 +2341,7 @@ fn build_dispatch_commands_for_monitor(
         addr
     ));
     if target_monitor_available && !client.monitor.is_empty() {
-        cmds.extend(monitor_move_commands(&client.monitor, addr));
+        cmds.extend(monitor_move_commands(&client.monitor, "0xNEW"));
     }
     if client.monitor.is_empty() || target_monitor_available {
         cmds.extend([
@@ -2655,8 +2677,16 @@ mod tests {
             Err(ProcessError::NotFound(pid))
         }
 
-        fn get_children(&self, _pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
-            Ok(vec![])
+        fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            if pid == 1000 {
+                Ok(vec![ChildProcess {
+                    pid: 2000,
+                    cwd: PathBuf::from("/tmp"),
+                    cmdline: "brave --profile-directory=Default".to_string(),
+                }])
+            } else {
+                Ok(vec![])
+            }
         }
 
         fn get_cmdline(&self, pid: u32) -> Result<String, ProcessError> {
@@ -3218,6 +3248,14 @@ mod tests {
             !cmds.iter().any(|c| c.starts_with("fullscreen")),
             "non-fullscreen client should not have fullscreen dispatch"
         );
+        assert!(
+            cmds.iter().any(|c| c == "focuswindow address:0xNEW"),
+            "dry-run monitor placement should target the placeholder address once"
+        );
+        assert!(
+            !cmds.iter().any(|c| c.contains("address:address:")),
+            "dry-run monitor placement must not double-prefix the address"
+        );
     }
 
     #[test]
@@ -3486,10 +3524,10 @@ mod tests {
         assert!(mock.dispatches().is_empty());
     }
 
-    // ── Test: dry-run does NOT skip duplicates ──────────────────────────
+    // ── Test: dry-run accounts for already-open windows ─────────────────
 
     #[test]
-    fn test_restore_dry_run_ignores_duplicates() {
+    fn test_restore_dry_run_accounts_for_duplicates() {
         let existing_window = HyprClient {
             address: "0xexisting".to_string(),
             class: "kitty".to_string(),
@@ -3510,7 +3548,8 @@ mod tests {
             pid: 9999,
         };
 
-        // Even though the existing window matches, dry-run should ignore it.
+        // The dry-run should report the existing window instead of planning a
+        // duplicate launch.
         let mock = MockHyprctl::new(vec![vec![existing_window]]);
 
         let client = make_client(
@@ -3529,8 +3568,8 @@ mod tests {
 
         let report = restore_session(&session, &mock, &config, true, true).unwrap();
 
-        assert_eq!(report.restored, 1, "dry-run should not skip duplicates");
-        assert_eq!(report.skipped, 0);
+        assert_eq!(report.restored, 0);
+        assert_eq!(report.skipped, 1);
         assert_eq!(report.failed, 0);
         // No real dispatches in dry-run.
         assert!(mock.dispatches().is_empty());

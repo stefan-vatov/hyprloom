@@ -842,5 +842,14 @@ fn safety_recovery_config(config: &hyprloom::config::Config) -> hyprloom::config
     // ordinary snapshots.  The recovery copy must therefore include those
     // clients too; otherwise a failed replacement cannot restore them.
     recovery_config.filters.ignore_classes.clear();
+    // A safety snapshot must preserve every currently open Brave profile, not
+    // only the profiles selected for ordinary restore.  Otherwise an active
+    // unmapped profile can disappear when recovery reconstructs the snapshot
+    // through the profile-aware path.
+    for (class, app) in &mut recovery_config.apps {
+        if class.eq_ignore_ascii_case("brave-browser") {
+            app.profile_workspaces = None;
+        }
+    }
     recovery_config
 }
