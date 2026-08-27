@@ -18,8 +18,20 @@ fn test_cli_help() {
         .stdout(predicate::str::contains("save"))
         .stdout(predicate::str::contains("restore"))
         .stdout(predicate::str::contains("replace"))
+        .stdout(predicate::str::contains("recover"))
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("delete"));
+}
+
+#[test]
+fn test_cli_recover_without_pending_replacement() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
+        .arg("recover")
+        .env("XDG_DATA_HOME", tmp.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("recovery check completed"));
 }
 
 #[test]

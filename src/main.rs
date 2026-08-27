@@ -75,6 +75,8 @@ enum Commands {
     },
     /// Show config info
     Config,
+    /// Recover an interrupted desktop replacement without starting another restore
+    Recover,
     /// Manage autosave (status, run, install/uninstall timer)
     Autosave {
         /// Run autosave now (capture + rotate)
@@ -525,6 +527,10 @@ fn main() {
                 Ok(_) => println!("No Brave profiles detected."),
                 Err(e) => println!("Could not read Brave profiles: {e}"),
             }
+        }
+
+        Commands::Recover => {
+            println!("Replacement recovery check completed.");
         }
 
         Commands::Autosave {

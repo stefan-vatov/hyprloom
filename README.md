@@ -56,6 +56,7 @@ hyprloom restore work      # restores "work"
 hyprloom restore --dry-run # preview without executing
 hyprloom restore work --reconcile # repair/reuse open windows; launch only missing ones
 hyprloom replace work      # safety backup, close current windows, then restore work (with recovery on failure)
+hyprloom recover           # recover an interrupted replacement without starting a restore
 hyprloom restore --max-age 24h  # skip if session older than 24h
 hyprloom restore --on-login     # print exec-once line for hyprland.conf
 

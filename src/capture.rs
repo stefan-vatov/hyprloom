@@ -7,6 +7,7 @@ use crate::process::{
 use crate::session::{LaunchInfo, Monitor, Session, SessionClient};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 // ── Error ──────────────────────────────────────────────────────────────────
 
@@ -205,11 +206,26 @@ fn build_launch_info(
     app_config: Option<&AppConfig>,
     process_info: &dyn ProcessInfoProvider,
 ) -> LaunchInfo {
+    // Omarchy web apps expose a Chrome window class that is not an executable
+    // (for example, `chrome-chatgpt.com__-Default`).  Their desktop entries
+    // contain the authoritative launcher and URL, so retain that launch
+    // contract instead of falling back to the non-existent class binary.
+    let desktop_launch = if app_config
+        .and_then(|config| config.binary.as_ref())
+        .is_none()
+    {
+        find_webapp_launch_info(client)
+    } else {
+        None
+    };
     let binary = app_config
         .and_then(|a| a.binary.clone())
+        .or_else(|| desktop_launch.as_ref().map(|launch| launch.command.clone()))
         .unwrap_or_else(|| {
             if is_ghostty_class(&client.class) || is_ghostty_class(&client.initial_class) {
                 "ghostty".to_string()
+            } else if is_brave_class(&client.class) || is_brave_class(&client.initial_class) {
+                "brave".to_string()
             } else {
                 client.class.clone()
             }
@@ -220,10 +236,13 @@ fn build_launch_info(
         .and_then(|a| a.capture_last_command)
         .unwrap_or(false);
 
-    let mut args: Vec<String> = Vec::new();
+    let mut args: Vec<String> = desktop_launch
+        .as_ref()
+        .map(|launch| launch.args.clone())
+        .unwrap_or_default();
     let mut hint: Option<String> = None;
 
-    if capture_cwd || capture_cmd {
+    if desktop_launch.is_none() && (capture_cwd || capture_cmd) {
         if let Some(shell) = select_terminal_process(process_info, client.pid) {
             // Find the actual shell child, skipping helper processes like
             // kitty's "kitten __atexit__" which has CWD=/home but is not the
@@ -297,6 +316,197 @@ fn launch_cwd_arg(args: &[String]) -> Option<&str> {
 
 fn is_ghostty_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("ghostty") || class.eq_ignore_ascii_case("com.mitchellh.ghostty")
+}
+
+fn is_brave_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("brave-browser")
+}
+
+#[derive(Debug, Clone)]
+struct DesktopLaunch {
+    command: String,
+    args: Vec<String>,
+}
+
+const OMARCHY_WEBAPP_LAUNCHERS: [&str; 2] =
+    ["omarchy-launch-or-focus-webapp", "omarchy-launch-or-focus"];
+
+fn find_webapp_launch_info(client: &crate::hyprctl::HyprClient) -> Option<LaunchInfo> {
+    let identities = [client.class.as_str(), client.initial_class.as_str()];
+    if !identities.iter().any(|class| is_webapp_class(class)) {
+        return None;
+    }
+
+    find_webapp_launch_info_in_directories(client, &desktop_application_directories())
+}
+
+fn find_webapp_launch_info_in_directories(
+    client: &crate::hyprctl::HyprClient,
+    directories: &[PathBuf],
+) -> Option<LaunchInfo> {
+    let identities = [client.class.as_str(), client.initial_class.as_str()];
+    for directory in directories {
+        let entries = match std::fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("desktop") {
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(_) => continue,
+            };
+            if let Some(launch) = parse_webapp_desktop_file(&contents, &identities) {
+                return Some(LaunchInfo {
+                    command: launch.command,
+                    args: launch.args,
+                    hint: None,
+                });
+            }
+        }
+    }
+
+    None
+}
+
+fn desktop_application_directories() -> Vec<PathBuf> {
+    let mut data_directories = Vec::new();
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        if !data_home.is_empty() {
+            data_directories.push(PathBuf::from(data_home));
+        }
+    } else if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            data_directories.push(PathBuf::from(home).join(".local/share"));
+        }
+    }
+
+    if let Some(data_dirs) = std::env::var_os("XDG_DATA_DIRS") {
+        data_directories.extend(
+            std::env::split_paths(&data_dirs).filter(|directory| !directory.as_os_str().is_empty()),
+        );
+    } else {
+        data_directories.extend([
+            PathBuf::from("/usr/local/share"),
+            PathBuf::from("/usr/share"),
+        ]);
+    }
+    // Omarchy's bundled application entries live here on a standard install,
+    // even when the host's XDG_DATA_DIRS does not mention the parent.
+    data_directories.push(PathBuf::from("/usr/share/omarchy"));
+
+    data_directories
+        .into_iter()
+        .map(|directory| directory.join("applications"))
+        .fold(Vec::new(), |mut unique, directory| {
+            if !unique.contains(&directory) {
+                unique.push(directory);
+            }
+            unique
+        })
+}
+
+fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<DesktopLaunch> {
+    let mut exec = None;
+    let mut startup_class = None;
+    for line in contents.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("Exec=") {
+            exec = Some(value);
+        } else if let Some(value) = line.strip_prefix("StartupWMClass=") {
+            startup_class = Some(value.trim());
+        }
+    }
+
+    let tokens = tokenize_desktop_exec(exec?)?;
+    let command = tokens.first()?.as_str();
+    if !OMARCHY_WEBAPP_LAUNCHERS
+        .iter()
+        .any(|launcher| launcher.eq_ignore_ascii_case(command))
+    {
+        return None;
+    }
+
+    let class_argument_matches = tokens
+        .get(1)
+        .map(|argument| {
+            identities
+                .iter()
+                .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(argument))
+        })
+        .unwrap_or(false);
+    let startup_class_matches = startup_class
+        .map(|startup| {
+            identities
+                .iter()
+                .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(startup))
+        })
+        .unwrap_or(false);
+    if !class_argument_matches && !startup_class_matches {
+        return None;
+    }
+
+    Some(DesktopLaunch {
+        command: tokens[0].clone(),
+        args: tokens.into_iter().skip(1).collect(),
+    })
+}
+
+fn tokenize_desktop_exec(value: &str) -> Option<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in value.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active_quote) = quote {
+            if character == active_quote {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '\'' | '"' => quote = Some(character),
+            character if character.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            character => current.push(character),
+        }
+    }
+
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    (!tokens.is_empty()).then_some(tokens)
+}
+
+fn is_webapp_class(class: &str) -> bool {
+    class
+        .get(.."chrome-".len())
+        .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
+        .unwrap_or(false)
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -568,6 +778,69 @@ mod tests {
             "a lone Brave window without a profile flag is the Default profile"
         );
         assert!(!session.clients[0].profile_identity_ambiguous);
+    }
+
+    #[test]
+    fn test_capture_defaults_brave_to_its_executable() {
+        let hyprctl = MockHyprctl {
+            clients: vec![make_hypr_client("brave-browser", 3002)],
+            monitors: vec![make_monitor("DP-1")],
+        };
+
+        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default())
+            .expect("capture failed");
+
+        assert_eq!(session.clients[0].launch.command, "brave");
+    }
+
+    #[test]
+    fn test_parse_omarchy_webapp_desktop_entry() {
+        let contents = r#"
+            [Desktop Entry]
+            Name=YouTube
+            Exec=omarchy-launch-or-focus chrome-youtube.com__-Profile_1 "omarchy-launch-webapp https://youtube.com/ --profile-directory='Profile 1'"
+        "#;
+
+        let launch = parse_webapp_desktop_file(contents, &["chrome-youtube.com__-Profile_1", ""])
+            .expect("webapp desktop entry should be recognized");
+
+        assert_eq!(launch.command, "omarchy-launch-or-focus");
+        assert_eq!(
+            launch.args,
+            vec![
+                "chrome-youtube.com__-Profile_1",
+                "omarchy-launch-webapp https://youtube.com/ --profile-directory='Profile 1'"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_webapp_entry_rejects_unrelated_class() {
+        let contents =
+            "Exec=omarchy-launch-or-focus-webapp chrome-chatgpt.com__-Default https://chatgpt.com/";
+
+        assert!(parse_webapp_desktop_file(contents, &["chrome-other.com__-Default"]).is_none());
+    }
+
+    #[test]
+    fn test_find_webapp_launch_info_uses_matching_desktop_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("ChatGPT.desktop"),
+            "[Desktop Entry]\nExec=omarchy-launch-or-focus-webapp chrome-chatgpt.com__-Default https://chatgpt.com/\n",
+        )
+        .unwrap();
+        let client = make_hypr_client("chrome-chatgpt.com__-Default", 3003);
+
+        let launch =
+            find_webapp_launch_info_in_directories(&client, &[directory.path().to_path_buf()])
+                .expect("matching webapp desktop entry should be found");
+
+        assert_eq!(launch.command, "omarchy-launch-or-focus-webapp");
+        assert_eq!(
+            launch.args,
+            vec!["chrome-chatgpt.com__-Default", "https://chatgpt.com/"]
+        );
     }
 
     #[test]

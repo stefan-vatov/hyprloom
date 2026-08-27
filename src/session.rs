@@ -1,6 +1,6 @@
 use crate::config::MAX_AUTOSAVE_RETAIN;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::cmp::Reverse;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -16,6 +16,23 @@ pub const MAX_SESSION_MONITORS: usize = 128;
 pub const MAX_SESSION_BRAVE_PROFILES: usize = 1_024;
 pub const MAX_SESSION_ARGS: usize = 2_048;
 pub const MAX_SESSION_STRING_BYTES: usize = 64 * 1024;
+
+// Older session writers sometimes emitted JSON null for fields that were
+// introduced as optional compatibility fields.  Treat null the same as a
+// missing value so those snapshots remain usable after an upgrade.
+fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(|value| value.unwrap_or_default())
+}
+
+fn deserialize_nullable_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<bool>::deserialize(deserializer).map(|value| value.unwrap_or_default())
+}
 
 // === Hyprloom session structs (what we save to disk) ===
 
@@ -58,26 +75,26 @@ pub struct SessionClient {
     /// Initial Hyprland app identity.  These fields are optional in spirit:
     /// older session files do not contain them and reconciliation falls back
     /// to `class` and `title` when they are empty.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub initial_class: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub initial_title: String,
     pub workspace: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub workspace_name: String,
     pub monitor: String,
     pub at: [i32; 2],
     pub size: [i32; 2],
     pub floating: bool,
     pub fullscreen: u8,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_bool")]
     pub pinned: bool,
     #[serde(default)]
     pub profile_directory: Option<String>,
     /// True when the captured browser process did not provide a safe
     /// window-specific profile identity.  Automatic restore must not use such
     /// a client to move or launch a guessed Brave profile.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_nullable_bool")]
     pub profile_identity_ambiguous: bool,
     pub focus_history_id: i32,
     pub launch: LaunchInfo,
@@ -1171,6 +1188,44 @@ mod tests {
         assert_eq!(client.workspace_name, "");
         assert!(!client.pinned);
         assert!(client.profile_directory.is_none());
+    }
+
+    #[test]
+    fn test_session_backward_compat_accepts_null_new_client_fields() {
+        let json = r#"{
+            "name": "old-client-null-fields",
+            "created_at": "2026-03-08T10:00:00Z",
+            "hyprland_version": "0.54.0",
+            "monitors": [],
+            "clients": [{
+                "class": "kitty",
+                "title": "kitty",
+                "initial_class": null,
+                "initial_title": null,
+                "workspace": 1,
+                "workspace_name": null,
+                "monitor": "DP-1",
+                "at": [0, 0],
+                "size": [800, 600],
+                "floating": false,
+                "fullscreen": 0,
+                "pinned": null,
+                "profile_directory": null,
+                "profile_identity_ambiguous": null,
+                "focus_history_id": 0,
+                "launch": {"command": "kitty", "args": [], "hint": null}
+            }]
+        }"#;
+
+        let session: Session =
+            serde_json::from_str(json).expect("null compatibility fields must load");
+        let client = &session.clients[0];
+        assert_eq!(client.initial_class, "");
+        assert_eq!(client.initial_title, "");
+        assert_eq!(client.workspace_name, "");
+        assert!(!client.pinned);
+        assert!(client.profile_directory.is_none());
+        assert!(!client.profile_identity_ambiguous);
     }
 
     #[test]

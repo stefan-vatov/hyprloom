@@ -618,6 +618,13 @@ fn restore_session_with_process_info(
             // --reconcile.
             let current_existing =
                 observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
+            if current_existing.len() > MAX_RECONCILIATION_WINDOWS {
+                return Err(RestoreError::TooManyWindows {
+                    targets: target_count,
+                    current: current_existing.len(),
+                    limit: MAX_RECONCILIATION_WINDOWS,
+                });
+            }
             if let Some(existing_index) =
                 find_existing_restore_match(client, &current_existing, &consumed_existing, config)
             {
@@ -771,6 +778,13 @@ fn restore_session_with_process_info(
             // `restore` would duplicate already-open Brave profiles.
             let current_existing =
                 observe_clients_with_monitors(hyprctl, process_info, config, &current_monitors)?;
+            if current_existing.len() > MAX_RECONCILIATION_WINDOWS {
+                return Err(RestoreError::TooManyWindows {
+                    targets: target_count,
+                    current: current_existing.len(),
+                    limit: MAX_RECONCILIATION_WINDOWS,
+                });
+            }
             if let Some(existing_index) = find_existing_restore_match(
                 &target.client,
                 &current_existing,
@@ -833,6 +847,23 @@ fn restore_session_with_process_info(
             }
 
             if dry_run {
+                let launch_command = build_launch_command(&target.client);
+                if !launch_command_is_trusted(&target.client, config) {
+                    report.details.push(format!(
+                        "[dry-run] FAIL: launch command '{}' for {} is not authorized by app identity or config",
+                        launch_command[0], target.label
+                    ));
+                    report.failed += 1;
+                    continue;
+                }
+                if resolve_launch_binary(&launch_command[0], &target.label).is_err() {
+                    report.details.push(format!(
+                        "[dry-run] FAIL: binary '{}' not found for {}",
+                        launch_command[0], target.label
+                    ));
+                    report.failed += 1;
+                    continue;
+                }
                 report.details.push(format!(
                     "[dry-run] {} → ws={}",
                     target.label, target.client.workspace
@@ -2534,6 +2565,30 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
         return true;
     }
 
+    if is_brave_client(client) && command.eq_ignore_ascii_case("brave") {
+        return true;
+    }
+
+    // Omarchy Chrome web apps are represented by classes such as
+    // `chrome-chatgpt.com__-Default`, while their executable is the
+    // user-facing launcher stored in the matching .desktop entry.
+    if is_webapp_class(client)
+        && ["omarchy-launch-or-focus-webapp", "omarchy-launch-or-focus"]
+            .iter()
+            .any(|launcher| launcher.eq_ignore_ascii_case(&command))
+    {
+        return client
+            .launch
+            .args
+            .first()
+            .map(|class| {
+                [client.class.as_str(), client.initial_class.as_str()]
+                    .iter()
+                    .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(class))
+            })
+            .unwrap_or(false);
+    }
+
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
         .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command))
@@ -2572,6 +2627,17 @@ fn is_ghostty_class(client: &SessionClient) -> bool {
         .any(|class| {
             class.eq_ignore_ascii_case("ghostty")
                 || class.eq_ignore_ascii_case("com.mitchellh.ghostty")
+        })
+}
+
+fn is_webapp_class(client: &SessionClient) -> bool {
+    [client.class.as_str(), client.initial_class.as_str()]
+        .iter()
+        .any(|class| {
+            class
+                .get(.."chrome-".len())
+                .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
+                .unwrap_or(false)
         })
 }
 
@@ -5563,6 +5629,43 @@ mod tests {
         assert_eq!(command[0], "ghostty");
         assert_eq!(command[1], "--working-directory");
         assert_eq!(command[2], "/tmp/project");
+    }
+
+    #[test]
+    fn test_default_brave_binary_is_trusted_without_app_config() {
+        let client = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "brave",
+            vec![],
+            None,
+        );
+
+        assert!(launch_command_is_trusted(&client, &Config::default()));
+    }
+
+    #[test]
+    fn test_omarchy_webapp_launcher_is_trusted_for_matching_class() {
+        let client = make_client(
+            "chrome-chatgpt.com__-Default",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "omarchy-launch-or-focus-webapp",
+            vec![
+                "chrome-chatgpt.com__-Default".to_string(),
+                "https://chatgpt.com/".to_string(),
+            ],
+            None,
+        );
+
+        assert!(launch_command_is_trusted(&client, &Config::default()));
     }
 
     #[test]
