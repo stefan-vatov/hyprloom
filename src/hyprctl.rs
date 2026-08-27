@@ -66,6 +66,13 @@ pub enum HyprctlError {
 
 pub trait HyprctlClient {
     fn get_clients(&self) -> Result<Vec<HyprClient>, HyprctlError>;
+    /// Return the address of the currently focused window, when Hyprland has
+    /// one.  This is a window-level correlation signal for applications such
+    /// as Chromium and Brave that may hand a launch request to an existing
+    /// browser process.
+    fn get_active_window_address(&self) -> Result<Option<String>, HyprctlError> {
+        Ok(None)
+    }
     fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError>;
     /// Dispatch a Hyprland command; `args` is the full argument string
     /// (e.g. `"workspace 2"`).
@@ -98,6 +105,18 @@ impl HyprctlClient for RealHyprctl {
             ));
         }
         Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    fn get_active_window_address(&self) -> Result<Option<String>, HyprctlError> {
+        let output = Command::new("hyprctl")
+            .args(["activewindow", "-j"])
+            .output()?;
+        if !output.status.success() {
+            return Err(HyprctlError::CommandFailed(
+                String::from_utf8_lossy(&output.stderr).to_string(),
+            ));
+        }
+        Ok(parse_active_window_address(&output.stdout)?)
     }
 
     fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError> {
@@ -167,6 +186,15 @@ impl HyprctlClient for RealHyprctl {
 
 fn escape_batch_command(command: &str) -> String {
     command.replace('\\', "\\\\").replace(';', "\\;")
+}
+
+fn parse_active_window_address(payload: &[u8]) -> Result<Option<String>, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_slice(payload)?;
+    Ok(value
+        .get("address")
+        .and_then(serde_json::Value::as_str)
+        .filter(|address| !address.is_empty() && *address != "0x0")
+        .map(str::to_string))
 }
 
 /// Parse the argument string accepted by `HyprctlClient::dispatch` without
@@ -357,5 +385,18 @@ mod tests {
 
         assert_eq!(monitor.x, None);
         assert_eq!(monitor.y, None);
+    }
+
+    #[test]
+    fn test_parse_active_window_address() {
+        assert_eq!(
+            parse_active_window_address(br#"{"address":"0x123"}"#).unwrap(),
+            Some("0x123".to_string())
+        );
+        assert_eq!(
+            parse_active_window_address(br#"{"address":"0x0"}"#).unwrap(),
+            None
+        );
+        assert_eq!(parse_active_window_address(br#"{}"#).unwrap(), None);
     }
 }

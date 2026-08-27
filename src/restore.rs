@@ -22,6 +22,8 @@ pub enum RestoreError {
     NoSession,
     #[error("could not unambiguously identify the new '{class}' window; candidates: {addresses}")]
     AmbiguousWindow { class: String, addresses: String },
+    #[error("could not safely correlate the new '{class}' window with its launch")]
+    UncorrelatedWindow { class: String },
     #[error("window {address} disappeared before reconciliation completed")]
     WindowDisappeared { address: String },
     #[error("launch command '{command}' for {target} is not authorized by app identity or config")]
@@ -320,6 +322,17 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
         return None;
     }
     if is_brave_client(target)
+        && target
+            .profile_directory
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        // Older snapshots did not record a profile directory.  A class/title
+        // match is not enough to identify which shared Brave profile owns the
+        // current window, so never repair it in place.
+        return None;
+    }
+    if is_brave_client(target)
         && (target.profile_identity_ambiguous || observed.profile_identity_ambiguous)
     {
         // A class/title match cannot identify a Brave profile when either
@@ -482,11 +495,24 @@ fn is_brave_client(client: &SessionClient) -> bool {
     is_brave_class(&client.class) || is_brave_class(&client.initial_class)
 }
 
+fn brave_client_has_no_safe_profile_identity(client: &SessionClient) -> bool {
+    is_brave_client(client)
+        && (client.profile_identity_ambiguous
+            || client
+                .profile_directory
+                .as_deref()
+                .is_none_or(str::is_empty))
+}
+
 fn is_generic_chromium_client(client: &SessionClient) -> bool {
     (is_generic_chromium_class(&client.class) || is_generic_chromium_class(&client.initial_class))
         && ![client.class.as_str(), client.initial_class.as_str()]
             .iter()
             .any(|class| is_webapp_class_name(class))
+}
+
+fn is_browser_target(client: &SessionClient) -> bool {
+    is_brave_client(client) || is_generic_chromium_client(client) || is_webapp_class(client)
 }
 
 fn is_brave_hypr_client(client: &HyprClient) -> bool {
@@ -615,7 +641,7 @@ fn restore_session_with_process_info(
                 }
                 continue;
             }
-            if is_brave_client(client) && client.profile_identity_ambiguous {
+            if brave_client_has_no_safe_profile_identity(client) {
                 report.skipped += 1;
                 if verbose {
                     report.details.push(format!(
@@ -1401,7 +1427,7 @@ fn reconcile_session_with_launcher_options(
     let mut used_current_addresses = HashSet::new();
     for (target_index, target) in targets.iter().enumerate() {
         let target_client = &target_clients[target_index];
-        if is_brave_client(target_client) && target_client.profile_identity_ambiguous {
+        if brave_client_has_no_safe_profile_identity(target_client) {
             report.skipped += 1;
             report.details.push(format!(
                 "SKIP: {} has no safe Brave profile identity",
@@ -2399,8 +2425,10 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
     ));
     let poll_interval = Duration::from_millis(100);
     let candidate_settle = Duration::from_millis(250).min(timeout);
+    let active_candidate_settle = poll_interval.min(timeout);
     let start = Instant::now();
     let mut first_candidate_at = None;
+    let mut active_candidate_at: Option<(String, Instant)> = None;
 
     let new_window = loop {
         if start.elapsed() > timeout {
@@ -2420,40 +2448,79 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
                     && candidate_matches_profile(client, window, process_info)
             })
             .collect();
-        if !candidates.is_empty() {
-            let candidate_seen_at = first_candidate_at.get_or_insert_with(Instant::now);
-            let process_related = candidates.iter().any(|candidate| {
-                launched_process_is_related(&launched, candidate.pid, process_info)
-            });
-            if launched.pid.is_some() && !process_related {
-                // A same-class window can be opened by the user while the
-                // requested application is starting.  Never move that window
-                // just because it was the only candidate seen during the
-                // settle period; wait for a descendant of the process we
-                // actually launched or fail without changing it.  A profile
-                // flag belongs to the shared Brave process, not necessarily
-                // to the newly-created top-level window, so it cannot relax
-                // this rule.
-                continue;
-            }
-            if candidates.len() > 1 && !process_related {
-                return Err(RestoreError::AmbiguousWindow {
-                    class: client.class.clone(),
-                    addresses: candidates
-                        .iter()
-                        .map(|candidate| candidate.address.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                });
-            }
-            if candidates.len() == 1
-                && !process_related
-                && candidate_seen_at.elapsed() < candidate_settle
-            {
-                continue;
-            }
-            break choose_launched_window(client, candidates, launched, process_info)?;
+        if candidates.is_empty() {
+            first_candidate_at = None;
+            active_candidate_at = None;
+            continue;
         }
+
+        let candidate_seen_at = first_candidate_at.get_or_insert_with(Instant::now);
+        let process_related = candidates
+            .iter()
+            .any(|candidate| launched_process_is_related(&launched, candidate.pid, process_info));
+        if launched.pid.is_some() && !process_related {
+            if !is_browser_target(client) {
+                // Keep the conservative process-tree rule for ordinary apps;
+                // active focus is only a meaningful fallback for browsers
+                // that intentionally share one process across windows.
+                continue;
+            }
+            // Chromium-based browsers commonly hand a launch request to an
+            // existing browser process, so the new window's PID is not
+            // related to the short-lived process we spawned.  Hyprland's
+            // active-window address is the remaining window-level signal:
+            // accept it only when exactly one new compatible candidate is
+            // focused and stays focused for a full poll interval.  A
+            // same-class window opened by the user is otherwise left
+            // untouched and the launch is reported as uncorrelated.
+            let active_address = hyprctl.get_active_window_address()?;
+            let active_candidate = active_address.as_deref().and_then(|address| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.address == address)
+            });
+            let Some(active_candidate) = active_candidate else {
+                active_candidate_at = None;
+                if candidate_seen_at.elapsed() >= candidate_settle {
+                    return Err(RestoreError::UncorrelatedWindow {
+                        class: client.class.clone(),
+                    });
+                }
+                continue;
+            };
+            let active_address = active_candidate.address.clone();
+            let active_stable = match &active_candidate_at {
+                Some((address, seen_at)) if address == &active_address => {
+                    seen_at.elapsed() >= active_candidate_settle
+                }
+                _ => {
+                    active_candidate_at = Some((active_address, Instant::now()));
+                    false
+                }
+            };
+            if active_stable {
+                break active_candidate.clone();
+            }
+            continue;
+        }
+        active_candidate_at = None;
+        if candidates.len() > 1 && !process_related {
+            return Err(RestoreError::AmbiguousWindow {
+                class: client.class.clone(),
+                addresses: candidates
+                    .iter()
+                    .map(|candidate| candidate.address.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
+        if candidates.len() == 1
+            && !process_related
+            && candidate_seen_at.elapsed() < candidate_settle
+        {
+            continue;
+        }
+        break choose_launched_window(client, candidates, launched, process_info)?;
     };
 
     // 4. Use the same minimal repair logic as reconciliation.  The launch
@@ -2518,9 +2585,12 @@ fn candidate_matches_profile(
         // correlation still has to prove that this is the window created by
         // the requested launch before it can be moved.
         [] => target_profile.eq_ignore_ascii_case("Default"),
-        // A shared browser process can advertise several profiles.  No single
-        // top-level window can be assigned safely from that process tree.
-        _ => false,
+        // A shared browser process can advertise several profiles.  This is
+        // only compatibility evidence; the caller must still correlate the
+        // newly created window using its active address before moving it.
+        _ => profiles
+            .iter()
+            .any(|profile| profile.eq_ignore_ascii_case(target_profile)),
     }
 }
 
@@ -3618,6 +3688,8 @@ mod tests {
         /// One entry per `get_clients()` call; last entry is repeated if exhausted.
         client_states: RefCell<Vec<Vec<HyprClient>>>,
         state_index: RefCell<usize>,
+        active_addresses: RefCell<Vec<Option<String>>>,
+        active_index: RefCell<usize>,
         dispatches: RefCell<Vec<String>>,
     }
 
@@ -3626,8 +3698,15 @@ mod tests {
             Self {
                 client_states: RefCell::new(client_states),
                 state_index: RefCell::new(0),
+                active_addresses: RefCell::new(Vec::new()),
+                active_index: RefCell::new(0),
                 dispatches: RefCell::new(Vec::new()),
             }
+        }
+
+        fn with_active_addresses(self, active_addresses: Vec<Option<String>>) -> Self {
+            *self.active_addresses.borrow_mut() = active_addresses;
+            self
         }
 
         fn dispatches(&self) -> Vec<String> {
@@ -3644,6 +3723,16 @@ mod tests {
             let result = states.get(effective).cloned().unwrap_or_default();
             drop(states);
             *self.state_index.borrow_mut() = idx + 1;
+            Ok(result)
+        }
+
+        fn get_active_window_address(&self) -> Result<Option<String>, HyprctlError> {
+            let idx = *self.active_index.borrow();
+            let addresses = self.active_addresses.borrow();
+            let effective = idx.min(addresses.len().saturating_sub(1));
+            let result = addresses.get(effective).cloned().unwrap_or(None);
+            drop(addresses);
+            *self.active_index.borrow_mut() = idx + 1;
             Ok(result)
         }
 
@@ -5040,27 +5129,79 @@ mod tests {
             .all(|detail| !detail.contains("brave profile")));
     }
 
+    #[test]
+    fn test_legacy_brave_without_profile_identity_is_not_matched_or_launched() {
+        let target = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        let current = make_reconcile_window(
+            "0xprofile",
+            "brave-browser",
+            "Brave",
+            1,
+            0,
+            [100, 100],
+            [800, 600],
+        );
+        let observed = ObservedClient::with_profile_directory(
+            current.clone(),
+            None,
+            None,
+            Some("Profile 1".to_string()),
+        );
+        assert!(plan_reconciliation(std::slice::from_ref(&target), &[observed])[0].is_none());
+
+        let mock = MockHyprctl::new(vec![vec![current]]);
+        let launcher = RecordingLauncher::default();
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![target]),
+            &mock,
+            &BraveProfileProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.launched, 0);
+        assert!(launcher.launches.borrow().is_empty());
+        assert!(mock.dispatches().is_empty());
+    }
+
     // ── Test: without profiles, brave windows restore individually ───────
 
     #[test]
     fn test_restore_brave_without_profiles_falls_back() {
-        // Session WITHOUT brave_profiles — should restore brave windows normally
+        // Session WITHOUT brave_profiles can still restore a Brave window when
+        // the window itself carries a positive Default-profile identity.
+        let mut client = make_client(
+            "brave-browser",
+            1,
+            [0, 0],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        client.profile_directory = Some("Default".to_string());
         let session = Session {
             name: "test".to_string(),
             created_at: Utc::now(),
             hyprland_version: "0.54.1".to_string(),
             monitors: vec![],
-            clients: vec![make_client(
-                "brave-browser",
-                1,
-                [0, 0],
-                [800, 600],
-                false,
-                0,
-                "true",
-                vec![],
-                None,
-            )],
+            clients: vec![client],
             brave_profiles: vec![], // no profiles
         };
 
@@ -5081,7 +5222,8 @@ mod tests {
         let mock = MockHyprctl::new(vec![]);
         let report = restore_session(&session, &mock, &config, true, true).unwrap();
 
-        // Without profiles, brave windows are restored individually
+        // Without an inventory, a positively identified Brave window is still
+        // restored individually.
         assert_eq!(report.restored, 1);
         assert!(report
             .details
@@ -5381,7 +5523,10 @@ mod tests {
             true,
         );
 
-        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
         assert!(mock.dispatches().is_empty());
     }
 
@@ -5436,8 +5581,68 @@ mod tests {
             true,
         );
 
-        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
         assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_brave_launch_uses_active_window_when_browser_reuses_pid() {
+        let mut target = make_client(
+            "brave-browser",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.profile_directory = Some("Default".to_string());
+        let existing = make_reconcile_window(
+            "0xexisting",
+            "brave-browser",
+            "Work",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut new_window = make_reconcile_window(
+            "0xnew",
+            "brave-browser",
+            "Personal",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        new_window.pid = existing.pid;
+        let mock = MockHyprctl::new(vec![vec![existing.clone()], vec![existing, new_window]])
+            .with_active_addresses(vec![Some("0xnew".to_string())]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.window_detect_timeout_ms = 500;
+        config.general.restore_delay_ms = 0;
+
+        let result = restore_single_client_with_launcher_and_process_info_with_address(
+            &target,
+            &mock,
+            &SharedBraveProfileProcessInfo,
+            &config,
+            &launcher,
+            true,
+        )
+        .expect("the focused new Brave window should be correlated safely");
+
+        assert_eq!(result.address, "0xnew");
+        assert!(!mock.dispatches().is_empty());
     }
 
     #[test]
@@ -5489,8 +5694,67 @@ mod tests {
             true,
         );
 
-        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
         assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_webapp_launch_uses_active_window_when_browser_reuses_pid() {
+        let target = make_client(
+            "chrome-chatgpt.com__-Default",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "omarchy-launch-webapp",
+            vec!["https://chatgpt.com/".to_string()],
+            None,
+        );
+        let existing = make_reconcile_window(
+            "0xexisting",
+            "chrome-other.com__-Default",
+            "Other app",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        let mut new_window = make_reconcile_window(
+            "0xnew",
+            "chrome-chatgpt.com__-Default",
+            "ChatGPT",
+            1,
+            0,
+            [0, 0],
+            [800, 600],
+        );
+        new_window.pid = existing.pid;
+        let mock = MockHyprctl::new(vec![vec![existing.clone()], vec![existing, new_window]])
+            .with_active_addresses(vec![Some("0xnew".to_string())]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let mut config = Config::default();
+        config.general.window_detect_timeout_ms = 500;
+        config.general.restore_delay_ms = 0;
+
+        let result = restore_single_client_with_launcher_and_process_info_with_address(
+            &target,
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            &launcher,
+            true,
+        )
+        .expect("the focused new web app should be correlated safely");
+
+        assert_eq!(result.address, "0xnew");
+        assert!(!mock.dispatches().is_empty());
     }
 
     #[test]
@@ -5558,7 +5822,10 @@ mod tests {
             true,
         );
 
-        assert!(matches!(result, Err(RestoreError::Hyprctl(_))));
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
         assert!(mock.dispatches().is_empty());
     }
 
