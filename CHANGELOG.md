@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.8] - 2026-08-27
+
+### Fixed
+
+- Preserve process identity alongside Hyprland addresses so address reuse cannot move unrelated windows
+- Accept a reused launch address only when it belongs to the launched process
+- Keep replacement recovery conservative when a window may have been reopened
+- Report ambiguous Brave restores as failures instead of silent success
+- Fix the release workflow's checksum extraction for variable-backed PKGBUILDs
+
 ## [0.3.7] - 2026-08-27
 
 ### Fixed

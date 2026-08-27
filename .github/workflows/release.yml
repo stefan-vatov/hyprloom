@@ -82,7 +82,11 @@ jobs:
           test -s source.tar.gz
           tar -tzf source.tar.gz >/dev/null
           sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)
-          expected_sha256=$(sed -n "s/^sha256sums=('\\([^']*\\)').*/\\1/p" PKGBUILD)
+          # PKGBUILD keeps the checksum in a quoted shell variable for
+          # readability.  .SRCINFO is the makepkg-generated, literal package
+          # metadata and is already checked in with the tagged source.
+          expected_sha256=$(awk '$1 == "sha256sums" && $2 == "=" { print $3; exit }' .SRCINFO)
+          test -n "$expected_sha256"
           test "$sha256" = "$expected_sha256"
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
 

@@ -156,6 +156,8 @@ fn build_session_client(
         class: client.class.clone(),
         title: client.title.clone(),
         address: (!client.address.is_empty()).then(|| client.address.clone()),
+        pid: Some(client.pid),
+        process_start_time: process_info.get_start_time(client.pid).ok(),
         initial_class: if client.initial_class.is_empty() {
             client.class.clone()
         } else {

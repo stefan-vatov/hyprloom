@@ -76,6 +76,14 @@ pub struct SessionClient {
     /// open.  Older snapshots do not contain it and deserialize as `None`.
     #[serde(default)]
     pub address: Option<String>,
+    /// PID and Linux process-start time identify the process which owned the
+    /// window at capture time.  They are supplemental evidence: a window can
+    /// legitimately survive a process hand-off, and older sessions do not
+    /// contain either field.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub process_start_time: Option<u64>,
     /// Initial Hyprland app identity.  These fields are optional in spirit:
     /// older session files do not contain them and reconciliation falls back
     /// to `class` and `title` when they are empty.
@@ -155,6 +163,12 @@ pub struct ReplaceMarker {
     pub backup_name: String,
     pub phase: ReplacePhase,
     pub closing_address: Option<String>,
+    /// Process identity for the first close candidate.  New markers use this
+    /// to distinguish a close that actually happened from a different window
+    /// which later reused the same Hyprland address.  Older markers leave it
+    /// absent and are recovered conservatively.
+    pub closing_pid: Option<u32>,
+    pub closing_start_time: Option<u64>,
     /// The session being installed.  Older markers do not contain this and
     /// therefore retain the conservative exact-recovery behavior.
     pub target_name: Option<String>,
@@ -502,6 +516,8 @@ pub fn mark_replace_in_progress_for_target(
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::InProgress,
             closing_address: None,
+            closing_pid: None,
+            closing_start_time: None,
             target_name: target_name.map(str::to_string),
         },
         sessions_dir,
@@ -537,6 +553,38 @@ pub fn mark_replace_closing_for_target(
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::Closing,
             closing_address: Some(address.to_string()),
+            closing_pid: None,
+            closing_start_time: None,
+            target_name: target_name.map(str::to_string),
+        },
+        sessions_dir,
+    )
+}
+
+/// Record the first close candidate together with its process identity.  The
+/// identity is intentionally optional because Hyprland can report a window
+/// whose process has already exited by the time `/proc` is inspected.
+pub fn mark_replace_closing_for_target_with_identity(
+    backup_name: &str,
+    target_name: Option<&str>,
+    sessions_dir: &std::path::Path,
+    address: &str,
+    pid: u32,
+    start_time: Option<u64>,
+) -> Result<(), SessionError> {
+    validate_session_name(backup_name)?;
+    if let Some(target_name) = target_name {
+        validate_session_name(target_name)?;
+    }
+    validate_replace_address(address)?;
+    ensure_sessions_dir(sessions_dir)?;
+    write_replace_marker(
+        &ReplaceMarker {
+            backup_name: backup_name.to_string(),
+            phase: ReplacePhase::Closing,
+            closing_address: Some(address.to_string()),
+            closing_pid: Some(pid),
+            closing_start_time: start_time,
             target_name: target_name.map(str::to_string),
         },
         sessions_dir,
@@ -568,6 +616,8 @@ pub fn mark_replace_prepared_for_target(
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::Prepared,
             closing_address: None,
+            closing_pid: None,
+            closing_start_time: None,
             target_name: target_name.map(str::to_string),
         },
         sessions_dir,
@@ -596,6 +646,8 @@ pub fn mark_replace_committed_for_target(
             backup_name: backup_name.to_string(),
             phase: ReplacePhase::Committed,
             closing_address: None,
+            closing_pid: None,
+            closing_start_time: None,
             target_name: target_name.map(str::to_string),
         },
         sessions_dir,
@@ -628,25 +680,71 @@ pub fn replace_marker(
         .to_string();
     let lines: Vec<&str> = text.lines().collect();
     let first = lines.first().copied().unwrap_or_default();
-    let (phase, name_index, base_len, closing_index) = match first {
-        "prepared" => (ReplacePhase::Prepared, 1, 2, None),
+    let (phase, name_index, cursor) = match first {
+        "prepared" => (ReplacePhase::Prepared, 1, 2),
         // Older builds wrote only the backup name.  Treat that format as an
         // interrupted replacement so upgrading cannot silently skip recovery.
-        "closing" => (ReplacePhase::Closing, 1, 3, Some(2)),
-        "in-progress" => (ReplacePhase::InProgress, 1, 2, None),
-        "committed" => (ReplacePhase::Committed, 1, 2, None),
-        _legacy_name => (ReplacePhase::InProgress, 0, 1, None),
+        "closing" => (ReplacePhase::Closing, 1, 3),
+        "in-progress" => (ReplacePhase::InProgress, 1, 2),
+        "committed" => (ReplacePhase::Committed, 1, 2),
+        _legacy_name => (ReplacePhase::InProgress, 0, 1),
     };
-    if lines.len() < base_len || lines.len() > base_len + 1 {
+    if lines.len() < cursor {
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "replacement marker is missing required fields",
+        )));
+    }
+    let name = lines.get(name_index).copied().unwrap_or_default();
+    let closing_address = (phase == ReplacePhase::Closing)
+        .then(|| lines.get(2).copied().unwrap_or_default().to_string());
+    let mut next_index = cursor;
+    let mut closing_pid = None;
+    let mut closing_start_time = None;
+    if phase == ReplacePhase::Closing {
+        // New markers add an identity record between the closing address and
+        // the optional target name.  Its prefix keeps the old three/four-line
+        // marker formats unambiguous and readable during upgrades.
+        if let Some(identity) = lines
+            .get(next_index)
+            .filter(|line| line.starts_with("identity:"))
+        {
+            let value = identity.strip_prefix("identity:").unwrap_or_default();
+            let (pid, start_time) = value.split_once(':').ok_or_else(|| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "replacement marker has an invalid process identity",
+                ))
+            })?;
+            closing_pid = Some(pid.parse::<u32>().map_err(|_| {
+                SessionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "replacement marker has an invalid process ID",
+                ))
+            })?);
+            closing_start_time = if start_time.is_empty() {
+                None
+            } else {
+                Some(start_time.parse::<u64>().map_err(|_| {
+                    SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "replacement marker has an invalid process start time",
+                    ))
+                })?)
+            };
+            next_index += 1;
+        }
+    }
+    let target_name = lines.get(next_index).map(|target| (*target).to_string());
+    if target_name.is_some() {
+        next_index += 1;
+    }
+    if lines.len() != next_index {
         return Err(SessionError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "replacement marker has unexpected extra lines",
         )));
     }
-    let name = lines.get(name_index).copied().unwrap_or_default();
-    let closing_address =
-        closing_index.map(|index| lines.get(index).copied().unwrap_or_default().to_string());
-    let target_name = lines.get(base_len).map(|target| (*target).to_string());
     validate_session_name(name)?;
     if let Some(address) = &closing_address {
         validate_replace_address(address)?;
@@ -658,6 +756,8 @@ pub fn replace_marker(
         backup_name: name.to_string(),
         phase,
         closing_address,
+        closing_pid,
+        closing_start_time,
         target_name,
     }))
 }
@@ -702,6 +802,13 @@ fn format_marker_content(
     if let Some(address) = closing_address {
         content.push('\n');
         content.push_str(address);
+    }
+    if let (Some(pid), Some(start_time)) = (marker.closing_pid, marker.closing_start_time) {
+        content.push('\n');
+        content.push_str(&format!("identity:{pid}:{start_time}"));
+    } else if let Some(pid) = marker.closing_pid {
+        content.push('\n');
+        content.push_str(&format!("identity:{pid}:"));
     }
     if let Some(target_name) = &marker.target_name {
         content.push('\n');
@@ -1061,6 +1168,8 @@ mod tests {
                 class: "kitty".to_string(),
                 title: "Claude Code".to_string(),
                 address: None,
+                pid: None,
+                process_start_time: None,
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 4,
@@ -1123,6 +1232,8 @@ mod tests {
                 class: "kitty".to_string(),
                 title: "test".to_string(),
                 address: None,
+                pid: None,
+                process_start_time: None,
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 1,
@@ -1400,6 +1511,8 @@ mod tests {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::Prepared,
                 closing_address: None,
+                closing_pid: None,
+                closing_start_time: None,
                 target_name: None,
             })
         );
@@ -1410,6 +1523,8 @@ mod tests {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::Closing,
                 closing_address: Some("0xclosing".to_string()),
+                closing_pid: None,
+                closing_start_time: None,
                 target_name: None,
             })
         );
@@ -1424,6 +1539,8 @@ mod tests {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::InProgress,
                 closing_address: None,
+                closing_pid: None,
+                closing_start_time: None,
                 target_name: None,
             })
         );
@@ -1434,6 +1551,8 @@ mod tests {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::Committed,
                 closing_address: None,
+                closing_pid: None,
+                closing_start_time: None,
                 target_name: None,
             })
         );
@@ -1444,11 +1563,39 @@ mod tests {
                 backup_name: "autosave-recovery".to_string(),
                 phase: ReplacePhase::Prepared,
                 closing_address: None,
+                closing_pid: None,
+                closing_start_time: None,
                 target_name: Some("target".to_string()),
             })
         );
         clear_replace_marker(dir.path()).unwrap();
         assert_eq!(pending_replace_backup(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_replace_closing_marker_preserves_process_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_replace_closing_for_target_with_identity(
+            "autosave-recovery",
+            Some("target"),
+            dir.path(),
+            "0xclosing",
+            1234,
+            Some(5678),
+        )
+        .unwrap();
+
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::Closing,
+                closing_address: Some("0xclosing".to_string()),
+                closing_pid: Some(1234),
+                closing_start_time: Some(5678),
+                target_name: Some("target".to_string()),
+            })
+        );
     }
 
     #[test]

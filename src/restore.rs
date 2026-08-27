@@ -122,6 +122,7 @@ pub struct ObservedClient {
     pub monitor_name: Option<String>,
     pub cwd: Option<PathBuf>,
     pub profile_directory: Option<String>,
+    pub process_start_time: Option<u64>,
     /// A process flag is not always window-specific. Chromium-based browsers
     /// commonly reuse one PID for several top-level windows.
     pub profile_identity_ambiguous: bool,
@@ -138,6 +139,7 @@ impl ObservedClient {
             monitor_name,
             cwd,
             profile_directory: None,
+            process_start_time: None,
             profile_identity_ambiguous: false,
         }
     }
@@ -153,6 +155,7 @@ impl ObservedClient {
             monitor_name,
             cwd,
             profile_directory,
+            process_start_time: None,
             profile_identity_ambiguous: false,
         }
     }
@@ -360,6 +363,13 @@ fn match_score_with_policy(
         (Some(target_profile), Some(current_profile))
             if same_nonempty(target_profile, current_profile)
     );
+    if saved_address_matches && process_identity_matches(target, observed) == Some(false) {
+        // Hyprland can recycle an address after a window closes.  Treat the
+        // address as exact only while its captured process identity still
+        // agrees; otherwise a repair could move an unrelated same-class
+        // browser or terminal window.
+        return None;
+    }
     if is_generic_chromium_client(target)
         && !generic_chromium_identity_matches_with_policy(target, current, policy)
     {
@@ -531,6 +541,44 @@ fn strong_identity_conflict(target: &SessionClient, observed: &ObservedClient) -
     );
 
     initial_title_conflict || title_conflict && cwd_conflict
+}
+
+/// Compare the optional process identity captured for a window with the
+/// process currently reported for it.  `None` means the available session
+/// format or provider did not contain enough evidence; callers must not turn
+/// that absence into a positive match.
+fn process_identity_matches(target: &SessionClient, observed: &ObservedClient) -> Option<bool> {
+    let saved_pid = target.pid?;
+    let current_pid = observed.client.pid;
+    if saved_pid != current_pid {
+        return Some(false);
+    }
+    match (target.process_start_time, observed.process_start_time) {
+        (Some(saved), Some(current)) => Some(saved == current),
+        (Some(_), None) => None,
+        (None, _) => Some(true),
+    }
+}
+
+fn replacement_safety_identity_matches(
+    safety_client: &SessionClient,
+    observed: &ObservedClient,
+) -> bool {
+    if !classes_match(safety_client, &observed.client) {
+        return false;
+    }
+    if process_identity_matches(safety_client, observed) == Some(true) {
+        return true;
+    }
+
+    // A reopened window has a new address and usually a new process.  Exact
+    // stable title evidence is still useful as a negative proof here: if a
+    // current window is indistinguishable from a pre-replacement window, it
+    // must not be used to claim that a replacement target was restored.
+    same_nonempty(&safety_client.title, &observed.client.title)
+        && (safety_client.initial_title.is_empty()
+            || observed.client.initial_title.is_empty()
+            || same_nonempty(&safety_client.initial_title, &observed.client.initial_title))
 }
 
 /// A same-initial-title match can be a legitimate live window whose title has
@@ -785,8 +833,23 @@ fn restore_session_with_process_info(
     let mut consumed_existing = HashSet::new();
     let current_monitors = hyprctl.get_monitors()?;
 
-    // Detect if profile-based Brave restore applies.
-    let has_brave_profiles = brave_profile_targets(session, config).is_some();
+    // Detect if profile-based Brave restore applies.  An empty profile result
+    // can mean an intentionally empty allowlist, but it can also mean that a
+    // legacy snapshot contains Brave windows whose profile identity cannot be
+    // recovered.  The latter must be reported as a failure, not a successful
+    // no-op.
+    let brave_profiles = brave_profile_targets(session, config);
+    let has_brave_profiles = brave_profiles.is_some();
+    let explicit_empty_brave_mapping = app_config_for(config, "brave-browser", "")
+        .and_then(|app| app.profile_workspaces.as_ref())
+        .is_some_and(HashMap::is_empty);
+    let unsafe_empty_brave_profile_mode = has_brave_profiles
+        && !explicit_empty_brave_mapping
+        && brave_profiles.as_ref().is_some_and(Vec::is_empty)
+        && session
+            .clients
+            .iter()
+            .any(brave_client_has_no_safe_profile_identity);
 
     // Group by workspace (BTreeMap gives us sorted workspace order for free).
     let mut by_workspace: BTreeMap<i32, Vec<&SessionClient>> = BTreeMap::new();
@@ -802,6 +865,16 @@ fn restore_session_with_process_info(
         clients.sort_by(|a, b| a.at[1].cmp(&b.at[1]).then(a.at[0].cmp(&b.at[0])));
 
         for client in clients {
+            if unsafe_empty_brave_profile_mode && is_brave_client(client) {
+                report.failed += 1;
+                if verbose {
+                    report.details.push(format!(
+                        "FAIL: {} has no safe Brave profile identity to restore",
+                        client.title
+                    ));
+                }
+                continue;
+            }
             // Skip brave-browser windows when profiles are available (handled after main loop).
             if has_brave_profiles && is_brave_client(client) {
                 continue;
@@ -818,10 +891,14 @@ fn restore_session_with_process_info(
                 continue;
             }
             if brave_client_has_no_safe_profile_identity(client) {
-                report.skipped += 1;
+                // This is a requested window, not an optional extra.  A
+                // plain restore cannot identify its Brave profile safely, so
+                // report an actionable failure instead of returning success
+                // after silently omitting it.
+                report.failed += 1;
                 if verbose {
                     report.details.push(format!(
-                        "SKIP: {} has no safe Brave profile identity",
+                        "FAIL: {} has no safe Brave profile identity",
                         client.title
                     ));
                 }
@@ -1481,11 +1558,13 @@ fn replace_session_inner(
                     // Keep the prepared marker until the first close is about
                     // to happen. If dispatch fails, startup can inspect this
                     // address before deciding whether recovery is necessary.
-                    crate::session::mark_replace_closing_for_target(
+                    crate::session::mark_replace_closing_for_target_with_identity(
                         backup_name,
                         Some(target_name),
                         sessions_dir,
                         &client.address,
+                        client.pid,
+                        process_info.get_start_time(client.pid).ok(),
                     )
                     .map_err(|error| RestoreError::Transaction(error.to_string()))?;
                 }
@@ -1679,6 +1758,19 @@ pub fn replacement_target_is_complete_with_backup(
     if observed.len() > MAX_RECONCILIATION_WINDOWS {
         return Ok(false);
     }
+    if let Some(safety_snapshot) = safety_snapshot {
+        if observed.iter().any(|current| {
+            safety_snapshot
+                .clients
+                .iter()
+                .any(|saved| replacement_safety_identity_matches(saved, current))
+        }) {
+            // A pre-replacement window can be reopened with a fresh address.
+            // If it is still indistinguishable from a saved safety window,
+            // do not mistake it for a target and commit the transaction.
+            return Ok(false);
+        }
+    }
     let target_clients: Vec<SessionClient> = build_reconcile_targets(session, config)
         .into_iter()
         .map(|target| {
@@ -1760,6 +1852,10 @@ fn reconcile_session_with_launcher_options(
 
     let mut report = ReconcileReport::default();
     let mut used_current_addresses = HashSet::new();
+    // Keep the newest compositor snapshot for safety decisions.  A window can
+    // reopen between the initial plan and the per-target refresh; using only
+    // the initial list could launch a duplicate during conservative recovery.
+    let mut latest_observed = observed.clone();
     for (target_index, target) in targets.iter().enumerate() {
         let target_client = &target_clients[target_index];
         if brave_client_has_no_safe_profile_identity(target_client) {
@@ -1809,6 +1905,7 @@ fn reconcile_session_with_launcher_options(
                     limit: MAX_RECONCILIATION_WINDOWS,
                 });
             }
+            latest_observed = refreshed.clone();
             let planned_address = plan[target_index]
                 .and_then(|pair| observed.get(pair.current_index))
                 .map(|current| current.client.address.clone());
@@ -1904,7 +2001,7 @@ fn reconcile_session_with_launcher_options(
 
         if has_ambiguous_generic_chromium_candidate(
             target_client,
-            &observed,
+            &latest_observed,
             &used_current_addresses,
             config,
         ) {
@@ -1919,7 +2016,7 @@ fn reconcile_session_with_launcher_options(
         if !allow_ambiguous_identity
             && has_unmatched_same_class_candidate(
                 target_client,
-                &observed,
+                &latest_observed,
                 &used_current_addresses,
                 config,
             )
@@ -2019,12 +2116,12 @@ fn reconcile_session_with_launcher_options(
         }
     }
 
-    report.extras = observed
+    report.extras = latest_observed
         .iter()
         .filter(|window| !used_current_addresses.contains(&window.client.address))
         .count();
     if verbose {
-        for window in &observed {
+        for window in &latest_observed {
             if !used_current_addresses.contains(&window.client.address) {
                 report.details.push(format!(
                     "EXTRA: {} '{}' at address {} on ws={} left untouched",
@@ -2219,6 +2316,8 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                     class: "brave-browser".to_string(),
                     title: profile.name.clone(),
                     address: None,
+                    pid: None,
+                    process_start_time: None,
                     initial_class: "brave-browser".to_string(),
                     initial_title: "Brave".to_string(),
                     workspace: default_workspace,
@@ -2316,7 +2415,11 @@ fn observe_clients_with_monitors(
         .map(|client| {
             let monitor_name = monitor_names.get(&client.monitor).cloned();
             let cwd = observe_cwd(&client, process_info);
-            ObservedClient::with_profile_directory(client, monitor_name, cwd, None)
+            let process_start_time = process_info.get_start_time(client.pid).ok();
+            let mut observed =
+                ObservedClient::with_profile_directory(client, monitor_name, cwd, None);
+            observed.process_start_time = process_start_time;
+            observed
         })
         .collect();
     let mut brave_window_counts = HashMap::<u32, usize>::new();
@@ -2789,7 +2892,10 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             HyprctlError::CommandFailed(format!("spawn '{}' failed: {e}", launch_cmd[0]))
         })?;
 
-    // 3. Poll for the new window (address not in snapshot + class match).
+    // 3. Poll for the new window.  A compositor address is usually fresh, but
+    // it can be recycled when an old window closes while the new process is
+    // starting.  Permit that one edge case only when process correlation
+    // proves the reused address belongs to this launch.
     let timeout = Duration::from_millis(config.general.window_detect_timeout_ms.clamp(
         crate::config::MIN_WINDOW_DETECT_TIMEOUT_MS,
         crate::config::MAX_WINDOW_DETECT_TIMEOUT_MS,
@@ -2812,7 +2918,8 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
         let candidates: Vec<HyprClient> = current
             .into_iter()
             .filter(|window| {
-                !before.contains(&window.address)
+                (!before.contains(&window.address)
+                    || launched_process_is_related(&launched, window.pid, process_info))
                     && classes_match(client, window)
                     && candidate_matches_profile(client, window, process_info)
             })
@@ -3326,6 +3433,8 @@ mod tests {
             class: class.to_string(),
             title: class.to_string(),
             address: None,
+            pid: None,
+            process_start_time: None,
             initial_class: class.to_string(),
             initial_title: class.to_string(),
             workspace,
@@ -3543,6 +3652,34 @@ mod tests {
             plan_reconciliation(&[target], &[observed])[0].map(|pair| pair.kind),
             Some(MatchKind::ExactIdentity)
         );
+    }
+
+    #[test]
+    fn test_matching_rejects_reused_address_when_process_identity_changes() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xreused".to_string());
+        target.pid = Some(1000);
+        target.process_start_time = Some(10);
+
+        let mut current =
+            make_reconcile_window("0xreused", "kitty", "Project", 1, 0, [10, 20], [800, 600]);
+        current.pid = 2000;
+        let mut observed = ObservedClient::from_hypr_client(current, None, None);
+        observed.process_start_time = Some(20);
+
+        assert_eq!(plan_reconciliation(&[target], &[observed]), vec![None]);
     }
 
     #[test]
@@ -4128,6 +4265,7 @@ mod tests {
     struct RecordingLauncher {
         launches: RefCell<Vec<(String, Vec<String>)>>,
         pid: Option<u32>,
+        start_time: Option<u64>,
     }
 
     impl ProcessLauncher for RecordingLauncher {
@@ -4137,7 +4275,7 @@ mod tests {
                 .push((command.to_string(), args.to_vec()));
             Ok(LaunchedProcess {
                 pid: self.pid,
-                start_time: None,
+                start_time: self.start_time,
             })
         }
     }
@@ -4326,6 +4464,59 @@ mod tests {
     }
 
     #[test]
+    fn test_replacement_completion_rejects_reopened_safety_window_as_target() {
+        let mut target = make_client(
+            "kitty",
+            2,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xtarget-before-crash".to_string());
+
+        let mut safety = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "kitty",
+            vec![],
+            None,
+        );
+        safety.title = "Project".to_string();
+        safety.initial_title = "Project".to_string();
+        safety.address = Some("0xold-safety-window".to_string());
+
+        let reopened = make_reconcile_window(
+            "0xreopened-safety-window",
+            "kitty",
+            "Project",
+            1,
+            0,
+            [900, 100],
+            [700, 500],
+        );
+        let mock = MockHyprctl::new(vec![vec![reopened]]);
+
+        assert!(!replacement_target_is_complete_with_backup(
+            &make_session(vec![target]),
+            Some(&make_session(vec![safety])),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+        )
+        .unwrap());
+    }
+
+    #[test]
     fn test_replacement_completion_accepts_generic_chromium_relaunch_by_unique_title() {
         let mut target = make_client(
             "chromium",
@@ -4405,6 +4596,54 @@ mod tests {
 
         assert_eq!(report.skipped, 1);
         assert_eq!(report.launched, 0);
+        assert!(mock.dispatches().is_empty());
+    }
+
+    #[test]
+    fn test_safe_recovery_checks_reopened_window_before_launching_duplicate() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.title = "Project".to_string();
+        target.initial_title = "Project".to_string();
+        target.address = Some("0xbefore-reopen".to_string());
+
+        let mut reopened = make_reconcile_window(
+            "0xafter-reopen",
+            "kitty",
+            "Project",
+            7,
+            0,
+            [900, 100],
+            [700, 500],
+        );
+        reopened.initial_title = "Project".to_string();
+        let mock = MockHyprctl::new(vec![vec![], vec![reopened]]);
+        let launcher = RecordingLauncher::default();
+
+        let report = reconcile_session_with_launcher_options(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.launched, 0);
+        assert!(launcher.launches.borrow().is_empty());
         assert!(mock.dispatches().is_empty());
     }
 
@@ -5039,6 +5278,53 @@ mod tests {
             .dispatches()
             .iter()
             .any(|dispatch| dispatch == "fullscreen 1"));
+    }
+
+    #[test]
+    fn test_launch_accepts_reused_address_when_it_belongs_to_launched_process() {
+        let mut target = make_client(
+            "kitty",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "true",
+            vec![],
+            None,
+        );
+        target.monitor.clear();
+
+        let mut old_window =
+            make_reconcile_window("0xreused", "kitty", "old", 1, 0, [0, 0], [400, 300]);
+        old_window.pid = 4000;
+        let mut launched_window =
+            make_reconcile_window("0xreused", "kitty", "kitty", 1, 0, [0, 0], [400, 300]);
+        launched_window.pid = 5000;
+        let mock = MockHyprctl::new(vec![vec![old_window], vec![launched_window]]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            start_time: Some(10),
+            ..Default::default()
+        };
+        let process_info = StartTimeProcessInfo { start_time: 10 };
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        restore_single_client_with_launcher_and_process_info(
+            &target,
+            &mock,
+            &process_info,
+            &config,
+            &launcher,
+            false,
+        )
+        .expect("the launched window may reuse the old address");
+
+        assert!(mock
+            .dispatches()
+            .iter()
+            .any(|dispatch| dispatch.contains("0xreused")));
     }
 
     #[test]

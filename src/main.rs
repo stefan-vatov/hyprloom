@@ -4,7 +4,7 @@ use hyprloom::config::{
     app_config_for, config_path, legacy_sessions_dir, load_config, sessions_dir,
 };
 use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
-use hyprloom::process::RealProcessInfo;
+use hyprloom::process::{ProcessInfoProvider, RealProcessInfo};
 use hyprloom::restore::{
     recover_session, recover_session_safely, replace_session_with_marker,
     replacement_target_is_complete_with_backup, restore_session, validate_replacement_targets,
@@ -724,7 +724,15 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             return false;
         };
         let hyprctl = RealHyprctl;
-        match replacement_close_started(closing_address, &hyprctl, config) {
+        let process_info = RealProcessInfo;
+        match replacement_close_started(
+            closing_address,
+            marker.closing_pid,
+            marker.closing_start_time,
+            &hyprctl,
+            &process_info,
+            config,
+        ) {
             Some(false) => {
                 eprintln!(
                     "Found a replacement that had not confirmed its first close; leaving the current desktop unchanged."
@@ -811,10 +819,17 @@ fn replacement_has_started(
     match replace_marker(sessions_dir) {
         Ok(Some(marker)) => match marker.phase {
             ReplacePhase::InProgress => Some(true),
-            ReplacePhase::Closing => marker
-                .closing_address
-                .as_deref()
-                .and_then(|address| replacement_close_started(address, hyprctl, config)),
+            ReplacePhase::Closing => marker.closing_address.as_deref().and_then(|address| {
+                let process_info = RealProcessInfo;
+                replacement_close_started(
+                    address,
+                    marker.closing_pid,
+                    marker.closing_start_time,
+                    hyprctl,
+                    &process_info,
+                    config,
+                )
+            }),
             ReplacePhase::Prepared | ReplacePhase::Committed => Some(false),
         },
         Ok(None) => Some(false),
@@ -833,7 +848,10 @@ fn replacement_has_started(
 /// safer to leave the user's desktop alone than to replay a full backup.
 fn replacement_close_started(
     address: &str,
+    expected_pid: Option<u32>,
+    expected_start_time: Option<u64>,
     hyprctl: &dyn HyprctlClient,
+    process_info: &dyn ProcessInfoProvider,
     config: &hyprloom::config::Config,
 ) -> Option<bool> {
     let timeout = Duration::from_millis(config.general.window_detect_timeout_ms.clamp(
@@ -851,11 +869,38 @@ fn replacement_close_started(
                 return None;
             }
         };
-        if !clients.iter().any(|client| client.address == address) {
+        let mut identity_confirmed = false;
+        let Some(current) = clients.iter().find(|client| client.address == address) else {
             return Some(true);
+        };
+
+        if let Some(expected_pid) = expected_pid {
+            if current.pid != expected_pid {
+                // The old window is gone and this address now belongs to a
+                // different process.  Treat the close as started instead of
+                // waiting for (or deleting) the replacement backup.
+                return Some(true);
+            }
+            if let Some(expected_start_time) = expected_start_time {
+                if let Ok(current_start_time) = process_info.get_start_time(current.pid) {
+                    if current_start_time != expected_start_time {
+                        return Some(true);
+                    }
+                    identity_confirmed = true;
+                }
+            } else {
+                identity_confirmed = true;
+            }
         }
         if started.elapsed() >= timeout {
-            return Some(false);
+            // A legacy marker has no process identity, so an address that is
+            // still present is ambiguous: it may be the old window or a
+            // window which reused that address after the close.  Preserve the
+            // marker and backup rather than making an irreversible guess.
+            return match (expected_pid, expected_start_time, identity_confirmed) {
+                (Some(_), None, true) | (Some(_), Some(_), true) => Some(false),
+                _ => None,
+            };
         }
         thread::sleep(Duration::from_millis(50));
     }
