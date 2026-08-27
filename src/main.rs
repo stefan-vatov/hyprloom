@@ -1,18 +1,19 @@
 use clap::{Parser, Subcommand};
-use hyprflow::capture::capture_session;
-use hyprflow::config::{config_path, load_config, sessions_dir};
-use hyprflow::hyprctl::RealHyprctl;
-use hyprflow::process::RealProcessInfo;
-use hyprflow::restore::restore_session;
-use hyprflow::session::{
-    delete_session, list_sessions, load_session, save_session, session_exists,
+use hyprloom::capture::capture_session;
+use hyprloom::config::{config_path, legacy_sessions_dir, load_config, sessions_dir};
+use hyprloom::hyprctl::RealHyprctl;
+use hyprloom::process::RealProcessInfo;
+use hyprloom::restore::restore_session;
+use hyprloom::session::{
+    delete_session, list_sessions, load_session, migrate_legacy_sessions, save_session,
+    session_exists,
 };
 
 #[derive(Parser)]
 #[command(
-    name = "hyprflow",
+    name = "hyprloom",
     version,
-    about = "Save and restore Hyprland sessions"
+    about = "Save, restore, and reconcile Hyprland sessions"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -40,6 +41,9 @@ enum Commands {
         /// Preview without executing
         #[arg(short, long)]
         dry_run: bool,
+        /// Match existing windows, repair only mismatches, and leave extras alone
+        #[arg(long)]
+        reconcile: bool,
         /// Skip restore if session is older than duration (e.g., 24h, 7d, 30m)
         #[arg(long)]
         max_age: Option<String>,
@@ -74,6 +78,9 @@ fn main() {
     let cli = Cli::parse();
     let config = load_config();
     let sessions_dir = sessions_dir();
+    if let Err(error) = migrate_legacy_sessions(&sessions_dir, &legacy_sessions_dir()) {
+        eprintln!("Warning: could not migrate legacy hyprflow sessions: {error}");
+    }
 
     match cli.command {
         Commands::Save { name, force } => {
@@ -118,15 +125,16 @@ fn main() {
         Commands::Restore {
             name,
             dry_run,
+            reconcile,
             max_age,
             on_login,
         } => {
             if on_login {
                 println!("Add this line to ~/.config/hypr/hyprland.conf:");
                 println!();
-                println!("  exec-once = hyprflow restore --max-age 24h");
+                println!("  exec-once = hyprloom restore --reconcile --max-age 24h");
                 println!();
-                println!("This will restore your last saved session on login.");
+                println!("This will reconcile your last saved session on login.");
                 println!("Sessions older than 24h will be skipped.");
                 return;
             }
@@ -135,11 +143,11 @@ fn main() {
 
             let session = match load_session(&name, &sessions_dir) {
                 Ok(s) => s,
-                Err(hyprflow::session::SessionError::NotFound(_)) => {
+                Err(hyprloom::session::SessionError::NotFound(_)) => {
                     // If requesting the default session and it doesn't exist,
                     // fall back to the most recent autosave
                     if name == config.general.default_session {
-                        match hyprflow::session::list_autosave_sessions(&sessions_dir) {
+                        match hyprloom::session::list_autosave_sessions(&sessions_dir) {
                             Ok(autosaves) if !autosaves.is_empty() => {
                                 let fallback_name = &autosaves[0].name;
                                 println!(
@@ -174,7 +182,7 @@ fn main() {
             };
 
             if let Some(ref age_str) = max_age {
-                match hyprflow::session::parse_max_age(age_str) {
+                match hyprloom::session::parse_max_age(age_str) {
                     Ok(max_duration) => {
                         let age = chrono::Utc::now() - session.created_at;
                         if age > max_duration {
@@ -195,24 +203,60 @@ fn main() {
             }
 
             let hyprctl = RealHyprctl;
-            match restore_session(&session, &hyprctl, &config, dry_run, cli.verbose) {
-                Ok(report) => {
-                    if dry_run {
-                        println!("Dry run for session '{}':", session.name);
-                    } else {
-                        println!("Restored session '{}':", session.name);
+            if reconcile {
+                let process_info = RealProcessInfo;
+                match hyprloom::restore::reconcile_session(
+                    &session,
+                    &hyprctl,
+                    &process_info,
+                    &config,
+                    dry_run,
+                    cli.verbose,
+                ) {
+                    Ok(report) => {
+                        if dry_run {
+                            println!("Dry run for reconciliation of '{}':", session.name);
+                        } else {
+                            println!("Reconciled session '{}':", session.name);
+                        }
+                        println!(
+                            "  {} unchanged, {} moved, {} launched, {} extra left alone, {} skipped, {} failed",
+                            report.unchanged,
+                            report.moved,
+                            report.launched,
+                            report.extras,
+                            report.skipped,
+                            report.failed
+                        );
+                        for detail in &report.details {
+                            println!("  {}", detail);
+                        }
                     }
-                    println!(
-                        "  {} restored, {} skipped, {} failed",
-                        report.restored, report.skipped, report.failed
-                    );
-                    for detail in &report.details {
-                        println!("  {}", detail);
+                    Err(e) => {
+                        eprintln!("Error reconciling session: {}", e);
+                        std::process::exit(1);
                     }
                 }
-                Err(e) => {
-                    eprintln!("Error restoring session: {}", e);
-                    std::process::exit(1);
+            } else {
+                match restore_session(&session, &hyprctl, &config, dry_run, cli.verbose) {
+                    Ok(report) => {
+                        if dry_run {
+                            println!("Dry run for session '{}':", session.name);
+                        } else {
+                            println!("Restored session '{}':", session.name);
+                        }
+                        println!(
+                            "  {} restored, {} skipped, {} failed",
+                            report.restored, report.skipped, report.failed
+                        );
+                        for detail in &report.details {
+                            println!("  {}", detail);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error restoring session: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             }
         }
@@ -275,7 +319,7 @@ fn main() {
 
             // Show Brave profile mappings
             println!();
-            match hyprflow::brave::read_profiles() {
+            match hyprloom::brave::read_profiles() {
                 Ok(profiles) if !profiles.is_empty() => {
                     println!("Brave profiles detected:");
                     let profile_ws = config
@@ -316,21 +360,21 @@ fn main() {
                 std::process::exit(1);
             }
 
-            let systemd_dir = hyprflow::autosave::systemd_user_dir();
+            let systemd_dir = hyprloom::autosave::systemd_user_dir();
 
             if install {
-                match hyprflow::autosave::install(&systemd_dir) {
+                match hyprloom::autosave::install(&systemd_dir) {
                     Ok((service_path, timer_path)) => {
                         println!("Created:");
                         println!("  {}", service_path.display());
                         println!("  {}", timer_path.display());
                         println!();
                         println!("To enable and start:");
-                        println!("  systemctl --user enable --now hyprflow-autosave.timer");
+                        println!("  systemctl --user enable --now hyprloom-autosave.timer");
                         println!();
                         println!("To check status:");
-                        println!("  systemctl --user status hyprflow-autosave.timer");
-                        println!("  journalctl --user -u hyprflow-autosave.service");
+                        println!("  systemctl --user status hyprloom-autosave.timer");
+                        println!("  journalctl --user -u hyprloom-autosave.service");
                     }
                     Err(e) => {
                         eprintln!("Error installing autosave timer: {}", e);
@@ -338,7 +382,7 @@ fn main() {
                     }
                 }
             } else if uninstall {
-                match hyprflow::autosave::uninstall(&systemd_dir) {
+                match hyprloom::autosave::uninstall(&systemd_dir) {
                     Ok(()) => println!("Autosave timer removed."),
                     Err(e) => {
                         eprintln!("Error uninstalling autosave timer: {}", e);
@@ -348,7 +392,7 @@ fn main() {
             } else if now {
                 let hyprctl = RealHyprctl;
                 let process_info = RealProcessInfo;
-                let name = hyprflow::session::autosave_name_now();
+                let name = hyprloom::session::autosave_name_now();
 
                 match capture_session(&name, &hyprctl, &process_info, &config) {
                     Ok(session) => {
@@ -359,11 +403,11 @@ fn main() {
                         }
 
                         let retain = config.general.autosave_retain;
-                        let total_before = hyprflow::session::list_autosave_sessions(&sessions_dir)
+                        let total_before = hyprloom::session::list_autosave_sessions(&sessions_dir)
                             .map(|s| s.len())
                             .unwrap_or(0);
                         let pruned =
-                            hyprflow::session::rotate_autosaves(&sessions_dir, retain).unwrap_or(0);
+                            hyprloom::session::rotate_autosaves(&sessions_dir, retain).unwrap_or(0);
                         let retained = total_before.saturating_sub(pruned);
 
                         println!(
@@ -378,18 +422,18 @@ fn main() {
                 }
             } else {
                 // Status mode (no flags)
-                let installed = hyprflow::autosave::is_installed(&systemd_dir);
-                let active = hyprflow::autosave::is_active();
+                let installed = hyprloom::autosave::is_installed(&systemd_dir);
+                let active = hyprloom::autosave::is_active();
 
                 if !installed {
                     println!("Autosave is not configured.");
-                    println!("Run 'hyprflow autosave --install' to set up the systemd timer.");
+                    println!("Run 'hyprloom autosave --install' to set up the systemd timer.");
                 } else if !active {
                     println!("Autosave timer is installed but not active.");
-                    println!("  systemctl --user enable --now hyprflow-autosave.timer");
+                    println!("  systemctl --user enable --now hyprloom-autosave.timer");
                 } else {
                     println!("Autosave is active (every 10min).");
-                    match hyprflow::session::list_autosave_sessions(&sessions_dir) {
+                    match hyprloom::session::list_autosave_sessions(&sessions_dir) {
                         Ok(sessions) if !sessions.is_empty() => {
                             let latest = &sessions[0];
                             println!(
@@ -406,7 +450,7 @@ fn main() {
                         Ok(_) => println!("No autosave sessions yet."),
                         Err(e) => println!("Could not list sessions: {e}"),
                     }
-                    println!("To disable: hyprflow autosave --uninstall");
+                    println!("To disable: hyprloom autosave --uninstall");
                 }
             }
         }

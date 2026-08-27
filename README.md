@@ -1,14 +1,16 @@
-# hyprflow
+# hyprloom
 
 Save and restore [Hyprland](https://hyprland.org) window sessions.
 
-When you reboot or after a power loss, hyprflow restores your applications to their correct workspaces and positions.
+When you reboot or after a power loss, hyprloom restores your applications to their correct workspaces and positions.
 
 ## Features
 
 - **Save** current session — captures all windows, positions, workspaces, and monitor layout
 - **Restore** saved session — relaunches apps and positions them precisely
+- **Reconcile** saved session — reuses open windows, repairs only mismatches, and leaves extras alone
 - **Kitty terminal support** — restores working directory + shows hint of last command
+- **Ghostty-aware restore** — recognizes the Linux app class and restores its working directory when configured
 - **Smart filtering** — ignores transient windows (Waybar, Wofi, popups)
 - **Dry run** — preview restore without executing
 - **Brave profile support** — restores each profile to its configured workspace
@@ -27,40 +29,41 @@ cargo install --path .
 
 ```bash
 # Using your preferred AUR helper
-yay -S hyprflow
+yay -S hyprloom
 ```
 
 ## Usage
 
 ```bash
 # Save current session
-hyprflow save              # saves as "latest"
-hyprflow save work         # saves as "work"
+hyprloom save              # saves as "latest"
+hyprloom save work         # saves as "work"
 
 # Restore a session
-hyprflow restore           # restores "latest"
-hyprflow restore work      # restores "work"
-hyprflow restore --dry-run # preview without executing
-hyprflow restore --max-age 24h  # skip if session older than 24h
-hyprflow restore --on-login     # print exec-once line for hyprland.conf
+hyprloom restore           # restores "latest"
+hyprloom restore work      # restores "work"
+hyprloom restore --dry-run # preview without executing
+hyprloom restore work --reconcile # repair/reuse open windows; launch only missing ones
+hyprloom restore --max-age 24h  # skip if session older than 24h
+hyprloom restore --on-login     # print exec-once line for hyprland.conf
 
 # Manage sessions
-hyprflow list              # list all saved sessions
-hyprflow delete work       # delete a session
+hyprloom list              # list all saved sessions
+hyprloom delete work       # delete a session
 
 # Show config
-hyprflow config
+hyprloom config
 
 # Autosave
-hyprflow autosave              # check timer status
-hyprflow autosave --now        # save now + rotate old
-hyprflow autosave --install    # set up systemd timer
-hyprflow autosave --uninstall  # remove systemd timer
+hyprloom autosave              # check timer status
+hyprloom autosave --now        # save now + rotate old
+hyprloom autosave --install    # set up systemd timer
+hyprloom autosave --uninstall  # remove systemd timer
 ```
 
 ## Configuration
 
-Config file: `~/.config/hyprflow/config.toml`
+Config file: `~/.config/hyprloom/config.toml`
 
 ```toml
 [general]
@@ -78,18 +81,39 @@ capture_cwd = true
 capture_last_command = true
 hint_template = "# Last: {last_command}\n# Dir: {cwd}"
 
+[apps."com.mitchellh.ghostty"]
+binary = "ghostty"
+capture_cwd = true
+
 [apps.brave-browser]
 binary = "brave"
 ```
 
+### Reconciliation
+
+Reconciliation is the additive restore mode. For every saved target, Hyprloom
+first tries to match an existing window using its initial app identity, title,
+working directory, and saved geometry. Each current window can be used at most
+once. It then:
+
+- does nothing for targets already in place;
+- moves or resizes matched targets that are in the wrong workspace, monitor, or position;
+- launches only targets that are genuinely missing;
+- leaves extra windows open and reports them.
+
+Run it repeatedly or use it during login; once the target set is satisfied, the
+pass is idempotent. Use the normal `restore` mode when you explicitly want the
+legacy launch/skip behavior, or Deskloom's Replace action when you want a clean
+desktop first.
+
 ### Brave Profile Support
 
-Hyprflow captures and restores Brave browser profiles individually. Since Brave
+Hyprloom captures and restores Brave browser profiles individually. Since Brave
 runs all windows in a single process, profiles are detected from Brave's
 `Local State` file rather than from window processes.
 
 Only profiles listed in `profile_workspaces` are captured and restored. Use
-`hyprflow config` to see detected profiles and their mapping status.
+`hyprloom config` to see detected profiles and their mapping status.
 
 ```toml
 [apps.brave-browser]
@@ -103,22 +127,22 @@ configured workspace. Profiles not in `profile_workspaces` are skipped.
 
 ### Autosave
 
-Hyprflow can automatically save sessions at regular intervals using a systemd
+Hyprloom can automatically save sessions at regular intervals using a systemd
 timer. Autosave sessions are named with timestamps (`autosave-20260309T143000`)
 and automatically rotated, keeping only the last N saves.
 
 ```bash
 # Check autosave status
-hyprflow autosave
+hyprloom autosave
 
 # Run autosave manually (capture + rotate)
-hyprflow autosave --now
+hyprloom autosave --now
 
 # Install systemd timer (saves every 10 minutes)
-hyprflow autosave --install
+hyprloom autosave --install
 
 # Remove systemd timer
-hyprflow autosave --uninstall
+hyprloom autosave --uninstall
 ```
 
 Configure retention in `config.toml`:
@@ -133,13 +157,13 @@ autosave_retain = 5   # keep last 5 autosave sessions (default)
 To automatically restore your session when Hyprland starts:
 
 ```bash
-hyprflow restore --on-login
+hyprloom restore --on-login
 ```
 
 This prints an `exec-once` line to add to `~/.config/hypr/hyprland.conf`:
 
 ```
-exec-once = hyprflow restore --max-age 24h
+exec-once = hyprloom restore --reconcile --max-age 24h
 ```
 
 The `--max-age` flag prevents restoring stale sessions. Accepted formats:
@@ -147,13 +171,20 @@ The `--max-age` flag prevents restoring stale sessions. Accepted formats:
 
 ### Sessions storage
 
-Sessions are stored as JSON files in `~/.local/share/hyprflow/sessions/`.
+Sessions are stored as JSON files in `~/.local/share/hyprloom/sessions/`.
+Existing sessions from `~/.local/share/hyprflow/sessions/` are copied there on
+first use and are never removed.
 
 ## How it works
 
 **Save:** Captures window state via `hyprctl clients -j`, reads terminal CWD from `/proc`, and serializes to JSON.
 
 **Restore:** Launches apps sequentially, polls for new windows via address diff, then positions each window using `hyprctl dispatch` with exact pixel coordinates.
+
+**Reconcile:** Captures the current client list once, creates a deterministic
+one-to-one assignment to saved targets, applies only the required dispatches to
+matched windows, and uses the normal launch-and-detect path for missing targets.
+Unmatched current windows are never closed by reconciliation.
 
 ## Requirements
 

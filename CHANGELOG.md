@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.0] - 2026-08-27
+
+### Added
+
+- Hyprloom fork identity and namespaced configuration, data, and systemd units
+- `restore --reconcile` additive reconciliation mode with one-to-one matching
+- Placement-only repair for existing windows, missing-window launches, and extra-window preservation
+- Initial class/title capture and Ghostty binary/working-directory support
+- Non-destructive migration of existing Hyprflow session files
+
 ## [0.2.1] - 2026-03-11
 
 ### Fixed
@@ -19,10 +29,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - CI/CD pipeline: GitHub Actions for tests/lint + auto-publish to AUR on version tag
 - Brave browser profile support: capture active profiles from `Local State`, restore one window per profile with `--profile-directory` flag
 - Configurable workspace mapping per Brave profile via `profile_workspaces` in config.toml
-- `hyprflow config` now displays detected Brave profiles with mapping status
+- `hyprloom config` now displays detected Brave profiles with mapping status
 - Count-based duplicate detection on restore: skips already-running windows, restores only missing count
-- Autosave with rotation: `hyprflow autosave --now` captures and keeps last N sessions (configurable via `autosave_retain`)
-- Systemd timer management: `hyprflow autosave --install` / `--uninstall` for automated periodic saves
+- Autosave with rotation: `hyprloom autosave --now` captures and keeps last N sessions (configurable via `autosave_retain`)
+- Systemd timer management: `hyprloom autosave --install` / `--uninstall` for automated periodic saves
 - `--max-age` flag for restore: skip restore if session is older than specified duration (e.g., `24h`, `7d`)
 - `--on-login` flag for restore: prints `exec-once` line for Hyprland config
 
@@ -40,17 +50,17 @@ Initial release.
 
 ### Added
 
-- `hyprflow save [name]` — save current Hyprland session (defaults to "latest")
-- `hyprflow restore [name]` — restore saved session with sequential launch and exact pixel positioning
-- `hyprflow list` — list all saved sessions with metadata
-- `hyprflow delete <name>` — delete a named session
-- `hyprflow config` — print current configuration
+- `hyprloom save [name]` — save current Hyprland session (defaults to "latest")
+- `hyprloom restore [name]` — restore saved session with sequential launch and exact pixel positioning
+- `hyprloom list` — list all saved sessions with metadata
+- `hyprloom delete <name>` — delete a named session
+- `hyprloom config` — print current configuration
 - `--dry-run` flag for restore preview without executing
 - `--verbose` flag for detailed output during save and restore
 - Kitty terminal support: restore working directory and show last command hint
 - Configurable ignore list for transient windows (Waybar, Wofi, Mako, etc.)
-- TOML configuration at `~/.config/hyprflow/config.toml`
-- Sessions stored as JSON at `~/.local/share/hyprflow/sessions/`
+- TOML configuration at `~/.config/hyprloom/config.toml`
+- Sessions stored as JSON at `~/.local/share/hyprloom/sessions/`
 - Trait-based abstraction (`HyprctlClient`, `ProcessInfoProvider`) for full unit testability
 - AUR PKGBUILD for Arch Linux
 
@@ -58,4 +68,3 @@ Initial release.
 
 - Skip kitten `__atexit__` helper process when capturing Kitty CWD to avoid reading the wrong working directory
 - Derive `Default` for `Config` instead of manual implementation (clippy compliance)
-

@@ -494,7 +494,7 @@ feat: restore Brave windows by profile with configurable workspaces
 ### Task 6: Update user's config.toml and test end-to-end
 
 **Files:**
-- Verify: `~/.config/hyprflow/config.toml`
+- Verify: `~/.config/hyprloom/config.toml`
 
 **Step 1: Add profile config**
 
@@ -512,12 +512,12 @@ Run: `cargo build --release`
 
 **Step 3: Test capture**
 
-Run: `./target/release/hyprflow save profile-test --force`
+Run: `./target/release/hyprloom save profile-test --force`
 Verify: session JSON contains `brave_profiles` array with expected profiles.
 
 **Step 4: Test dry-run restore**
 
-Run: `./target/release/hyprflow restore profile-test --dry-run`
+Run: `./target/release/hyprloom restore profile-test --dry-run`
 Verify: output shows profile-based brave entries instead of generic brave windows.
 
 **Step 5: Commit**

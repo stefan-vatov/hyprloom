@@ -5,7 +5,7 @@
 
 ## Overview
 
-Add `--max-age` flag to `hyprflow restore` and `--on-login` flag that prints the
+Add `--max-age` flag to `hyprloom restore` and `--on-login` flag that prints the
 `exec-once` line for the user to paste into their Hyprland config.
 
 ## Flag: `--max-age <duration>`
@@ -39,7 +39,7 @@ Added to the existing `restore` subcommand.
 ```
 Add this line to ~/.config/hypr/hyprland.conf:
 
-  exec-once = hyprflow restore --max-age 24h
+  exec-once = hyprloom restore --max-age 24h
 
 This will restore your last saved session on login.
 Sessions older than 24h will be skipped.

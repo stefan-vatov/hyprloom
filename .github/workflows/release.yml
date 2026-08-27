@@ -31,11 +31,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: target/release/hyprflow
+          files: target/release/hyprloom
 
   # Publishes the updated PKGBUILD to AUR.
   # Required secret: AUR_SSH_PRIVATE_KEY
-  #   - Generate: ssh-keygen -t ed25519 -C "hyprflow-aur" -f aur_key
+  #   - Generate: ssh-keygen -t ed25519 -C "hyprloom-aur" -f aur_key
   #   - Add public key to your AUR account: https://aur.archlinux.org/account
   #   - Add private key as repository secret AUR_SSH_PRIVATE_KEY
   aur-publish:
@@ -52,7 +52,7 @@ jobs:
       - name: Download source tarball and compute checksum
         id: checksum
         run: |
-          curl -sL "https://github.com/iSorensen/hyprflow/archive/${GITHUB_REF_NAME}.tar.gz" \
+          curl -sL "https://github.com/thethracian/hyprloom/archive/${GITHUB_REF_NAME}.tar.gz" \
             -o source.tar.gz
           sha256=$(sha256sum source.tar.gz | cut -d' ' -f1)
           echo "sha256=${sha256}" >> "$GITHUB_OUTPUT"
@@ -68,7 +68,7 @@ jobs:
             >> ~/.ssh/config
 
       - name: Clone AUR repo
-        run: git clone ssh://aur@aur.archlinux.org/hyprflow.git aur-repo
+        run: git clone ssh://aur@aur.archlinux.org/hyprloom.git aur-repo
 
       - name: Update PKGBUILD
         working-directory: aur-repo

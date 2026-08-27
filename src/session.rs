@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 
-// === Hyprflow session structs (what we save to disk) ===
+// === Hyprloom session structs (what we save to disk) ===
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BraveProfile {
@@ -32,6 +33,13 @@ pub struct Monitor {
 pub struct SessionClient {
     pub class: String,
     pub title: String,
+    /// Initial Hyprland app identity.  These fields are optional in spirit:
+    /// older session files do not contain them and reconciliation falls back
+    /// to `class` and `title` when they are empty.
+    #[serde(default)]
+    pub initial_class: String,
+    #[serde(default)]
+    pub initial_title: String,
     pub workspace: i32,
     pub monitor: String,
     pub at: [i32; 2],
@@ -109,7 +117,7 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
             }
         }
     }
-    summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    summaries.sort_by_key(|summary| Reverse(summary.created_at));
     Ok(summaries)
 }
 
@@ -124,6 +132,33 @@ pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionErro
 
 pub fn session_exists(name: &str, sessions_dir: &Path) -> bool {
     sessions_dir.join(format!("{name}.json")).exists()
+}
+
+/// Copy legacy hyprflow sessions into the fork's storage without removing or
+/// overwriting anything.  This is intentionally idempotent so a user can run
+/// the fork repeatedly while keeping the original files as a rollback path.
+pub fn migrate_legacy_sessions(
+    sessions_dir: &Path,
+    legacy_sessions_dir: &Path,
+) -> Result<usize, SessionError> {
+    if sessions_dir == legacy_sessions_dir || !legacy_sessions_dir.exists() {
+        return Ok(0);
+    }
+
+    std::fs::create_dir_all(sessions_dir)?;
+    let mut copied = 0;
+    for entry in std::fs::read_dir(legacy_sessions_dir)? {
+        let entry = entry?;
+        let source = entry.path();
+        if source.extension().map(|ext| ext == "json").unwrap_or(false) {
+            let destination = sessions_dir.join(entry.file_name());
+            if !destination.exists() {
+                std::fs::copy(source, destination)?;
+                copied += 1;
+            }
+        }
+    }
+    Ok(copied)
 }
 
 // === Autosave helpers ===
@@ -192,6 +227,10 @@ pub struct HyprClient {
     pub address: String,
     pub class: String,
     pub title: String,
+    #[serde(default, rename = "initialClass")]
+    pub initial_class: String,
+    #[serde(default, rename = "initialTitle")]
+    pub initial_title: String,
     pub workspace: HyprWorkspace,
     pub monitor: i32,
     pub at: [i32; 2],
@@ -239,6 +278,8 @@ mod tests {
             clients: vec![SessionClient {
                 class: "kitty".to_string(),
                 title: "Claude Code".to_string(),
+                initial_class: "kitty".to_string(),
+                initial_title: "kitty".to_string(),
                 workspace: 4,
                 monitor: "DP-4".to_string(),
                 at: [12, 50],
@@ -294,6 +335,8 @@ mod tests {
             clients: vec![SessionClient {
                 class: "kitty".to_string(),
                 title: "test".to_string(),
+                initial_class: "kitty".to_string(),
+                initial_title: "kitty".to_string(),
                 workspace: 1,
                 monitor: "DP-4".to_string(),
                 at: [0, 0],
@@ -370,6 +413,28 @@ mod tests {
         let loaded = load_session("work", dir.path()).unwrap();
         assert_eq!(loaded.name, "work");
         assert_eq!(loaded.clients.len(), 1);
+    }
+
+    #[test]
+    fn test_migrate_legacy_sessions_is_idempotent_and_non_destructive() {
+        let legacy = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        save_session(&make_test_session("work"), legacy.path()).unwrap();
+
+        assert_eq!(
+            migrate_legacy_sessions(current.path(), legacy.path()).unwrap(),
+            1
+        );
+        assert_eq!(load_session("work", current.path()).unwrap().name, "work");
+
+        // Existing fork data is never overwritten, and a second pass copies nothing.
+        let existing = make_test_session("work");
+        save_session(&existing, current.path()).unwrap();
+        assert_eq!(
+            migrate_legacy_sessions(current.path(), legacy.path()).unwrap(),
+            0
+        );
+        assert_eq!(load_session("work", current.path()).unwrap().name, "work");
     }
 
     #[test]
@@ -507,6 +572,7 @@ mod tests {
         let kitty = &clients[0];
         assert_eq!(kitty.address, "0x55c46f7e1350");
         assert_eq!(kitty.class, "kitty");
+        assert_eq!(kitty.initial_class, "kitty");
         assert_eq!(kitty.title, "Claude Code");
         assert_eq!(kitty.workspace.id, 4);
         assert_eq!(kitty.workspace.name, "4");

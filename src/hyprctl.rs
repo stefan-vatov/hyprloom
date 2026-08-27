@@ -17,6 +17,13 @@ pub struct HyprClient {
     pub address: String,
     pub class: String,
     pub title: String,
+    /// The app identity reported when the window was first created.  Unlike
+    /// `class`/`title`, these values stay useful when an app changes its
+    /// title or class after launch.
+    #[serde(default, rename = "initialClass")]
+    pub initial_class: String,
+    #[serde(default, rename = "initialTitle")]
+    pub initial_title: String,
     pub workspace: HyprWorkspace,
     pub monitor: i32,
     pub at: [i32; 2],

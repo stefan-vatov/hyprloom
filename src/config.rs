@@ -90,16 +90,23 @@ impl Default for FilterConfig {
 }
 
 pub fn load_config() -> Config {
-    let path = config_path();
-    if path.exists() {
-        let content = std::fs::read_to_string(&path).unwrap_or_default();
-        toml::from_str(&content).unwrap_or_default()
-    } else {
-        Config::default()
+    for path in [config_path(), legacy_config_path()] {
+        if path.exists() {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            return toml::from_str(&content).unwrap_or_default();
+        }
     }
+    Config::default()
 }
 
 pub fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config"))
+        .join("hyprloom")
+        .join("config.toml")
+}
+
+pub fn legacy_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
         .join("hyprflow")
@@ -107,6 +114,13 @@ pub fn config_path() -> PathBuf {
 }
 
 pub fn sessions_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.local/share"))
+        .join("hyprloom")
+        .join("sessions")
+}
+
+pub fn legacy_sessions_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
         .join("hyprflow")

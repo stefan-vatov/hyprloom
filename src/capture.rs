@@ -114,12 +114,25 @@ fn build_session_client(
         .cloned()
         .unwrap_or_else(|| format!("monitor-{}", client.monitor));
 
-    let app_config = config.apps.get(&client.class);
+    let app_config = config
+        .apps
+        .get(&client.class)
+        .or_else(|| config.apps.get(&client.initial_class));
     let launch = build_launch_info(client, app_config, process_info);
 
     SessionClient {
         class: client.class.clone(),
         title: client.title.clone(),
+        initial_class: if client.initial_class.is_empty() {
+            client.class.clone()
+        } else {
+            client.initial_class.clone()
+        },
+        initial_title: if client.initial_title.is_empty() {
+            client.title.clone()
+        } else {
+            client.initial_title.clone()
+        },
         workspace: client.workspace.id,
         monitor: monitor_name,
         at: client.at,
@@ -138,7 +151,13 @@ fn build_launch_info(
 ) -> LaunchInfo {
     let binary = app_config
         .and_then(|a| a.binary.clone())
-        .unwrap_or_else(|| client.class.clone());
+        .unwrap_or_else(|| {
+            if is_ghostty_class(&client.class) || is_ghostty_class(&client.initial_class) {
+                "ghostty".to_string()
+            } else {
+                client.class.clone()
+            }
+        });
 
     let capture_cwd = app_config.and_then(|a| a.capture_cwd).unwrap_or(false);
     let capture_cmd = app_config
@@ -160,7 +179,15 @@ fn build_launch_info(
                 .find(|c| !SKIP_COMMANDS.iter().any(|s| c.cmdline.starts_with(s)))
             {
                 if capture_cwd {
-                    args.push("--directory".to_string());
+                    args.push(
+                        if is_ghostty_class(&client.class)
+                            || is_ghostty_class(&client.initial_class)
+                        {
+                            "--working-directory".to_string()
+                        } else {
+                            "--directory".to_string()
+                        },
+                    );
                     args.push(shell.cwd.to_string_lossy().to_string());
                 }
 
@@ -210,6 +237,10 @@ fn build_launch_info(
         args,
         hint,
     }
+}
+
+fn is_ghostty_class(class: &str) -> bool {
+    class.eq_ignore_ascii_case("ghostty") || class.eq_ignore_ascii_case("com.mitchellh.ghostty")
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────────
@@ -274,6 +305,8 @@ mod tests {
             address: "0xdeadbeef".to_string(),
             class: class.to_string(),
             title: format!("{class} window"),
+            initial_class: class.to_string(),
+            initial_title: class.to_string(),
             workspace: RawWorkspace {
                 id: 1,
                 name: "1".to_string(),
@@ -450,6 +483,60 @@ mod tests {
             "no args expected without CWD capture"
         );
         assert!(launch.hint.is_none());
+    }
+
+    #[test]
+    fn test_capture_uses_ghostty_binary_and_working_directory_flag() {
+        const GHOSTTY_PID: u32 = 3501;
+        const SHELL_PID: u32 = 3502;
+
+        let hyprctl = MockHyprctl {
+            clients: vec![make_hypr_client("com.mitchellh.ghostty", GHOSTTY_PID)],
+            monitors: vec![make_monitor("DP-1")],
+        };
+
+        let mut app_configs = HashMap::new();
+        app_configs.insert(
+            "com.mitchellh.ghostty".to_string(),
+            AppConfig {
+                binary: None,
+                capture_cwd: Some(true),
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: None,
+                default_workspace: None,
+            },
+        );
+
+        let config = Config {
+            general: GeneralConfig::default(),
+            filters: FilterConfig {
+                ignore_classes: vec![],
+            },
+            apps: app_configs,
+        };
+
+        let process = MockProcess {
+            cwds: HashMap::new(),
+            children: HashMap::from([(
+                GHOSTTY_PID,
+                vec![ChildProcess {
+                    pid: SHELL_PID,
+                    cwd: PathBuf::from("/home/user/project"),
+                    cmdline: "zsh".to_string(),
+                }],
+            )]),
+        };
+
+        let session = capture_session("test", &hyprctl, &process, &config).unwrap();
+        let client = &session.clients[0];
+
+        assert_eq!(client.launch.command, "ghostty");
+        assert_eq!(
+            client.launch.args,
+            vec!["--working-directory", "/home/user/project"]
+        );
+        assert_eq!(client.initial_class, "com.mitchellh.ghostty");
     }
 
     // ── Additional: monitor name resolution ───────────────────────────────

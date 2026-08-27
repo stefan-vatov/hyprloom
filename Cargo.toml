@@ -1,10 +1,10 @@
 [package]
-name = "hyprflow"
-version = "0.2.1"
+name = "hyprloom"
+version = "0.3.0"
 edition = "2021"
-description = "Save and restore Hyprland window sessions"
+description = "Save, restore, and reconcile Hyprland window sessions"
 license = "MIT"
-repository = "https://github.com/iSorensen/hyprflow"
+repository = "https://github.com/thethracian/hyprloom"
 readme = "README.md"
 keywords = ["hyprland", "wayland", "session", "restore"]
 categories = ["command-line-utilities"]

@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add `hyprflow autosave` subcommand with session rotation, systemd timer install/uninstall, and status display.
+**Goal:** Add `hyprloom autosave` subcommand with session rotation, systemd timer install/uninstall, and status display.
 
 **Architecture:** New `src/autosave.rs` module handles rotation logic and systemd unit generation. Config gets `autosave_retain` field. Main.rs gets `Autosave` subcommand with `--now`, `--install`, `--uninstall` flags. No flag = status check.
 
@@ -242,8 +242,8 @@ Create `src/autosave.rs` with tests only:
 ```rust
 use std::path::{Path, PathBuf};
 
-const SERVICE_NAME: &str = "hyprflow-autosave.service";
-const TIMER_NAME: &str = "hyprflow-autosave.timer";
+const SERVICE_NAME: &str = "hyprloom-autosave.service";
+const TIMER_NAME: &str = "hyprloom-autosave.timer";
 
 fn systemd_user_dir() -> PathBuf {
     dirs::config_dir()
@@ -254,10 +254,10 @@ fn systemd_user_dir() -> PathBuf {
 
 fn service_content() -> String {
     let binary = std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("hyprflow"));
+        .unwrap_or_else(|_| PathBuf::from("hyprloom"));
     format!(
         "[Unit]\n\
-         Description=Hyprflow autosave session\n\
+         Description=Hyprloom autosave session\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -268,7 +268,7 @@ fn service_content() -> String {
 
 fn timer_content() -> String {
     "[Unit]\n\
-     Description=Hyprflow autosave timer\n\
+     Description=Hyprloom autosave timer\n\
      \n\
      [Timer]\n\
      OnUnitActiveSec=10min\n\
@@ -291,7 +291,7 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
 pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
     // Try to disable timer first (best-effort — may fail if not enabled)
     let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", "hyprflow-autosave.timer"])
+        .args(["--user", "disable", "--now", "hyprloom-autosave.timer"])
         .output();
 
     let service_path = systemd_dir.join(SERVICE_NAME);
@@ -311,7 +311,7 @@ pub fn is_installed(systemd_dir: &Path) -> bool {
 
 pub fn is_active() -> bool {
     std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "hyprflow-autosave.timer"])
+        .args(["--user", "is-active", "--quiet", "hyprloom-autosave.timer"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -319,7 +319,7 @@ pub fn is_active() -> bool {
 
 pub fn is_enabled() -> bool {
     std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "--quiet", "hyprflow-autosave.timer"])
+        .args(["--user", "is-enabled", "--quiet", "hyprloom-autosave.timer"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -435,21 +435,21 @@ Autosave {
 
 ```rust
 Commands::Autosave { now, install, uninstall } => {
-    let systemd_dir = hyprflow::autosave::systemd_user_dir();
+    let systemd_dir = hyprloom::autosave::systemd_user_dir();
 
     if install {
-        match hyprflow::autosave::install(&systemd_dir) {
+        match hyprloom::autosave::install(&systemd_dir) {
             Ok((service_path, timer_path)) => {
                 println!("Created:");
                 println!("  {}", service_path.display());
                 println!("  {}", timer_path.display());
                 println!();
                 println!("To enable and start:");
-                println!("  systemctl --user enable --now hyprflow-autosave.timer");
+                println!("  systemctl --user enable --now hyprloom-autosave.timer");
                 println!();
                 println!("To check status:");
-                println!("  systemctl --user status hyprflow-autosave.timer");
-                println!("  journalctl --user -u hyprflow-autosave.service");
+                println!("  systemctl --user status hyprloom-autosave.timer");
+                println!("  journalctl --user -u hyprloom-autosave.service");
             }
             Err(e) => {
                 eprintln!("Error installing autosave timer: {}", e);
@@ -457,7 +457,7 @@ Commands::Autosave { now, install, uninstall } => {
             }
         }
     } else if uninstall {
-        match hyprflow::autosave::uninstall(&systemd_dir) {
+        match hyprloom::autosave::uninstall(&systemd_dir) {
             Ok(()) => println!("Autosave timer removed."),
             Err(e) => {
                 eprintln!("Error uninstalling autosave timer: {}", e);
@@ -467,7 +467,7 @@ Commands::Autosave { now, install, uninstall } => {
     } else if now {
         let hyprctl = RealHyprctl;
         let process_info = RealProcessInfo;
-        let name = hyprflow::session::autosave_name_now();
+        let name = hyprloom::session::autosave_name_now();
 
         match capture_session(&name, &hyprctl, &process_info, &config) {
             Ok(session) => {
@@ -478,10 +478,10 @@ Commands::Autosave { now, install, uninstall } => {
                 }
 
                 let retain = config.general.autosave_retain;
-                let pruned = hyprflow::session::rotate_autosaves(&sessions_dir, retain)
+                let pruned = hyprloom::session::rotate_autosaves(&sessions_dir, retain)
                     .unwrap_or(0);
 
-                let total = hyprflow::session::list_autosave_sessions(&sessions_dir)
+                let total = hyprloom::session::list_autosave_sessions(&sessions_dir)
                     .map(|s| s.len())
                     .unwrap_or(0);
 
@@ -497,18 +497,18 @@ Commands::Autosave { now, install, uninstall } => {
         }
     } else {
         // Status mode (no flags)
-        let installed = hyprflow::autosave::is_installed(&systemd_dir);
-        let active = hyprflow::autosave::is_active();
+        let installed = hyprloom::autosave::is_installed(&systemd_dir);
+        let active = hyprloom::autosave::is_active();
 
         if !installed {
             println!("Autosave is not configured.");
-            println!("Run 'hyprflow autosave --install' to set up the systemd timer.");
+            println!("Run 'hyprloom autosave --install' to set up the systemd timer.");
         } else if !active {
             println!("Autosave timer is installed but not active.");
-            println!("  systemctl --user enable --now hyprflow-autosave.timer");
+            println!("  systemctl --user enable --now hyprloom-autosave.timer");
         } else {
             println!("Autosave is active (every 10min).");
-            match hyprflow::session::list_autosave_sessions(&sessions_dir) {
+            match hyprloom::session::list_autosave_sessions(&sessions_dir) {
                 Ok(sessions) if !sessions.is_empty() => {
                     let latest = &sessions[0];
                     println!(
@@ -525,7 +525,7 @@ Commands::Autosave { now, install, uninstall } => {
                 Ok(_) => println!("No autosave sessions yet."),
                 Err(e) => println!("Could not list sessions: {e}"),
             }
-            println!("To disable: hyprflow autosave --uninstall");
+            println!("To disable: hyprloom autosave --uninstall");
         }
     }
 }
@@ -572,7 +572,7 @@ Read `tests/cli_test.rs` to understand the test patterns used.
 ```rust
 #[test]
 fn test_autosave_status_not_configured() {
-    let cmd = Command::cargo_bin("hyprflow").unwrap();
+    let cmd = Command::cargo_bin("hyprloom").unwrap();
     // Without Hyprland running, at minimum we can test the --help output
     cmd.arg("autosave").arg("--help")
         .assert()
@@ -651,7 +651,7 @@ Add entry for autosave feature under v0.2.
 
 **Step 3: Update README.md**
 
-Add autosave section documenting `hyprflow autosave` usage with all flags.
+Add autosave section documenting `hyprloom autosave` usage with all flags.
 
 **Step 4: Update config.toml example**
 

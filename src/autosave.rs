@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-const SERVICE_NAME: &str = "hyprflow-autosave.service";
-const TIMER_NAME: &str = "hyprflow-autosave.timer";
+const SERVICE_NAME: &str = "hyprloom-autosave.service";
+const TIMER_NAME: &str = "hyprloom-autosave.timer";
 
 pub fn systemd_user_dir() -> PathBuf {
     dirs::config_dir()
@@ -11,10 +11,10 @@ pub fn systemd_user_dir() -> PathBuf {
 }
 
 fn service_content() -> String {
-    let binary = which::which("hyprflow").unwrap_or_else(|_| PathBuf::from("hyprflow"));
+    let binary = which::which("hyprloom").unwrap_or_else(|_| PathBuf::from("hyprloom"));
     format!(
         "[Unit]\n\
-         Description=Hyprflow autosave session\n\
+         Description=Hyprloom autosave session\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
@@ -25,7 +25,7 @@ fn service_content() -> String {
 
 fn timer_content() -> String {
     "[Unit]\n\
-     Description=Hyprflow autosave timer\n\
+     Description=Hyprloom autosave timer\n\
      \n\
      [Timer]\n\
      OnUnitActiveSec=10min\n\
@@ -39,8 +39,8 @@ fn timer_content() -> String {
 pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(systemd_dir)?;
 
-    if which::which("hyprflow").is_err() {
-        eprintln!("Warning: hyprflow not found in PATH. Edit the generated .service file with the full path.");
+    if which::which("hyprloom").is_err() {
+        eprintln!("Warning: hyprloom not found in PATH. Edit the generated .service file with the full path.");
     }
 
     let service_path = systemd_dir.join(SERVICE_NAME);
@@ -52,7 +52,7 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
 
 pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
     let result = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", "hyprflow-autosave.timer"])
+        .args(["--user", "disable", "--now", "hyprloom-autosave.timer"])
         .output();
     if let Ok(output) = result {
         if !output.status.success() {
@@ -78,7 +78,7 @@ pub fn is_installed(systemd_dir: &Path) -> bool {
 
 pub fn is_active() -> bool {
     std::process::Command::new("systemctl")
-        .args(["--user", "is-active", "--quiet", "hyprflow-autosave.timer"])
+        .args(["--user", "is-active", "--quiet", "hyprloom-autosave.timer"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -86,7 +86,7 @@ pub fn is_active() -> bool {
 
 pub fn is_enabled() -> bool {
     std::process::Command::new("systemctl")
-        .args(["--user", "is-enabled", "--quiet", "hyprflow-autosave.timer"])
+        .args(["--user", "is-enabled", "--quiet", "hyprloom-autosave.timer"])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)

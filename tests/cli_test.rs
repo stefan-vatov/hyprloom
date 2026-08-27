@@ -1,20 +1,17 @@
-use assert_cmd::Command;
 use predicates::prelude::*;
 
 #[test]
 fn test_cli_version() {
-    Command::cargo_bin("hyprflow")
-        .unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
         .arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("hyprflow"));
+        .stdout(predicate::str::contains("hyprloom"));
 }
 
 #[test]
 fn test_cli_help() {
-    Command::cargo_bin("hyprflow")
-        .unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
         .arg("--help")
         .assert()
         .success()
@@ -25,10 +22,18 @@ fn test_cli_help() {
 }
 
 #[test]
+fn test_cli_help_describes_reconciliation() {
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
+        .args(["restore", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reconcile"));
+}
+
+#[test]
 fn test_cli_list_empty() {
     let tmp = tempfile::tempdir().unwrap();
-    Command::cargo_bin("hyprflow")
-        .unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
         .arg("list")
         .env("XDG_DATA_HOME", tmp.path())
         .assert()
@@ -39,8 +44,7 @@ fn test_cli_list_empty() {
 #[test]
 fn test_cli_delete_nonexistent() {
     let tmp = tempfile::tempdir().unwrap();
-    Command::cargo_bin("hyprflow")
-        .unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
         .args(["delete", "nonexistent"])
         .env("XDG_DATA_HOME", tmp.path())
         .assert()
@@ -49,8 +53,7 @@ fn test_cli_delete_nonexistent() {
 
 #[test]
 fn test_cli_config_shows_paths() {
-    Command::cargo_bin("hyprflow")
-        .unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("hyprloom")
         .arg("config")
         .assert()
         .success()
@@ -60,7 +63,7 @@ fn test_cli_config_shows_paths() {
 
 #[test]
 fn test_autosave_help() {
-    let mut cmd = Command::cargo_bin("hyprflow").unwrap();
+    let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("hyprloom");
     cmd.args(["autosave", "--help"]);
     cmd.assert()
         .success()

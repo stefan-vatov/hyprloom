@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Add `--max-age` and `--on-login` flags to `hyprflow restore` for safe session restore at Hyprland startup.
+**Goal:** Add `--max-age` and `--on-login` flags to `hyprloom restore` for safe session restore at Hyprland startup.
 
 **Architecture:** Duration parsing helper in `session.rs`, age check before restore in `main.rs`, `--on-login` prints exec-once line and exits.
 
@@ -115,7 +115,7 @@ Commands::Restore { name, dry_run, max_age, on_login } => {
     if on_login {
         println!("Add this line to ~/.config/hypr/hyprland.conf:");
         println!();
-        println!("  exec-once = hyprflow restore --max-age 24h");
+        println!("  exec-once = hyprloom restore --max-age 24h");
         println!();
         println!("This will restore your last saved session on login.");
         println!("Sessions older than 24h will be skipped.");
@@ -128,7 +128,7 @@ Commands::Restore { name, dry_run, max_age, on_login } => {
         Ok(session) => {
             // Max age check
             if let Some(ref age_str) = max_age {
-                match hyprflow::session::parse_max_age(age_str) {
+                match hyprloom::session::parse_max_age(age_str) {
                     Ok(max_duration) => {
                         let age = chrono::Utc::now() - session.created_at;
                         if age > max_duration {
@@ -190,11 +190,11 @@ Add to `### Added` under `[Unreleased] (v0.2.0)`:
 
 **Step 3: Update README.md**
 
-Add to the restore usage block (after `hyprflow restore --dry-run`):
+Add to the restore usage block (after `hyprloom restore --dry-run`):
 
 ```bash
-hyprflow restore --max-age 24h  # skip if session older than 24h
-hyprflow restore --on-login     # print exec-once line for hyprland.conf
+hyprloom restore --max-age 24h  # skip if session older than 24h
+hyprloom restore --on-login     # print exec-once line for hyprland.conf
 ```
 
 Add a new section "### Restore on Login" after the Autosave section:
@@ -205,13 +205,13 @@ Add a new section "### Restore on Login" after the Autosave section:
 To automatically restore your session when Hyprland starts:
 
 ```bash
-hyprflow restore --on-login
+hyprloom restore --on-login
 ```
 
 This prints an `exec-once` line to add to `~/.config/hypr/hyprland.conf`:
 
 ```
-exec-once = hyprflow restore --max-age 24h
+exec-once = hyprloom restore --max-age 24h
 ```
 
 The `--max-age` flag prevents restoring stale sessions. Accepted formats:
