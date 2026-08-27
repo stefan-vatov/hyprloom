@@ -72,6 +72,10 @@ pub struct Monitor {
 pub struct SessionClient {
     pub class: String,
     pub title: String,
+    /// Hyprland's address is a window-level identity while the window remains
+    /// open.  Older snapshots do not contain it and deserialize as `None`.
+    #[serde(default)]
+    pub address: Option<String>,
     /// Initial Hyprland app identity.  These fields are optional in spirit:
     /// older session files do not contain them and reconciliation falls back
     /// to `class` and `title` when they are empty.
@@ -928,6 +932,9 @@ fn validate_session_structure(session: &Session) -> Result<(), SessionError> {
         ] {
             validate_text(label, value)?;
         }
+        if let Some(address) = &client.address {
+            validate_text("client address", address)?;
+        }
         if let Some(profile) = &client.profile_directory {
             validate_text("client profile directory", profile)?;
         }
@@ -1053,6 +1060,7 @@ mod tests {
             clients: vec![SessionClient {
                 class: "kitty".to_string(),
                 title: "Claude Code".to_string(),
+                address: None,
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 4,
@@ -1114,6 +1122,7 @@ mod tests {
             clients: vec![SessionClient {
                 class: "kitty".to_string(),
                 title: "test".to_string(),
+                address: None,
                 initial_class: "kitty".to_string(),
                 initial_title: "kitty".to_string(),
                 workspace: 1,
@@ -1213,6 +1222,7 @@ mod tests {
         let client = &session.clients[0];
         assert_eq!(client.workspace_name, "");
         assert!(!client.pinned);
+        assert!(client.address.is_none());
         assert!(client.profile_directory.is_none());
     }
 
@@ -1250,6 +1260,7 @@ mod tests {
         assert_eq!(client.initial_title, "");
         assert_eq!(client.workspace_name, "");
         assert!(!client.pinned);
+        assert!(client.address.is_none());
         assert!(client.profile_directory.is_none());
         assert!(!client.profile_identity_ambiguous);
     }

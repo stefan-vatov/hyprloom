@@ -315,13 +315,12 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
     if !classes_match(target, current) {
         return None;
     }
-    if is_generic_chromium_client(target) && !same_nonempty(&target.title, &current.title) {
+    if is_generic_chromium_client(target) && !generic_chromium_identity_matches(target, current) {
         // Ordinary Chromium windows share one class and commonly one PID.
-        // The current title is the only window-level identity Hyprland
-        // exposes here, so require an exact title rather than consuming a
-        // same-class window with a different page.  Duplicate titles remain
-        // intentionally distinguishable only by the normal assignment
-        // scoring and are never accepted on a title mismatch.
+        // A title is not window ownership: two tabs can show the same title,
+        // and a page title can change after capture.  Reuse only a compositor
+        // identity captured for that window; legacy snapshots without one
+        // remain safely unmatched.
         return None;
     }
     if is_brave_client(target)
@@ -348,6 +347,10 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
 
     let mut score = 1_000;
     let mut kind = MatchKind::ClassFallback;
+    if is_generic_chromium_client(target) {
+        score += 2_000;
+        kind = MatchKind::ExactIdentity;
+    }
 
     if let Some(target_profile) = &target.profile_directory {
         if let Some(current_profile) = &observed.profile_directory {
@@ -372,7 +375,9 @@ fn match_score(target: &SessionClient, observed: &ObservedClient) -> Option<(i32
 
     if same_nonempty(&target.initial_class, &current.initial_class) {
         score += 350;
-        kind = MatchKind::AppIdentity;
+        if kind != MatchKind::ExactIdentity {
+            kind = MatchKind::AppIdentity;
+        }
     }
 
     if same_nonempty(&target.title, &current.title) {
@@ -530,6 +535,18 @@ fn is_generic_chromium_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("chromium")
 }
 
+fn generic_chromium_identity_matches(target: &SessionClient, current: &HyprClient) -> bool {
+    let Some(target_address) = target.address.as_deref() else {
+        return target.focus_history_id > 0 && target.focus_history_id == current.focus_history_id;
+    };
+    if target_address.is_empty() || !same_nonempty(target_address, &current.address) {
+        return false;
+    }
+    target.focus_history_id == 0
+        || current.focus_history_id == 0
+        || target.focus_history_id == current.focus_history_id
+}
+
 fn generic_chromium_match_is_safe(
     target: &SessionClient,
     observed: &ObservedClient,
@@ -543,40 +560,10 @@ fn generic_chromium_match_is_safe(
         .iter()
         .filter(|candidate| {
             classes_match(target, &candidate.client)
-                && same_nonempty(&target.title, &candidate.client.title)
+                && generic_chromium_identity_matches(target, &candidate.client)
         })
         .collect::<Vec<_>>();
-    if matching.len() <= 1 {
-        return true;
-    }
-
-    // A duplicated browser title is not a unique identity.  Reuse it only
-    // when one and only one candidate is already in the saved placement; that
-    // preserves the idempotent fast path while never moving an arbitrary
-    // same-title extra.  If both candidates are misplaced, Chromium gives us
-    // no further window-level identity and the safe result is to leave them
-    // alone rather than guess.
-    let in_place = matching
-        .iter()
-        .filter(|candidate| {
-            build_reconcile_dispatch_commands(
-                target,
-                &candidate.client,
-                candidate.monitor_name.as_deref(),
-            )
-            .is_empty()
-        })
-        .count();
-    in_place == 1
-        && matching.iter().any(|candidate| {
-            candidate.client.address == observed.client.address
-                && build_reconcile_dispatch_commands(
-                    target,
-                    &candidate.client,
-                    candidate.monitor_name.as_deref(),
-                )
-                .is_empty()
-        })
+    matching.len() == 1 && matching[0].client.address == observed.client.address
 }
 
 fn same_nonempty(left: &str, right: &str) -> bool {
@@ -775,6 +762,22 @@ fn restore_session_with_process_info(
                             ));
                         }
                     }
+                }
+                continue;
+            }
+
+            if has_ambiguous_generic_chromium_candidate(
+                &target_client,
+                &current_existing,
+                &consumed_existing,
+                config,
+            ) {
+                report.skipped += 1;
+                if verbose {
+                    report.details.push(format!(
+                        "SKIP: {} could not be safely matched because generic Chromium window identity is unavailable",
+                        target_client.class
+                    ));
                 }
                 continue;
             }
@@ -1079,6 +1082,24 @@ fn has_ambiguous_profile_candidate(
         && existing.iter().any(|current| {
             !consumed.contains(&current.client.address)
                 && current.profile_identity_ambiguous
+                && !is_ignored_class(&current.client.class, &config.filters.ignore_classes)
+                && !is_ignored_class(
+                    &current.client.initial_class,
+                    &config.filters.ignore_classes,
+                )
+                && classes_match(target, &current.client)
+        })
+}
+
+fn has_ambiguous_generic_chromium_candidate(
+    target: &SessionClient,
+    existing: &[ObservedClient],
+    consumed: &HashSet<String>,
+    config: &Config,
+) -> bool {
+    is_generic_chromium_client(target)
+        && existing.iter().any(|current| {
+            !consumed.contains(&current.client.address)
                 && !is_ignored_class(&current.client.class, &config.filters.ignore_classes)
                 && !is_ignored_class(
                     &current.client.initial_class,
@@ -1629,6 +1650,20 @@ fn reconcile_session_with_launcher_options(
             continue;
         }
 
+        if has_ambiguous_generic_chromium_candidate(
+            target_client,
+            &observed,
+            &used_current_addresses,
+            config,
+        ) {
+            report.skipped += 1;
+            report.details.push(format!(
+                "SKIP: {} could not be safely matched because generic Chromium window identity is unavailable",
+                target.label
+            ));
+            continue;
+        }
+
         let launch_command = build_launch_command(target_client);
         if !launch_command_is_trusted(target_client, config) {
             report.failed += 1;
@@ -1904,6 +1939,7 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                 .unwrap_or_else(|| SessionClient {
                     class: "brave-browser".to_string(),
                     title: profile.name.clone(),
+                    address: None,
                     initial_class: "brave-browser".to_string(),
                     initial_title: "Brave".to_string(),
                     workspace: default_workspace,
@@ -2487,10 +2523,8 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
     ));
     let poll_interval = Duration::from_millis(100);
     let candidate_settle = Duration::from_millis(250).min(timeout);
-    let active_candidate_settle = poll_interval.min(timeout);
     let start = Instant::now();
     let mut first_candidate_at = None;
-    let mut active_candidate_at: Option<(String, Instant)> = None;
 
     let new_window = loop {
         if start.elapsed() > timeout {
@@ -2512,7 +2546,6 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
             .collect();
         if candidates.is_empty() {
             first_candidate_at = None;
-            active_candidate_at = None;
             continue;
         }
 
@@ -2523,63 +2556,21 @@ fn restore_single_client_with_launcher_and_process_info_with_address(
         if launched.pid.is_some() && !process_related {
             if !is_browser_target(client) {
                 // Keep the conservative process-tree rule for ordinary apps;
-                // active focus is only a meaningful fallback for browsers
-                // that intentionally share one process across windows.
-                continue;
-            }
-            if candidates.len() != 1 {
-                // Active focus cannot identify the launched window when two
-                // or more compatible windows appeared in the same interval:
-                // one of them may have been opened independently by the
-                // user.  Wait briefly for the set to settle, then fail
-                // closed rather than moving an arbitrary browser window.
-                active_candidate_at = None;
-                if candidate_seen_at.elapsed() >= candidate_settle {
-                    return Err(RestoreError::UncorrelatedWindow {
-                        class: client.class.clone(),
-                    });
-                }
+                // a newly visible but uncorrelated window is never accepted.
                 continue;
             }
             // Chromium-based browsers commonly hand a launch request to an
-            // existing browser process, so the new window's PID is not
-            // related to the short-lived process we spawned.  Hyprland's
-            // active-window address is the remaining window-level signal:
-            // accept it only when exactly one new compatible candidate is
-            // focused and stays focused for a full poll interval.  A
-            // same-class window opened by the user is otherwise left
-            // untouched and the launch is reported as uncorrelated.
-            let active_address = hyprctl.get_active_window_address()?;
-            let active_candidate = active_address.as_deref().and_then(|address| {
-                candidates
-                    .iter()
-                    .find(|candidate| candidate.address == address)
-            });
-            let Some(active_candidate) = active_candidate else {
-                active_candidate_at = None;
-                if candidate_seen_at.elapsed() >= candidate_settle {
-                    return Err(RestoreError::UncorrelatedWindow {
-                        class: client.class.clone(),
-                    });
-                }
-                continue;
-            };
-            let active_address = active_candidate.address.clone();
-            let active_stable = match &active_candidate_at {
-                Some((address, seen_at)) if address == &active_address => {
-                    seen_at.elapsed() >= active_candidate_settle
-                }
-                _ => {
-                    active_candidate_at = Some((active_address, Instant::now()));
-                    false
-                }
-            };
-            if active_stable {
-                break active_candidate.clone();
+            // existing browser process.  A class-matching window that
+            // appears during that handoff may be the user's own window;
+            // active focus cannot prove launch ownership.  Leave it alone
+            // and fail closed after the normal settle window.
+            if candidate_seen_at.elapsed() >= candidate_settle {
+                return Err(RestoreError::UncorrelatedWindow {
+                    class: client.class.clone(),
+                });
             }
             continue;
         }
-        active_candidate_at = None;
         if candidates.len() > 1 && !process_related {
             return Err(RestoreError::AmbiguousWindow {
                 class: client.class.clone(),
@@ -3061,6 +3052,7 @@ mod tests {
         SessionClient {
             class: class.to_string(),
             title: class.to_string(),
+            address: None,
             initial_class: class.to_string(),
             initial_title: class.to_string(),
             workspace,
@@ -3246,7 +3238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matching_allows_exact_title_generic_chromium_window() {
+    fn test_matching_uses_captured_address_for_generic_chromium_window_after_title_change() {
         let mut target = make_client(
             "chromium",
             1,
@@ -3260,11 +3252,12 @@ mod tests {
         );
         target.title = "New Tab".to_string();
         target.initial_title = "Chromium".to_string();
+        target.address = Some("0xunrelated-identical-title".to_string());
 
         let mut current = make_reconcile_window(
             "0xunrelated-identical-title",
             "chromium",
-            "New Tab",
+            "Project page",
             1,
             0,
             [10, 20],
@@ -3280,7 +3273,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matching_duplicate_generic_chromium_titles_uses_only_unique_in_place_window() {
+    fn test_matching_duplicate_generic_chromium_titles_uses_captured_address() {
         let mut target = make_client(
             "chromium",
             1,
@@ -3294,6 +3287,7 @@ mod tests {
         );
         target.title = "New Tab".to_string();
         target.initial_title = "Chromium".to_string();
+        target.address = Some("0xin-place".to_string());
 
         let mut in_place = make_reconcile_window(
             "0xin-place",
@@ -3326,7 +3320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_matching_duplicate_misplaced_generic_chromium_titles_fails_closed() {
+    fn test_matching_legacy_generic_chromium_without_identity_fails_closed() {
         let mut target = make_client(
             "chromium",
             1,
@@ -3342,7 +3336,7 @@ mod tests {
         target.initial_title = "Chromium".to_string();
 
         let mut first = make_reconcile_window(
-            "0xfirst-same-title",
+            "0xsame-title",
             "chromium",
             "New Tab",
             1,
@@ -3351,21 +3345,8 @@ mod tests {
             [800, 600],
         );
         first.initial_title = "Chromium".to_string();
-        let mut second = make_reconcile_window(
-            "0xsecond-same-title",
-            "chromium",
-            "New Tab",
-            1,
-            0,
-            [900, 20],
-            [800, 600],
-        );
-        second.initial_title = "Chromium".to_string();
 
-        let observed = vec![
-            ObservedClient::from_hypr_client(first, None, None),
-            ObservedClient::from_hypr_client(second, None, None),
-        ];
+        let observed = vec![ObservedClient::from_hypr_client(first, None, None)];
         assert_eq!(plan_reconciliation(&[target], &observed), vec![None]);
     }
 
@@ -5758,7 +5739,7 @@ mod tests {
     }
 
     #[test]
-    fn test_brave_launch_uses_active_window_when_browser_reuses_pid() {
+    fn test_brave_launch_does_not_trust_active_window_when_browser_reuses_pid() {
         let mut target = make_client(
             "brave-browser",
             1,
@@ -5807,11 +5788,13 @@ mod tests {
             &config,
             &launcher,
             true,
-        )
-        .expect("the focused new Brave window should be correlated safely");
+        );
 
-        assert_eq!(result.address, "0xnew");
-        assert!(!mock.dispatches().is_empty());
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]
@@ -5871,7 +5854,7 @@ mod tests {
     }
 
     #[test]
-    fn test_webapp_launch_uses_active_window_when_browser_reuses_pid() {
+    fn test_webapp_launch_does_not_trust_active_window_when_browser_reuses_pid() {
         let target = make_client(
             "chrome-chatgpt.com__-Default",
             1,
@@ -5919,11 +5902,13 @@ mod tests {
             &config,
             &launcher,
             true,
-        )
-        .expect("the focused new web app should be correlated safely");
+        );
 
-        assert_eq!(result.address, "0xnew");
-        assert!(!mock.dispatches().is_empty());
+        assert!(matches!(
+            result,
+            Err(RestoreError::UncorrelatedWindow { .. })
+        ));
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]
@@ -6117,6 +6102,61 @@ mod tests {
         assert_eq!(report.extras, 0);
         assert!(mock.dispatches().is_empty());
         assert!(launcher.launches.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_reconcile_does_not_launch_when_generic_chromium_identity_is_ambiguous() {
+        let mut target = make_client(
+            "chromium",
+            1,
+            [10, 20],
+            [800, 600],
+            false,
+            0,
+            "chromium",
+            vec![],
+            None,
+        );
+        target.address = Some("0xmissing-target".to_string());
+        target.title = "New Tab".to_string();
+        target.initial_title = "Chromium".to_string();
+
+        let first = make_reconcile_window(
+            "0xexisting-a",
+            "chromium",
+            "New Tab",
+            1,
+            0,
+            [300, 20],
+            [800, 600],
+        );
+        let second = make_reconcile_window(
+            "0xexisting-b",
+            "chromium",
+            "New Tab",
+            1,
+            0,
+            [900, 20],
+            [800, 600],
+        );
+        let mock = MockHyprctl::new(vec![vec![first, second]]);
+        let launcher = RecordingLauncher::default();
+
+        let report = reconcile_session_with_launcher(
+            &make_session(vec![target]),
+            &mock,
+            &EmptyProcessInfo,
+            &Config::default(),
+            false,
+            true,
+            &launcher,
+        )
+        .unwrap();
+
+        assert_eq!(report.launched, 0);
+        assert_eq!(report.skipped, 1);
+        assert!(launcher.launches.borrow().is_empty());
+        assert!(mock.dispatches().is_empty());
     }
 
     #[test]

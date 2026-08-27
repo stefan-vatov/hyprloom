@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.3] - 2026-08-27
+
+### Fixed
+
+- Persist Hyprland window addresses so generic Chromium reconciliation can reuse the exact live window even after its title changes
+- Fail closed when a browser launch is handed to an existing process instead of trusting active focus
+- Skip generic Chromium targets with unavailable or ambiguous identity instead of launching duplicates
+
 ## [0.3.2] - 2026-08-27
 
 ### Fixed

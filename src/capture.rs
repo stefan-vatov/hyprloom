@@ -163,6 +163,7 @@ fn build_session_client(
     SessionClient {
         class: client.class.clone(),
         title: client.title.clone(),
+        address: (!client.address.is_empty()).then(|| client.address.clone()),
         initial_class: if client.initial_class.is_empty() {
             client.class.clone()
         } else {
@@ -878,6 +879,7 @@ mod tests {
         let session = capture_session("test", &hyprctl, &process, &config).expect("capture failed");
 
         assert_eq!(session.clients.len(), 1);
+        assert_eq!(session.clients[0].address.as_deref(), Some("0xdeadbeef"));
         let launch = &session.clients[0].launch;
         assert_eq!(launch.command, "kitty");
         assert_eq!(
