@@ -527,11 +527,11 @@ pub fn validate_user_session_name(name: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// Copy legacy hyprflow sessions into the fork's storage without removing or
+/// Copy legacy `HyprFlow` sessions into `Hyprloom` storage without removing or
 /// overwriting anything.
 ///
 /// This is intentionally idempotent so a user can run
-/// the fork repeatedly while keeping the original files as a rollback path.
+/// `Hyprloom` repeatedly while keeping the original files as a rollback path.
 ///
 /// # Errors
 ///

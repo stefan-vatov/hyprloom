@@ -1,8 +1,14 @@
-# hyprloom
+# Hyprloom
 
 Save and restore [Hyprland](https://hyprland.org) window sessions.
 
-When you reboot or after a power loss, hyprloom restores your applications to their correct workspaces and positions.
+When you reboot or recover from a power loss, Hyprloom restores your applications to their correct workspaces and positions.
+
+Hyprloom is an independent fork of [HyprFlow](https://github.com/iSorensen/hyprflow), originally created by [Eduardo Sorensen](https://github.com/iSorensen). It keeps the original session capture and restore workflow while adding monitor-aware reconciliation, conservative window matching, and recovery safeguards.
+
+## Fork and attribution
+
+This project builds on [HyprFlow](https://github.com/iSorensen/hyprflow) by Eduardo Sorensen. Hyprloom is a separate project with its own `hyprloom` command, configuration directory, session storage, and release history. The original project and this fork are distributed under the MIT License; see [LICENSE](LICENSE).
 
 ## Features
 
@@ -36,7 +42,7 @@ yay -S hyprloom
 
 The package installs `hyprflow` as a compatibility symlink, so existing
 shortcuts and autosave references keep working while the fork uses the
-`hyprloom` name.
+`hyprloom` command and brand.
 
 The release workflow publishes the verified AUR metadata after a `v*` tag is
 published from the fork. This checkout includes the matching `v0.3.9` package
@@ -117,7 +123,7 @@ once. It then:
 
 Run it repeatedly or use it during login; once the target set is satisfied, the
 pass is idempotent. Use the normal `restore` mode for additive launch/repair
-behavior, or `replace`/Deskloom's Replace action when you want a clean desktop
+behavior, or `replace`/Hyprloom's Replace action when you want a clean desktop
 first. Replace validates every target before closing the current windows and
 keeps a safety autosnapshot named with the `autosave-` prefix.
 Replace closes every current Hyprland client, including clients excluded by
@@ -191,8 +197,8 @@ Configure retention in `config.toml`:
 autosave_retain = 5   # keep last 5 autosave sessions (0 removes all autosaves)
 ```
 
-If an older hyprflow autosave timer exists, `hyprloom autosave --install`
-migrates it to the hyprloom unit and preserves whether it was enabled.
+If an older HyprFlow autosave timer exists, `hyprloom autosave --install`
+migrates it to the Hyprloom unit and preserves whether it was enabled.
 
 ### Restore on Login
 

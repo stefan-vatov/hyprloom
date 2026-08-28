@@ -88,7 +88,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Initial class/title capture and Ghostty binary/working-directory support
 - Pinned/special-workspace fidelity and monitor-aware geometry adaptation
 - Process-tree launch correlation, deterministic terminal discovery, and profile-aware matching
-- Non-destructive migration of existing Hyprflow session files
+- Non-destructive migration of existing HyprFlow session files
 
 ### Fixed
 

@@ -123,7 +123,7 @@ fn main() {
         }
     };
     if let Err(error) = migrate_legacy_sessions(&sessions_dir, &legacy_sessions_dir()) {
-        cli_eprintln!("Warning: could not migrate legacy hyprflow sessions: {error}");
+        cli_eprintln!("Warning: could not migrate legacy HyprFlow sessions: {error}");
     }
     let requires_clean_recovery = command_requires_clean_recovery(&cli.command);
     let recovery_ready = if requires_clean_recovery {

@@ -6513,13 +6513,13 @@ mod tests {
     #[test]
     fn test_safety_snapshot_rejects_unlaunchable_window_before_replace() {
         let target = make_client(
-            "deskloom-test-command-that-does-not-exist",
+            "hyprloom-test-command-that-does-not-exist",
             1,
             [0, 0],
             [800, 600],
             false,
             0,
-            "deskloom-test-command-that-does-not-exist",
+            "hyprloom-test-command-that-does-not-exist",
             vec![],
             None,
         );
