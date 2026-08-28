@@ -6662,7 +6662,15 @@ mod tests {
         let mut config = Config::default();
         config.general.restore_delay_ms = 0;
 
-        let result = restore_single_client_with_launcher_and_process_info_with_address(&target, &mock, &EmptyProcessInfo, &config, &launcher, true);
+        let result = restore_single_client_with_launcher_and_process_info_with_address_and_binary(
+            &target,
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            &launcher,
+            true,
+            Some(std::path::Path::new("omarchy-launch-webapp")),
+        );
 
         assert!(matches!(result, Err(RestoreError::UncorrelatedWindow { .. })));
         assert!(mock.dispatches().is_empty());
@@ -6693,7 +6701,15 @@ mod tests {
         config.general.window_detect_timeout_ms = 500;
         config.general.restore_delay_ms = 0;
 
-        let result = restore_single_client_with_launcher_and_process_info_with_address(&target, &mock, &EmptyProcessInfo, &config, &launcher, true);
+        let result = restore_single_client_with_launcher_and_process_info_with_address_and_binary(
+            &target,
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            &launcher,
+            true,
+            Some(std::path::Path::new("omarchy-launch-webapp")),
+        );
 
         assert!(matches!(result, Err(RestoreError::UncorrelatedWindow { .. })));
         assert!(mock.dispatches().is_empty());
@@ -6726,8 +6742,16 @@ mod tests {
         config.general.window_detect_timeout_ms = 500;
         config.general.restore_delay_ms = 0;
 
-        let result = restore_single_client_with_launcher_and_process_info_with_address(&target, &mock, &EmptyProcessInfo, &config, &launcher, true)
-            .expect("a stable, focused web-app handoff should be correlated");
+        let result = restore_single_client_with_launcher_and_process_info_with_address_and_binary(
+            &target,
+            &mock,
+            &EmptyProcessInfo,
+            &config,
+            &launcher,
+            true,
+            Some(std::path::Path::new("omarchy-launch-webapp")),
+        )
+        .expect("a stable, focused web-app handoff should be correlated");
 
         assert_eq!(result.observed.client.address, "0xnew-webapp");
         assert!(mock.dispatches().iter().any(|dispatch| dispatch.contains("0xnew-webapp")));
