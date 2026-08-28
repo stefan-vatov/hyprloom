@@ -16,6 +16,16 @@ pub struct ChildProcess {
     pub cmdline: String,
 }
 
+/// The profile flags found while walking a Chromium process tree, together
+/// with whether every process lookup needed for that conclusion succeeded.
+/// An empty profile list is only evidence of the normal `Default` profile when
+/// the walk completed; an incomplete walk could simply have missed a flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileDiscovery {
+    pub profiles: Vec<String>,
+    pub complete: bool,
+}
+
 pub trait ProcessInfoProvider {
     fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError>;
     fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError>;
@@ -30,9 +40,7 @@ pub trait ProcessInfoProvider {
         let mut visited = HashSet::from([pid]);
 
         while let Some(parent_pid) = queue.pop_front() {
-            let Ok(mut children) = self.get_children(parent_pid) else {
-                continue;
-            };
+            let mut children = self.get_children(parent_pid)?;
             children.sort_by_key(|child| child.pid);
             for child in children {
                 if visited.insert(child.pid) {
@@ -105,25 +113,52 @@ impl ProcessInfoProvider for RealProcessInfo {
         let mut children_by_pid = std::collections::BTreeMap::new();
         let tasks_dir = format!("/proc/{pid}/task");
         let tasks = std::fs::read_dir(&tasks_dir).map_err(|_| ProcessError::NotFound(pid))?;
+        let mut complete = true;
 
-        for task in tasks.flatten() {
-            let children_file = task.path().join("children");
-            if let Ok(content) = std::fs::read_to_string(&children_file) {
-                for child_pid_str in content.split_whitespace() {
-                    if let Ok(child_pid) = child_pid_str.parse::<u32>() {
-                        let cwd = self.get_cwd(child_pid).unwrap_or_default();
-                        let cmdline = read_cmdline(child_pid);
-                        children_by_pid.insert(
-                            child_pid,
-                            ChildProcess {
-                                pid: child_pid,
-                                cwd,
-                                cmdline,
-                            },
-                        );
-                    }
+        for task in tasks {
+            let task = match task {
+                Ok(task) => task,
+                Err(_) => {
+                    complete = false;
+                    continue;
                 }
+            };
+            let children_file = task.path().join("children");
+            let content = match std::fs::read_to_string(&children_file) {
+                Ok(content) => content,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
+            };
+            for child_pid_str in content.split_whitespace() {
+                let child_pid = match child_pid_str.parse::<u32>() {
+                    Ok(child_pid) => child_pid,
+                    Err(_) => {
+                        complete = false;
+                        continue;
+                    }
+                };
+                let cwd = self.get_cwd(child_pid).unwrap_or_default();
+                let cmdline = read_cmdline(child_pid);
+                if cmdline.is_empty() {
+                    complete = false;
+                }
+                children_by_pid.insert(
+                    child_pid,
+                    ChildProcess {
+                        pid: child_pid,
+                        cwd,
+                        cmdline,
+                    },
+                );
             }
+        }
+        if !complete {
+            return Err(ProcessError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                format!("process tree for {pid} changed while it was being inspected"),
+            )));
         }
         Ok(children_by_pid.into_values().collect())
     }
@@ -292,36 +327,58 @@ pub fn find_profile_directories(
     process_info: &dyn ProcessInfoProvider,
     root_pid: u32,
 ) -> Vec<String> {
-    let mut queue = VecDeque::from([root_pid]);
+    find_profile_discovery(process_info, root_pid).profiles
+}
+
+/// Search a process and its descendants for profile flags without losing
+/// whether process metadata was unavailable during the walk.
+pub fn find_profile_discovery(
+    process_info: &dyn ProcessInfoProvider,
+    root_pid: u32,
+) -> ProfileDiscovery {
+    let mut queue = VecDeque::from([(root_pid, None::<String>)]);
     let mut visited = HashSet::from([root_pid]);
     let mut profiles = HashMap::<String, String>::new();
-    while let Some(pid) = queue.pop_front() {
-        if let Ok(cmdline) = process_info.get_cmdline(pid) {
-            if let Some(profile) = profile_directory_from_cmdline(&cmdline) {
-                profiles
-                    .entry(profile.to_ascii_lowercase())
-                    .or_insert(profile);
-            }
+    let mut complete = true;
+    while let Some((pid, known_cmdline)) = queue.pop_front() {
+        let cmdline = match known_cmdline {
+            Some(cmdline) => cmdline,
+            None => match process_info.get_cmdline(pid) {
+                Ok(cmdline) => cmdline,
+                Err(_) => {
+                    complete = false;
+                    String::new()
+                }
+            },
+        };
+        if cmdline.is_empty() {
+            complete = false;
+        } else if let Some(profile) = profile_directory_from_cmdline(&cmdline) {
+            profiles
+                .entry(profile.to_ascii_lowercase())
+                .or_insert(profile);
         }
 
-        let Ok(mut children) = process_info.get_children(pid) else {
-            continue;
+        let mut children = match process_info.get_children(pid) {
+            Ok(children) => children,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
         };
         children.sort_by_key(|child| child.pid);
         for child in children {
-            if let Some(profile) = profile_directory_from_cmdline(&child.cmdline) {
-                profiles
-                    .entry(profile.to_ascii_lowercase())
-                    .or_insert(profile);
+            if child.cmdline.is_empty() {
+                complete = false;
             }
             if visited.insert(child.pid) {
-                queue.push_back(child.pid);
+                queue.push_back((child.pid, Some(child.cmdline)));
             }
         }
     }
     let mut profiles: Vec<String> = profiles.into_values().collect();
     profiles.sort_by_key(|profile| profile.to_ascii_lowercase());
-    profiles
+    ProfileDiscovery { profiles, complete }
 }
 
 /// Return a single profile only when the process tree provides an
@@ -557,5 +614,18 @@ mod tests {
             find_profile_directories(&process_info, 1),
             vec!["Default".to_string(), "Profile 1".to_string()]
         );
+    }
+
+    #[test]
+    fn test_profile_discovery_marks_unreadable_process_metadata_incomplete() {
+        let process_info = MockProcessInfo {
+            cwds: HashMap::new(),
+            children: HashMap::new(),
+        };
+
+        let discovery = find_profile_discovery(&process_info, 1);
+
+        assert!(discovery.profiles.is_empty());
+        assert!(!discovery.complete);
     }
 }

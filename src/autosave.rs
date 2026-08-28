@@ -21,8 +21,33 @@ pub fn systemd_user_dir() -> PathBuf {
         .join("user")
 }
 
-fn service_content() -> String {
-    let binary = which::which("hyprloom").unwrap_or_else(|_| PathBuf::from("hyprloom"));
+fn current_executable() -> std::io::Result<PathBuf> {
+    let binary = std::env::current_exe()?;
+    if !binary.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current executable path is not absolute",
+        ));
+    }
+    let binary = std::fs::canonicalize(binary)?;
+    let metadata = std::fs::metadata(&binary)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current executable is not a regular file",
+        ));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "current executable is not executable",
+        ));
+    }
+    Ok(binary)
+}
+
+fn service_content(binary: &Path) -> String {
     format!(
         "[Unit]\n\
          Description=Hyprloom autosave session\n\
@@ -30,7 +55,7 @@ fn service_content() -> String {
          [Service]\n\
          Type=oneshot\n\
          ExecStart={} autosave --now\n",
-        systemd_quote_path(&binary)
+        systemd_quote_path(binary)
     )
 }
 
@@ -196,10 +221,7 @@ fn ensure_private_marker(path: &Path) -> std::io::Result<()> {
 pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     ensure_systemd_directory(systemd_dir)?;
     recover_install_transaction(systemd_dir)?;
-
-    if which::which("hyprloom").is_err() {
-        eprintln!("Warning: hyprloom not found in PATH. Edit the generated .service file with the full path.");
-    }
+    let binary = current_executable()?;
 
     let service_path = systemd_dir.join(SERVICE_NAME);
     let timer_path = systemd_dir.join(TIMER_NAME);
@@ -215,7 +237,7 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     if let Err(error) = write_optional_backup(&service_backup, previous_service.as_deref())
         .and_then(|_| write_optional_backup(&timer_backup, previous_timer.as_deref()))
         .and_then(|_| write_transaction_marker(systemd_dir, "backed-up"))
-        .and_then(|_| atomic_write(&service_path, service_content().as_bytes()))
+        .and_then(|_| atomic_write(&service_path, service_content(&binary).as_bytes()))
         .and_then(|_| write_transaction_marker(systemd_dir, "service-written"))
         .and_then(|_| atomic_write(&timer_path, timer_content().as_bytes()))
         .and_then(|_| write_transaction_marker(systemd_dir, "timer-written"))
@@ -550,9 +572,10 @@ mod tests {
 
     #[test]
     fn test_service_content_format() {
-        let content = service_content();
+        let content = service_content(Path::new("/tmp/hyprloom"));
         assert!(content.contains("Type=oneshot"));
         assert!(content.contains("autosave --now"));
+        assert!(content.contains("ExecStart=\"/tmp/hyprloom\" autosave --now"));
     }
 
     #[test]

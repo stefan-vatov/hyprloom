@@ -1,8 +1,8 @@
 use crate::config::{app_config_for, is_ignored_class, AppConfig, Config};
 use crate::hyprctl::{HyprctlClient, HyprctlError};
 use crate::process::{
-    find_profile_directories, is_helper_process, is_plain_shell, select_terminal_process,
-    ProcessError, ProcessInfoProvider,
+    find_profile_discovery, is_helper_process, is_plain_shell, select_terminal_process,
+    ProcessError, ProcessInfoProvider, ProfileDiscovery,
 };
 use crate::session::{LaunchInfo, Monitor, Session, SessionClient};
 use chrono::Utc;
@@ -64,15 +64,10 @@ pub fn capture_session(
             *counts.entry(client.pid).or_default() += 1;
             counts
         });
-    let brave_profiles_by_pid: HashMap<u32, Vec<String>> = raw_clients
+    let brave_profiles_by_pid: HashMap<u32, ProfileDiscovery> = raw_clients
         .iter()
         .filter(|client| is_brave_client(client))
-        .map(|client| {
-            (
-                client.pid,
-                find_profile_directories(process_info, client.pid),
-            )
-        })
+        .map(|client| (client.pid, find_profile_discovery(process_info, client.pid)))
         .collect();
 
     let clients: Vec<SessionClient> = raw_clients
@@ -84,7 +79,9 @@ pub fn capture_session(
         .map(|c| {
             let profile_directory = brave_profiles_by_pid
                 .get(&c.pid)
-                .and_then(|profiles| profile_for_window(profiles, brave_window_counts.get(&c.pid)))
+                .and_then(|discovery| {
+                    profile_for_window(discovery, brave_window_counts.get(&c.pid))
+                })
                 .map(str::to_string);
             build_session_client(c, &monitor_map, process_info, config, profile_directory)
         })
@@ -110,7 +107,7 @@ pub fn capture_session(
                         brave_profiles_by_pid
                             .get(&client.pid)
                             .into_iter()
-                            .flat_map(|profiles| profiles.clone())
+                            .flat_map(|discovery| discovery.profiles.clone())
                     })
                     .collect();
                 crate::brave::filter_profiles_by_active_directories(
@@ -189,9 +186,12 @@ fn is_brave_client(client: &crate::hyprctl::HyprClient) -> bool {
         || client.initial_class.eq_ignore_ascii_case("brave-browser")
 }
 
-fn profile_for_window<'a>(profiles: &'a [String], window_count: Option<&usize>) -> Option<&'a str> {
-    match profiles {
-        [profile] if window_count == Some(&1) => Some(profile.as_str()),
+fn profile_for_window<'a>(
+    discovery: &'a ProfileDiscovery,
+    window_count: Option<&usize>,
+) -> Option<&'a str> {
+    match discovery.profiles.as_slice() {
+        [profile] if window_count == Some(&1) && discovery.complete => Some(profile.as_str()),
         _ => None,
     }
 }
@@ -721,6 +721,38 @@ mod tests {
         }
     }
 
+    struct BraveNoProfileProcess;
+
+    impl ProcessInfoProvider for BraveNoProfileProcess {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, _pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Ok(vec![])
+        }
+
+        fn get_cmdline(&self, _pid: u32) -> Result<String, ProcessError> {
+            Ok("brave".to_string())
+        }
+    }
+
+    struct BravePartialProfileProcess;
+
+    impl ProcessInfoProvider for BravePartialProfileProcess {
+        fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
+            Err(ProcessError::NotFound(pid))
+        }
+
+        fn get_cmdline(&self, _pid: u32) -> Result<String, ProcessError> {
+            Ok("brave --profile-directory=Profile 1".to_string())
+        }
+    }
+
     // ── Helpers ──────────────────────────────────────────────────────────
 
     fn make_hypr_client(class: &str, pid: u32) -> RawClient {
@@ -920,8 +952,8 @@ mod tests {
             apps: app_configs,
         };
 
-        let session =
-            capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
+        let session = capture_session("test", &hyprctl, &BraveNoProfileProcess, &config)
+            .expect("capture failed");
 
         assert_eq!(session.clients.len(), 1);
         let launch = &session.clients[0].launch;
@@ -934,8 +966,41 @@ mod tests {
         assert_eq!(
             session.clients[0].profile_directory.as_deref(),
             None,
-            "a missing profile flag is not positive window identity"
+            "the absence of a profile flag is not positive window identity"
         );
+        assert!(session.clients[0].profile_identity_ambiguous);
+    }
+
+    #[test]
+    fn test_capture_does_not_infer_brave_default_when_profile_metadata_is_unavailable() {
+        let hyprctl = MockHyprctl {
+            clients: vec![make_hypr_client("brave-browser", 3001)],
+            monitors: vec![make_monitor("HDMI-A-1")],
+        };
+
+        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default())
+            .expect("capture failed");
+
+        assert!(session.clients[0].profile_directory.is_none());
+        assert!(session.clients[0].profile_identity_ambiguous);
+    }
+
+    #[test]
+    fn test_capture_does_not_accept_profile_from_incomplete_process_metadata() {
+        let hyprctl = MockHyprctl {
+            clients: vec![make_hypr_client("brave-browser", 3003)],
+            monitors: vec![make_monitor("HDMI-A-1")],
+        };
+
+        let session = capture_session(
+            "test",
+            &hyprctl,
+            &BravePartialProfileProcess,
+            &Config::default(),
+        )
+        .expect("capture failed");
+
+        assert!(session.clients[0].profile_directory.is_none());
         assert!(session.clients[0].profile_identity_ambiguous);
     }
 

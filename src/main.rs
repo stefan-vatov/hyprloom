@@ -6,14 +6,14 @@ use hyprloom::config::{
 use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::process::{ProcessInfoProvider, RealProcessInfo};
 use hyprloom::restore::{
-    recover_session, recover_session_safely, replace_session_with_marker,
+    recover_session_safely, replace_session_with_marker,
     replacement_target_is_complete_with_backup, restore_session, validate_replacement_targets,
-    validate_safety_snapshot, ReplaceMarkerContext,
+    validate_safety_snapshot_with_config, ReplaceMarkerContext,
 };
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
     migrate_legacy_sessions, replace_marker, rotate_autosaves, save_session, session_exists,
-    validate_user_session_name, OperationLock, ReplacePhase,
+    session_fingerprint, validate_user_session_name, OperationLock, ReplacePhase,
 };
 use std::path::Path;
 use std::thread;
@@ -325,6 +325,13 @@ fn main() {
                     std::process::exit(1);
                 }
             };
+            let target_digest = match session_fingerprint(&session) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    eprintln!("Replace cancelled: could not fingerprint target session: {error}");
+                    std::process::exit(1);
+                }
+            };
 
             // Validate the complete target before capturing or closing the
             // current desktop.  The replace implementation loads this same
@@ -347,7 +354,7 @@ fn main() {
                         std::process::exit(1);
                     }
                 };
-            if let Err(error) = validate_safety_snapshot(&backup) {
+            if let Err(error) = validate_safety_snapshot_with_config(&backup, &recovery_config) {
                 eprintln!("Replace cancelled: {error}");
                 std::process::exit(1);
             }
@@ -355,9 +362,10 @@ fn main() {
                 eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
             }
-            if let Err(error) = hyprloom::session::mark_replace_prepared_for_target(
+            if let Err(error) = hyprloom::session::mark_replace_prepared_for_target_with_digest(
                 &backup_name,
                 Some(&name),
+                Some(&target_digest),
                 &sessions_dir,
             ) {
                 eprintln!("Replace cancelled: could not record recovery marker: {error}");
@@ -380,6 +388,7 @@ fn main() {
                     backup_name: &backup_name,
                     target_name: &name,
                     sessions_dir: &sessions_dir,
+                    safety_snapshot: Some(&backup),
                 },
             ) {
                 Ok(report) => {
@@ -428,6 +437,20 @@ fn main() {
                 }
                 Err(error) => {
                     eprintln!("Error replacing desktop: {error}");
+                    if let hyprloom::restore::RestoreError::TransactionAfterRestore(_) = &error {
+                        eprintln!(
+                            "The target desktop was restored, so safety recovery is not being replayed."
+                        );
+                        if !clear_recovery_marker_and_rotate(
+                            &sessions_dir,
+                            config.general.autosave_retain,
+                        ) {
+                            eprintln!(
+                                "The recovery marker could not be cleared; leave the desktop in place and retry cleanup after checking the session store."
+                            );
+                        }
+                        std::process::exit(1);
+                    }
                     match replacement_has_started(&sessions_dir, &hyprctl, &config) {
                         Some(true) => {
                             eprintln!(
@@ -703,8 +726,10 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             return false;
         }
     };
-    let target_aware_marker = marker.target_name.is_some();
-    if marker.phase == ReplacePhase::Committed {
+    if matches!(
+        marker.phase,
+        ReplacePhase::Finalizing | ReplacePhase::Committed
+    ) {
         eprintln!(
             "Found a completed desktop replacement; finalizing its recovery marker without replaying the old snapshot."
         );
@@ -729,6 +754,7 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             closing_address,
             marker.closing_pid,
             marker.closing_start_time,
+            marker.closing_stable_id.as_deref(),
             &hyprctl,
             &process_info,
             config,
@@ -757,30 +783,47 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             let process_info = RealProcessInfo;
             let backup_for_completion = load_session(&marker.backup_name, sessions_dir).ok();
             match load_session(target_name, sessions_dir) {
-                Ok(target) => match backup_for_completion.as_ref().map(|backup| {
-                    replacement_target_is_complete_with_backup(
-                        &target,
-                        Some(backup),
-                        &hyprctl,
-                        &process_info,
-                        config,
-                    )
-                }) {
-                    Some(Ok(true)) => {
-                        eprintln!(
-                            "Found a replacement whose target windows are already present; preserving the current desktop and finalizing its recovery marker."
-                        );
-                        return clear_recovery_marker_and_rotate(
-                            sessions_dir,
-                            config.general.autosave_retain,
-                        );
+                Ok(target) => {
+                    let target_matches_marker = marker.target_digest.as_deref().is_some_and(
+                        |expected_digest| {
+                            session_fingerprint(&target)
+                                .ok()
+                                .is_some_and(|actual_digest| actual_digest == expected_digest)
+                        },
+                    );
+                    if !target_matches_marker {
+                        if marker.target_digest.is_some() {
+                            eprintln!(
+                                "Warning: replacement target changed since the transaction started; attempting safety recovery instead of accepting the edited target."
+                            );
+                        }
+                    } else {
+                        match backup_for_completion.as_ref().map(|backup| {
+                            replacement_target_is_complete_with_backup(
+                                &target,
+                                Some(backup),
+                                &hyprctl,
+                                &process_info,
+                                config,
+                            )
+                        }) {
+                            Some(Ok(true)) => {
+                                eprintln!(
+                                    "Found a replacement whose target windows are already present; preserving the current desktop and finalizing its recovery marker."
+                                );
+                                return clear_recovery_marker_and_rotate(
+                                    sessions_dir,
+                                    config.general.autosave_retain,
+                                );
+                            }
+                            Some(Ok(false)) => {}
+                            Some(Err(error)) => eprintln!(
+                                "Warning: could not verify the replacement target; attempting safety recovery: {error}"
+                            ),
+                            None => {}
+                        }
                     }
-                    Some(Ok(false)) => {}
-                    Some(Err(error)) => eprintln!(
-                        "Warning: could not verify the replacement target; attempting safety recovery: {error}"
-                    ),
-                    None => {}
-                },
+                }
                 Err(error) => eprintln!(
                     "Warning: could not load the replacement target; attempting safety recovery: {error}"
                 ),
@@ -800,11 +843,13 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
     };
     let hyprctl = RealHyprctl;
     let process_info = RealProcessInfo;
-    let recovered = if target_aware_marker {
-        report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, config, false)
-    } else {
-        report_safety_recovery(&backup, &hyprctl, &process_info, config, false)
-    };
+    // Marker-backed recovery is deliberately non-destructive.  A legacy
+    // marker has no target identity or safety snapshot metadata, so the old
+    // exact-replace path could close the current desktop before discovering
+    // that the backup could not be replayed.  Leaving current windows alone
+    // preserves user work and still repairs/launches only proven targets.
+    let recovered =
+        report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, config, false);
     if recovered {
         return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
@@ -825,12 +870,15 @@ fn replacement_has_started(
                     address,
                     marker.closing_pid,
                     marker.closing_start_time,
+                    marker.closing_stable_id.as_deref(),
                     hyprctl,
                     &process_info,
                     config,
                 )
             }),
-            ReplacePhase::Prepared | ReplacePhase::Committed => Some(false),
+            ReplacePhase::Prepared | ReplacePhase::Finalizing | ReplacePhase::Committed => {
+                Some(false)
+            }
         },
         Ok(None) => Some(false),
         Err(error) => {
@@ -850,6 +898,7 @@ fn replacement_close_started(
     address: &str,
     expected_pid: Option<u32>,
     expected_start_time: Option<u64>,
+    expected_stable_id: Option<&str>,
     hyprctl: &dyn HyprctlClient,
     process_info: &dyn ProcessInfoProvider,
     config: &hyprloom::config::Config,
@@ -869,38 +918,59 @@ fn replacement_close_started(
                 return None;
             }
         };
-        let mut identity_confirmed = false;
         let Some(current) = clients.iter().find(|client| client.address == address) else {
             return Some(true);
         };
 
-        if let Some(expected_pid) = expected_pid {
-            if current.pid != expected_pid {
-                // The old window is gone and this address now belongs to a
-                // different process.  Treat the close as started instead of
-                // waiting for (or deleting) the replacement backup.
-                return Some(true);
-            }
-            if let Some(expected_start_time) = expected_start_time {
-                if let Ok(current_start_time) = process_info.get_start_time(current.pid) {
-                    if current_start_time != expected_start_time {
-                        return Some(true);
-                    }
-                    identity_confirmed = true;
+        let mut stable_identity_confirmed = false;
+        if let Some(expected_stable_id) = expected_stable_id {
+            match current.stable_id.as_deref() {
+                Some(current_stable_id)
+                    if expected_stable_id.eq_ignore_ascii_case(current_stable_id) =>
+                {
+                    // Hyprland's stable ID is window-specific and proves
+                    // that this is still the original client.  It still does
+                    // not prove that an asynchronous close dispatch has not
+                    // merely been queued, so the timeout remains unknown.
+                    stable_identity_confirmed = true;
                 }
-            } else {
-                identity_confirmed = true;
+                Some(_) => {
+                    // The old address now belongs to a different window.
+                    return Some(true);
+                }
+                None => {
+                    // A compositor response without the stable ID cannot
+                    // prove that a same-process window is the original one.
+                    // Fall through to process evidence only for the case in
+                    // which it provides positive proof of a different owner.
+                }
+            }
+        }
+
+        if !stable_identity_confirmed {
+            if let Some(expected_pid) = expected_pid {
+                if current.pid != expected_pid {
+                    // The old window is gone and this address now belongs to a
+                    // different process.  Treat the close as started instead of
+                    // waiting for (or deleting) the replacement backup.
+                    return Some(true);
+                }
+                if let Some(expected_start_time) = expected_start_time {
+                    if let Ok(current_start_time) = process_info.get_start_time(current.pid) {
+                        if current_start_time != expected_start_time {
+                            return Some(true);
+                        }
+                    }
+                }
             }
         }
         if started.elapsed() >= timeout {
-            // A legacy marker has no process identity, so an address that is
-            // still present is ambiguous: it may be the old window or a
-            // window which reused that address after the close.  Preserve the
-            // marker and backup rather than making an irreversible guess.
-            return match (expected_pid, expected_start_time, identity_confirmed) {
-                (Some(_), None, true) | (Some(_), Some(_), true) => Some(false),
-                _ => None,
-            };
+            // A close dispatch is asynchronous.  Even positive identity
+            // evidence cannot prove that a successful dispatch has not merely
+            // been queued behind this poll.  Never clear the marker while the
+            // address remains visible; the next startup can retry safely once
+            // the compositor has settled.
+            return None;
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -912,34 +982,9 @@ fn command_requires_clean_recovery(command: &Commands) -> bool {
         Commands::Restore {
             dry_run, on_login, ..
         } => !dry_run && !on_login,
-        Commands::Autosave {
-            now: false,
-            install: false,
-            uninstall: false,
-        } => false,
+        Commands::Autosave { now, .. } => *now,
         _ => true,
     }
-}
-
-fn report_safety_recovery(
-    backup: &hyprloom::session::Session,
-    hyprctl: &RealHyprctl,
-    process_info: &RealProcessInfo,
-    config: &hyprloom::config::Config,
-    verbose: bool,
-) -> bool {
-    let recovery_config = safety_recovery_config(config);
-    report_recovery_result(
-        recover_session(
-            backup,
-            hyprctl,
-            process_info,
-            &recovery_config,
-            false,
-            verbose,
-        ),
-        "Safety recovery",
-    )
 }
 
 fn report_non_destructive_safety_recovery(

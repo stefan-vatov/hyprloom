@@ -1,6 +1,7 @@
 use crate::config::MAX_AUTOSAVE_RETAIN;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -160,6 +161,10 @@ pub enum ReplacePhase {
     Prepared,
     Closing,
     InProgress,
+    /// The target reconciliation completed.  This durable phase lets startup
+    /// finish cleanup safely if writing the final committed marker is
+    /// interrupted after the desktop has already been restored.
+    Finalizing,
     Committed,
 }
 
@@ -174,9 +179,18 @@ pub struct ReplaceMarker {
     /// absent and are recovered conservatively.
     pub closing_pid: Option<u32>,
     pub closing_start_time: Option<u64>,
+    /// Hyprland's window-specific stable ID for the first close candidate.
+    /// This protects recovery from address reuse inside one shared browser
+    /// process, where PID and process start time remain unchanged.
+    pub closing_stable_id: Option<String>,
     /// The session being installed.  Older markers do not contain this and
     /// therefore retain the conservative exact-recovery behavior.
     pub target_name: Option<String>,
+    /// SHA-256 fingerprint of the exact target session used by a replacement.
+    /// A changed target must not be used to declare an interrupted transaction
+    /// complete, because recovery must reason about the plan that actually
+    /// started.
+    pub target_digest: Option<String>,
 }
 
 /// Process-wide lock for all CLI operations that can observe or mutate the
@@ -515,6 +529,7 @@ pub fn mark_replace_in_progress_for_target(
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
     }
+    let target_digest = existing_target_digest(backup_name, target_name, sessions_dir)?;
     ensure_sessions_dir(sessions_dir)?;
     write_replace_marker(
         &ReplaceMarker {
@@ -523,7 +538,9 @@ pub fn mark_replace_in_progress_for_target(
             closing_address: None,
             closing_pid: None,
             closing_start_time: None,
+            closing_stable_id: None,
             target_name: target_name.map(str::to_string),
+            target_digest,
         },
         sessions_dir,
     )
@@ -552,6 +569,7 @@ pub fn mark_replace_closing_for_target(
         validate_session_name(target_name)?;
     }
     validate_replace_address(address)?;
+    let target_digest = existing_target_digest(backup_name, target_name, sessions_dir)?;
     ensure_sessions_dir(sessions_dir)?;
     write_replace_marker(
         &ReplaceMarker {
@@ -560,7 +578,9 @@ pub fn mark_replace_closing_for_target(
             closing_address: Some(address.to_string()),
             closing_pid: None,
             closing_start_time: None,
+            closing_stable_id: None,
             target_name: target_name.map(str::to_string),
+            target_digest,
         },
         sessions_dir,
     )
@@ -577,11 +597,37 @@ pub fn mark_replace_closing_for_target_with_identity(
     pid: u32,
     start_time: Option<u64>,
 ) -> Result<(), SessionError> {
+    mark_replace_closing_for_target_with_identity_and_stable_id(
+        backup_name,
+        target_name,
+        sessions_dir,
+        address,
+        pid,
+        start_time,
+        None,
+    )
+}
+
+/// Record the first close candidate with process and compositor identity.
+/// The stable ID is optional for compatibility with older Hyprland versions.
+pub fn mark_replace_closing_for_target_with_identity_and_stable_id(
+    backup_name: &str,
+    target_name: Option<&str>,
+    sessions_dir: &std::path::Path,
+    address: &str,
+    pid: u32,
+    start_time: Option<u64>,
+    stable_id: Option<&str>,
+) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
     }
     validate_replace_address(address)?;
+    if let Some(stable_id) = stable_id.filter(|id| !id.is_empty()) {
+        validate_replace_stable_id(stable_id)?;
+    }
+    let target_digest = existing_target_digest(backup_name, target_name, sessions_dir)?;
     ensure_sessions_dir(sessions_dir)?;
     write_replace_marker(
         &ReplaceMarker {
@@ -590,7 +636,9 @@ pub fn mark_replace_closing_for_target_with_identity(
             closing_address: Some(address.to_string()),
             closing_pid: Some(pid),
             closing_start_time: start_time,
+            closing_stable_id: stable_id.filter(|id| !id.is_empty()).map(str::to_string),
             target_name: target_name.map(str::to_string),
+            target_digest,
         },
         sessions_dir,
     )
@@ -611,9 +659,21 @@ pub fn mark_replace_prepared_for_target(
     target_name: Option<&str>,
     sessions_dir: &std::path::Path,
 ) -> Result<(), SessionError> {
+    mark_replace_prepared_for_target_with_digest(backup_name, target_name, None, sessions_dir)
+}
+
+pub fn mark_replace_prepared_for_target_with_digest(
+    backup_name: &str,
+    target_name: Option<&str>,
+    target_digest: Option<&str>,
+    sessions_dir: &std::path::Path,
+) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
+    }
+    if let Some(target_digest) = target_digest {
+        validate_replace_digest(target_digest)?;
     }
     ensure_sessions_dir(sessions_dir)?;
     write_replace_marker(
@@ -623,7 +683,9 @@ pub fn mark_replace_prepared_for_target(
             closing_address: None,
             closing_pid: None,
             closing_start_time: None,
+            closing_stable_id: None,
             target_name: target_name.map(str::to_string),
+            target_digest: target_digest.map(str::to_string),
         },
         sessions_dir,
     )
@@ -636,6 +698,35 @@ pub fn mark_replace_committed(
     mark_replace_committed_for_target(backup_name, None, sessions_dir)
 }
 
+/// Record that the target desktop is complete and only recovery-marker cleanup
+/// remains.  Startup can safely finalize this phase without replaying the old
+/// safety snapshot.
+pub fn mark_replace_finalizing_for_target(
+    backup_name: &str,
+    target_name: Option<&str>,
+    sessions_dir: &std::path::Path,
+) -> Result<(), SessionError> {
+    validate_session_name(backup_name)?;
+    if let Some(target_name) = target_name {
+        validate_session_name(target_name)?;
+    }
+    let target_digest = existing_target_digest(backup_name, target_name, sessions_dir)?;
+    ensure_sessions_dir(sessions_dir)?;
+    write_replace_marker(
+        &ReplaceMarker {
+            backup_name: backup_name.to_string(),
+            phase: ReplacePhase::Finalizing,
+            closing_address: None,
+            closing_pid: None,
+            closing_start_time: None,
+            closing_stable_id: None,
+            target_name: target_name.map(str::to_string),
+            target_digest,
+        },
+        sessions_dir,
+    )
+}
+
 pub fn mark_replace_committed_for_target(
     backup_name: &str,
     target_name: Option<&str>,
@@ -645,6 +736,7 @@ pub fn mark_replace_committed_for_target(
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
     }
+    let target_digest = existing_target_digest(backup_name, target_name, sessions_dir)?;
     ensure_sessions_dir(sessions_dir)?;
     write_replace_marker(
         &ReplaceMarker {
@@ -653,7 +745,9 @@ pub fn mark_replace_committed_for_target(
             closing_address: None,
             closing_pid: None,
             closing_start_time: None,
+            closing_stable_id: None,
             target_name: target_name.map(str::to_string),
+            target_digest,
         },
         sessions_dir,
     )
@@ -691,6 +785,7 @@ pub fn replace_marker(
         // interrupted replacement so upgrading cannot silently skip recovery.
         "closing" => (ReplacePhase::Closing, 1, 3),
         "in-progress" => (ReplacePhase::InProgress, 1, 2),
+        "finalizing" => (ReplacePhase::Finalizing, 1, 2),
         "committed" => (ReplacePhase::Committed, 1, 2),
         _legacy_name => (ReplacePhase::InProgress, 0, 1),
     };
@@ -706,42 +801,67 @@ pub fn replace_marker(
     let mut next_index = cursor;
     let mut closing_pid = None;
     let mut closing_start_time = None;
+    let mut closing_stable_id = None;
     if phase == ReplacePhase::Closing {
-        // New markers add an identity record between the closing address and
-        // the optional target name.  Its prefix keeps the old three/four-line
-        // marker formats unambiguous and readable during upgrades.
-        if let Some(identity) = lines
-            .get(next_index)
-            .filter(|line| line.starts_with("identity:"))
-        {
-            let value = identity.strip_prefix("identity:").unwrap_or_default();
-            let (pid, start_time) = value.split_once(':').ok_or_else(|| {
-                SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "replacement marker has an invalid process identity",
-                ))
-            })?;
-            closing_pid = Some(pid.parse::<u32>().map_err(|_| {
-                SessionError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "replacement marker has an invalid process ID",
-                ))
-            })?);
-            closing_start_time = if start_time.is_empty() {
-                None
-            } else {
-                Some(start_time.parse::<u64>().map_err(|_| {
+        // New markers add identity records between the closing address and
+        // the optional target name.  Their prefixes keep the old three/four-
+        // line marker formats unambiguous and readable during upgrades.
+        loop {
+            if let Some(identity) = lines
+                .get(next_index)
+                .filter(|line| line.starts_with("identity:"))
+            {
+                let value = identity.strip_prefix("identity:").unwrap_or_default();
+                let (pid, start_time) = value.split_once(':').ok_or_else(|| {
                     SessionError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
-                        "replacement marker has an invalid process start time",
+                        "replacement marker has an invalid process identity",
                     ))
-                })?)
-            };
-            next_index += 1;
+                })?;
+                closing_pid = Some(pid.parse::<u32>().map_err(|_| {
+                    SessionError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "replacement marker has an invalid process ID",
+                    ))
+                })?);
+                closing_start_time = if start_time.is_empty() {
+                    None
+                } else {
+                    Some(start_time.parse::<u64>().map_err(|_| {
+                        SessionError::Io(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "replacement marker has an invalid process start time",
+                        ))
+                    })?)
+                };
+                next_index += 1;
+                continue;
+            }
+            if let Some(stable) = lines
+                .get(next_index)
+                .filter(|line| line.starts_with("stable:"))
+            {
+                let value = stable.strip_prefix("stable:").unwrap_or_default();
+                validate_replace_stable_id(value)?;
+                closing_stable_id = Some(value.to_string());
+                next_index += 1;
+                continue;
+            }
+            break;
         }
     }
-    let target_name = lines.get(next_index).map(|target| (*target).to_string());
+    let target_name = lines
+        .get(next_index)
+        .filter(|line| !line.starts_with("target-digest:"))
+        .map(|target| (*target).to_string());
     if target_name.is_some() {
+        next_index += 1;
+    }
+    let target_digest = lines
+        .get(next_index)
+        .and_then(|line| line.strip_prefix("target-digest:"))
+        .map(str::to_string);
+    if target_digest.is_some() {
         next_index += 1;
     }
     if lines.len() != next_index {
@@ -757,13 +877,18 @@ pub fn replace_marker(
     if let Some(target_name) = &target_name {
         validate_session_name(target_name)?;
     }
+    if let Some(target_digest) = &target_digest {
+        validate_replace_digest(target_digest)?;
+    }
     Ok(Some(ReplaceMarker {
         backup_name: name.to_string(),
         phase,
         closing_address,
         closing_pid,
         closing_start_time,
+        closing_stable_id,
         target_name,
+        target_digest,
     }))
 }
 
@@ -780,6 +905,9 @@ fn write_replace_marker(
     if let Some(target_name) = &marker.target_name {
         validate_session_name(target_name)?;
     }
+    if let Some(target_digest) = &marker.target_digest {
+        validate_replace_digest(target_digest)?;
+    }
     let content = match marker.phase {
         ReplacePhase::Prepared => format_marker_content("prepared", marker, None),
         ReplacePhase::Closing => {
@@ -793,6 +921,7 @@ fn write_replace_marker(
             format_marker_content("closing", marker, Some(address))
         }
         ReplacePhase::InProgress => format_marker_content("in-progress", marker, None),
+        ReplacePhase::Finalizing => format_marker_content("finalizing", marker, None),
         ReplacePhase::Committed => format_marker_content("committed", marker, None),
     };
     atomic_write(&sessions_dir.join(REPLACE_MARKER_NAME), content.as_bytes())
@@ -815,9 +944,19 @@ fn format_marker_content(
         content.push('\n');
         content.push_str(&format!("identity:{pid}:"));
     }
+    if let Some(stable_id) = &marker.closing_stable_id {
+        content.push('\n');
+        content.push_str("stable:");
+        content.push_str(stable_id);
+    }
     if let Some(target_name) = &marker.target_name {
         content.push('\n');
         content.push_str(target_name);
+    }
+    if let Some(target_digest) = &marker.target_digest {
+        content.push('\n');
+        content.push_str("target-digest:");
+        content.push_str(target_digest);
     }
     content
 }
@@ -833,6 +972,53 @@ fn validate_replace_address(address: &str) -> Result<(), SessionError> {
         )));
     }
     Ok(())
+}
+
+fn validate_replace_stable_id(stable_id: &str) -> Result<(), SessionError> {
+    if stable_id.is_empty()
+        || stable_id.len() > MAX_SESSION_STRING_BYTES
+        || stable_id.contains(['\r', '\n'])
+    {
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement marker has an invalid stable window ID",
+        )));
+    }
+    Ok(())
+}
+
+fn validate_replace_digest(digest: &str) -> Result<(), SessionError> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(SessionError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "replacement marker has an invalid target fingerprint",
+        )));
+    }
+    Ok(())
+}
+
+/// Fingerprint the semantic target session stored in a replacement marker.
+/// JSON serialization is deterministic for this struct, so formatting-only
+/// edits do not change the fingerprint while any session field change does.
+pub fn session_fingerprint(session: &Session) -> Result<String, SessionError> {
+    let bytes = serde_json::to_vec(session)?;
+    let digest = Sha256::digest(bytes);
+    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn existing_target_digest(
+    backup_name: &str,
+    target_name: Option<&str>,
+    sessions_dir: &Path,
+) -> Result<Option<String>, SessionError> {
+    let Some(marker) = replace_marker(sessions_dir)? else {
+        return Ok(None);
+    };
+    if marker.backup_name == backup_name && marker.target_name.as_deref() == target_name {
+        Ok(marker.target_digest)
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn clear_replace_marker(sessions_dir: &std::path::Path) -> Result<(), SessionError> {
@@ -1047,6 +1233,9 @@ fn validate_session_structure(session: &Session) -> Result<(), SessionError> {
         if let Some(address) = &client.address {
             validate_text("client address", address)?;
         }
+        if let Some(stable_id) = &client.stable_id {
+            validate_text("client stable window ID", stable_id)?;
+        }
         if let Some(profile) = &client.profile_directory {
             validate_text("client profile directory", profile)?;
         }
@@ -1083,10 +1272,13 @@ fn validate_text(label: &str, value: &str) -> Result<(), SessionError> {
 /// Supported suffixes: `m` (minutes), `h` (hours), `d` (days).
 /// Examples: `"30m"`, `"24h"`, `"7d"`.
 pub fn parse_max_age(s: &str) -> Result<chrono::Duration, String> {
-    if s.len() < 2 {
+    let Some((unit_index, unit)) = s.char_indices().next_back() else {
+        return Err(format!("invalid duration: '{s}'"));
+    };
+    if unit_index == 0 {
         return Err(format!("invalid duration: '{s}'"));
     }
-    let (num_str, unit) = s.split_at(s.len() - 1);
+    let num_str = &s[..unit_index];
     let num: i64 = num_str
         .parse()
         .map_err(|_| format!("invalid duration: '{s}'"))?;
@@ -1094,9 +1286,9 @@ pub fn parse_max_age(s: &str) -> Result<chrono::Duration, String> {
         return Err(format!("duration must be greater than zero: '{s}'"));
     }
     let duration = match unit {
-        "m" => chrono::Duration::try_minutes(num),
-        "h" => chrono::Duration::try_hours(num),
-        "d" => chrono::Duration::try_days(num),
+        'm' => chrono::Duration::try_minutes(num),
+        'h' => chrono::Duration::try_hours(num),
+        'd' => chrono::Duration::try_days(num),
         _ => {
             return Err(format!(
                 "invalid duration unit '{unit}' in '{s}'. Use m, h, or d."
@@ -1522,7 +1714,9 @@ mod tests {
                 closing_address: None,
                 closing_pid: None,
                 closing_start_time: None,
+                closing_stable_id: None,
                 target_name: None,
+                target_digest: None,
             })
         );
         mark_replace_closing("autosave-recovery", dir.path(), "0xclosing").unwrap();
@@ -1534,7 +1728,9 @@ mod tests {
                 closing_address: Some("0xclosing".to_string()),
                 closing_pid: None,
                 closing_start_time: None,
+                closing_stable_id: None,
                 target_name: None,
+                target_digest: None,
             })
         );
         mark_replace_in_progress("autosave-recovery", dir.path()).unwrap();
@@ -1550,7 +1746,9 @@ mod tests {
                 closing_address: None,
                 closing_pid: None,
                 closing_start_time: None,
+                closing_stable_id: None,
                 target_name: None,
+                target_digest: None,
             })
         );
         mark_replace_committed("autosave-recovery", dir.path()).unwrap();
@@ -1562,7 +1760,24 @@ mod tests {
                 closing_address: None,
                 closing_pid: None,
                 closing_start_time: None,
+                closing_stable_id: None,
                 target_name: None,
+                target_digest: None,
+            })
+        );
+        mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path())
+            .unwrap();
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::Finalizing,
+                closing_address: None,
+                closing_pid: None,
+                closing_start_time: None,
+                closing_stable_id: None,
+                target_name: Some("target".to_string()),
+                target_digest: None,
             })
         );
         mark_replace_prepared_for_target("autosave-recovery", Some("target"), dir.path()).unwrap();
@@ -1574,11 +1789,52 @@ mod tests {
                 closing_address: None,
                 closing_pid: None,
                 closing_start_time: None,
+                closing_stable_id: None,
                 target_name: Some("target".to_string()),
+                target_digest: None,
             })
         );
         clear_replace_marker(dir.path()).unwrap();
         assert_eq!(pending_replace_backup(dir.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn test_replace_marker_preserves_target_fingerprint_across_phases() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = make_test_session("target");
+        let digest = session_fingerprint(&target).unwrap();
+
+        mark_replace_prepared_for_target_with_digest(
+            "autosave-recovery",
+            Some("target"),
+            Some(&digest),
+            dir.path(),
+        )
+        .unwrap();
+        assert_eq!(
+            replace_marker(dir.path())
+                .unwrap()
+                .and_then(|marker| marker.target_digest),
+            Some(digest.clone())
+        );
+
+        mark_replace_in_progress_for_target("autosave-recovery", Some("target"), dir.path())
+            .unwrap();
+        assert_eq!(
+            replace_marker(dir.path())
+                .unwrap()
+                .and_then(|marker| marker.target_digest),
+            Some(digest.clone())
+        );
+
+        mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path())
+            .unwrap();
+        assert_eq!(
+            replace_marker(dir.path())
+                .unwrap()
+                .and_then(|marker| marker.target_digest),
+            Some(digest)
+        );
     }
 
     #[test]
@@ -1602,7 +1858,38 @@ mod tests {
                 closing_address: Some("0xclosing".to_string()),
                 closing_pid: Some(1234),
                 closing_start_time: Some(5678),
+                closing_stable_id: None,
                 target_name: Some("target".to_string()),
+                target_digest: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_replace_closing_marker_preserves_stable_window_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        mark_replace_closing_for_target_with_identity_and_stable_id(
+            "autosave-recovery",
+            Some("target"),
+            dir.path(),
+            "0xclosing",
+            1234,
+            Some(5678),
+            Some("18000001"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            replace_marker(dir.path()).unwrap(),
+            Some(ReplaceMarker {
+                backup_name: "autosave-recovery".to_string(),
+                phase: ReplacePhase::Closing,
+                closing_address: Some("0xclosing".to_string()),
+                closing_pid: Some(1234),
+                closing_start_time: Some(5678),
+                closing_stable_id: Some("18000001".to_string()),
+                target_name: Some("target".to_string()),
+                target_digest: None,
             })
         );
     }
@@ -1738,6 +2025,11 @@ mod tests {
         assert!(parse_max_age("0m").is_err());
         assert!(parse_max_age("-1h").is_err());
         assert!(parse_max_age("9223372036854775807d").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_rejects_unicode_without_panicking() {
+        assert!(parse_max_age("1🙂").is_err());
     }
 
     #[cfg(unix)]
