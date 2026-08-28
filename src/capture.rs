@@ -1,8 +1,8 @@
 use crate::config::{app_config_for, is_ignored_class, AppConfig, Config};
 use crate::hyprctl::{HyprctlClient, HyprctlError};
 use crate::process::{
-    find_profile_discovery, is_helper_process, is_plain_shell, select_terminal_process,
-    ProcessError, ProcessInfoProvider, ProfileDiscovery,
+    find_profile_discovery, is_helper_process, is_plain_shell, select_terminal_process, ChildProcess, ProcessError, ProcessInfoProvider,
+    ProfileDiscovery,
 };
 use crate::session::{LaunchInfo, Monitor, Session, SessionClient};
 use chrono::Utc;
@@ -11,11 +11,14 @@ use std::path::PathBuf;
 
 // ── Error ──────────────────────────────────────────────────────────────────
 
+/// Errors that can occur while capturing a Hyprland session.
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("hyprctl error: {0}")]
+    /// Hyprland could not be queried.
     Hyprctl(#[from] HyprctlError),
     #[error("process error: {0}")]
+    /// Process metadata could not be inspected.
     Process(#[from] ProcessError),
 }
 
@@ -25,6 +28,10 @@ pub enum CaptureError {
 ///
 /// All windows whose class appears in `config.filters.ignore_classes` are
 /// excluded from the returned session.
+///
+/// # Errors
+///
+/// Returns an error when Hyprland or process inspection fails.
 pub fn capture_session(
     name: &str,
     hyprctl: &dyn HyprctlClient,
@@ -33,17 +40,12 @@ pub fn capture_session(
 ) -> Result<Session, CaptureError> {
     let raw_clients = hyprctl.get_clients()?;
     let raw_monitors = hyprctl.get_monitors()?;
-    let version = hyprctl
-        .get_hyprland_version()
-        .unwrap_or_else(|_| "unknown".to_string());
+    let version = hyprctl.get_hyprland_version().unwrap_or_else(|_| "unknown".to_string());
 
     // Build a map from monitor ID to monitor name so that
     // HyprClient.monitor (an i32 monitor ID) can be resolved to a
     // human-readable name such as "DP-1".
-    let monitor_map: HashMap<i32, String> = raw_monitors
-        .iter()
-        .map(|m| (m.id, m.name.clone()))
-        .collect();
+    let monitor_map: HashMap<i32, String> = raw_monitors.iter().map(|m| (m.id, m.name.clone())).collect();
 
     let monitors: Vec<Monitor> = raw_monitors
         .iter()
@@ -73,52 +75,18 @@ pub fn capture_session(
     let clients: Vec<SessionClient> = raw_clients
         .iter()
         .filter(|c| {
-            !is_ignored_class(&c.class, &config.filters.ignore_classes)
-                && !is_ignored_class(&c.initial_class, &config.filters.ignore_classes)
+            !is_ignored_class(&c.class, &config.filters.ignore_classes) && !is_ignored_class(&c.initial_class, &config.filters.ignore_classes)
         })
         .map(|c| {
             let profile_directory = brave_profiles_by_pid
                 .get(&c.pid)
-                .and_then(|discovery| {
-                    profile_for_window(discovery, brave_window_counts.get(&c.pid))
-                })
+                .and_then(|discovery| profile_for_window(discovery, brave_window_counts.get(&c.pid)))
                 .map(str::to_string);
             build_session_client(c, &monitor_map, process_info, config, profile_directory)
         })
         .collect();
 
-    let brave_profiles = if clients.iter().any(|c| {
-        c.class.eq_ignore_ascii_case("brave-browser")
-            || c.initial_class.eq_ignore_ascii_case("brave-browser")
-    }) {
-        let all_profiles = crate::brave::read_profiles().unwrap_or_else(|e| {
-            eprintln!("Warning: could not read Brave profiles: {e}");
-            vec![]
-        });
-        let profile_ws =
-            app_config_for(config, "brave-browser", "").and_then(|c| c.profile_workspaces.as_ref());
-        match profile_ws {
-            Some(mappings) => crate::brave::filter_profiles_by_config(all_profiles, Some(mappings)),
-            None => {
-                let active_directories: Vec<String> = raw_clients
-                    .iter()
-                    .filter(|client| is_brave_client(client))
-                    .flat_map(|client| {
-                        brave_profiles_by_pid
-                            .get(&client.pid)
-                            .into_iter()
-                            .flat_map(|discovery| discovery.profiles.clone())
-                    })
-                    .collect();
-                crate::brave::filter_profiles_by_active_directories(
-                    all_profiles,
-                    &active_directories,
-                )
-            }
-        }
-    } else {
-        vec![]
-    };
+    let brave_profiles = capture_brave_profiles(&clients, &raw_clients, &brave_profiles_by_pid, config);
 
     Ok(Session {
         name: name.to_string(),
@@ -182,33 +150,22 @@ fn build_session_client(
 }
 
 fn is_brave_client(client: &crate::hyprctl::HyprClient) -> bool {
-    client.class.eq_ignore_ascii_case("brave-browser")
-        || client.initial_class.eq_ignore_ascii_case("brave-browser")
+    client.class.eq_ignore_ascii_case("brave-browser") || client.initial_class.eq_ignore_ascii_case("brave-browser")
 }
 
-fn profile_for_window<'a>(
-    discovery: &'a ProfileDiscovery,
-    window_count: Option<&usize>,
-) -> Option<&'a str> {
+fn profile_for_window<'a>(discovery: &'a ProfileDiscovery, window_count: Option<&usize>) -> Option<&'a str> {
     match discovery.profiles.as_slice() {
         [profile] if window_count == Some(&1) && discovery.complete => Some(profile.as_str()),
         _ => None,
     }
 }
 
-fn build_launch_info(
-    client: &crate::hyprctl::HyprClient,
-    app_config: Option<&AppConfig>,
-    process_info: &dyn ProcessInfoProvider,
-) -> LaunchInfo {
+fn build_launch_info(client: &crate::hyprctl::HyprClient, app_config: Option<&AppConfig>, process_info: &dyn ProcessInfoProvider) -> LaunchInfo {
     // Omarchy web apps expose a Chrome window class that is not an executable
     // (for example, `chrome-chatgpt.com__-Default`).  Their desktop entries
     // contain the authoritative launcher and URL, so retain that launch
     // contract instead of falling back to the non-existent class binary.
-    let desktop_launch = if app_config
-        .and_then(|config| config.binary.as_ref())
-        .is_none()
-    {
+    let desktop_launch = if app_config.and_then(|config| config.binary.as_ref()).is_none() {
         find_webapp_launch_info(client)
     } else {
         None
@@ -227,74 +184,98 @@ fn build_launch_info(
         });
 
     let capture_cwd = app_config.and_then(|a| a.capture_cwd).unwrap_or(false);
-    let capture_cmd = app_config
-        .and_then(|a| a.capture_last_command)
-        .unwrap_or(false);
+    let capture_last_command = app_config.and_then(|a| a.capture_last_command).unwrap_or(false);
 
-    let mut args: Vec<String> = desktop_launch
-        .as_ref()
-        .map(|launch| launch.args.clone())
-        .unwrap_or_default();
+    let mut args: Vec<String> = desktop_launch.as_ref().map(|launch| launch.args.clone()).unwrap_or_default();
     let mut hint: Option<String> = None;
 
-    if desktop_launch.is_none() && (capture_cwd || capture_cmd) {
-        if let Some(shell) = select_terminal_process(process_info, client.pid) {
-            // Find the actual shell child, skipping helper processes like
-            // kitty's "kitten __atexit__" which has CWD=/home but is not the
-            // interactive shell.
-            if capture_cwd {
-                args.push(
-                    if is_ghostty_class(&client.class) || is_ghostty_class(&client.initial_class) {
-                        "--working-directory".to_string()
-                    } else {
-                        "--directory".to_string()
-                    },
-                );
-                args.push(shell.cwd.to_string_lossy().to_string());
-            }
-
-            if capture_cmd {
-                // Prefer a grandchild process (the command running inside the shell),
-                // but only when it is not itself a plain shell.
-                if let Ok(grandchildren) = process_info.get_descendants(shell.pid) {
-                    if let Some(cmd) = grandchildren
-                        .iter()
-                        .filter(|gc| {
-                            !gc.cmdline.is_empty()
-                                && !is_helper_process(&gc.cmdline)
-                                && !is_plain_shell(&gc.cmdline)
-                        })
-                        .min_by_key(|gc| gc.pid)
-                    {
-                        hint = Some(cmd.cmdline.clone());
-                    }
-                }
-
-                // Fall back to the shell's own cmdline if it is not a plain shell.
-                if hint.is_none() && !shell.cmdline.is_empty() && !is_plain_shell(&shell.cmdline) {
-                    hint = Some(shell.cmdline.clone());
-                }
-            }
-        }
+    let shell = (desktop_launch.is_none() && (capture_cwd || capture_last_command))
+        .then(|| select_terminal_process(process_info, client.pid))
+        .flatten();
+    if let Some(shell) = shell {
+        let (terminal_args, terminal_hint) = terminal_capture(client, &shell, process_info, capture_cwd, capture_last_command);
+        args.extend(terminal_args);
+        hint = terminal_hint;
     }
 
     // Render hint through the app-level template when one is configured.
     if let (Some(h), Some(ac)) = (&hint, app_config) {
         if let Some(template) = &ac.hint_template {
             let cwd_str = launch_cwd_arg(&args).unwrap_or("");
-            hint = Some(
-                template
-                    .replace("{last_command}", h)
-                    .replace("{cwd}", cwd_str),
-            );
+            hint = Some(template.replace("{last_command}", h).replace("{cwd}", cwd_str));
         }
     }
 
-    LaunchInfo {
-        command: binary,
-        args,
-        hint,
+    LaunchInfo { command: binary, args, hint }
+}
+
+fn capture_brave_profiles(
+    clients: &[SessionClient],
+    raw_clients: &[crate::hyprctl::HyprClient],
+    profiles_by_pid: &HashMap<u32, ProfileDiscovery>,
+    config: &Config,
+) -> Vec<crate::session::BraveProfile> {
+    if !clients.iter().any(is_brave_session_client) {
+        return Vec::new();
     }
+    let all_profiles = crate::brave::read_profiles().unwrap_or_else(|error| {
+        crate::output::warning(format!("Warning: could not read Brave profiles: {error}"));
+        Vec::new()
+    });
+    let Some(mappings) = app_config_for(config, "brave-browser", "").and_then(|app| app.profile_workspaces.as_ref()) else {
+        let active_directories = active_brave_profile_directories(raw_clients, profiles_by_pid);
+        return crate::brave::filter_profiles_by_active_directories(all_profiles, &active_directories);
+    };
+    crate::brave::filter_profiles_by_config(all_profiles, Some(mappings))
+}
+
+fn is_brave_session_client(client: &SessionClient) -> bool {
+    is_brave_class(&client.class) || is_brave_class(&client.initial_class)
+}
+
+fn active_brave_profile_directories(raw_clients: &[crate::hyprctl::HyprClient], profiles_by_pid: &HashMap<u32, ProfileDiscovery>) -> Vec<String> {
+    raw_clients
+        .iter()
+        .filter(|client| is_brave_client(client))
+        .flat_map(|client| {
+            profiles_by_pid
+                .get(&client.pid)
+                .into_iter()
+                .flat_map(|discovery| discovery.profiles.clone())
+        })
+        .collect()
+}
+
+fn terminal_capture(
+    client: &crate::hyprctl::HyprClient,
+    shell: &ChildProcess,
+    process_info: &dyn ProcessInfoProvider,
+    capture_cwd: bool,
+    capture_last_command: bool,
+) -> (Vec<String>, Option<String>) {
+    let mut args = Vec::new();
+    if capture_cwd {
+        let directory_flag = if is_ghostty_class(&client.class) || is_ghostty_class(&client.initial_class) {
+            "--working-directory"
+        } else {
+            "--directory"
+        };
+        args.push(directory_flag.to_string());
+        args.push(shell.cwd.to_string_lossy().to_string());
+    }
+    let hint = capture_last_command.then(|| terminal_command_hint(shell, process_info)).flatten();
+    (args, hint)
+}
+
+fn terminal_command_hint(shell: &ChildProcess, process_info: &dyn ProcessInfoProvider) -> Option<String> {
+    let grandchild_hint = process_info.get_descendants(shell.pid).ok().and_then(|grandchildren| {
+        grandchildren
+            .into_iter()
+            .filter(|child| !child.cmdline.is_empty() && !is_helper_process(&child.cmdline) && !is_plain_shell(&child.cmdline))
+            .min_by_key(|child| child.pid)
+            .map(|child| child.cmdline)
+    });
+    grandchild_hint.or_else(|| (!shell.cmdline.is_empty() && !is_plain_shell(&shell.cmdline)).then(|| shell.cmdline.clone()))
 }
 
 fn launch_cwd_arg(args: &[String]) -> Option<&str> {
@@ -309,11 +290,11 @@ fn launch_cwd_arg(args: &[String]) -> Option<&str> {
     })
 }
 
-fn is_ghostty_class(class: &str) -> bool {
+const fn is_ghostty_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("ghostty") || class.eq_ignore_ascii_case("com.mitchellh.ghostty")
 }
 
-fn is_brave_class(class: &str) -> bool {
+const fn is_brave_class(class: &str) -> bool {
     class.eq_ignore_ascii_case("brave-browser")
 }
 
@@ -324,11 +305,7 @@ struct DesktopLaunch {
     specificity: u8,
 }
 
-const OMARCHY_WEBAPP_LAUNCHERS: [&str; 3] = [
-    "omarchy-launch-or-focus-webapp",
-    "omarchy-launch-or-focus",
-    "omarchy-launch-webapp",
-];
+const OMARCHY_WEBAPP_LAUNCHERS: [&str; 3] = ["omarchy-launch-or-focus-webapp", "omarchy-launch-or-focus", "omarchy-launch-webapp"];
 
 fn find_webapp_launch_info(client: &crate::hyprctl::HyprClient) -> Option<LaunchInfo> {
     discover_webapp_launch_info(&client.class, &client.initial_class)
@@ -337,6 +314,7 @@ fn find_webapp_launch_info(client: &crate::hyprctl::HyprClient) -> Option<Launch
 /// Find the launcher recorded by Omarchy for a Chrome web-app class.  This is
 /// also used while restoring older snapshots whose launch command predates
 /// web-app desktop-entry discovery.
+#[must_use]
 pub fn discover_webapp_launch_info(class: &str, initial_class: &str) -> Option<LaunchInfo> {
     let identities = [class, initial_class];
     if !identities.iter().any(|class| is_webapp_class(class)) {
@@ -346,31 +324,18 @@ pub fn discover_webapp_launch_info(class: &str, initial_class: &str) -> Option<L
     find_webapp_launch_info_in_directories(class, initial_class, &desktop_application_directories())
 }
 
-fn find_webapp_launch_info_in_directories(
-    class: &str,
-    initial_class: &str,
-    directories: &[PathBuf],
-) -> Option<LaunchInfo> {
+fn find_webapp_launch_info_in_directories(class: &str, initial_class: &str, directories: &[PathBuf]) -> Option<LaunchInfo> {
     let identities = [class, initial_class];
     let mut matches = Vec::new();
     for directory in directories {
-        let entries = match std::fs::read_dir(directory) {
-            Ok(entries) => entries,
-            Err(_) => continue,
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|extension| extension.to_str()) != Some("desktop") {
-                continue;
-            }
-            let contents = match std::fs::read_to_string(&path) {
-                Ok(contents) => contents,
-                Err(_) => continue,
-            };
-            if let Some(launch) = parse_webapp_desktop_file(&contents, &identities) {
-                matches.push(launch);
-            }
-        }
+        matches.extend(
+            entries
+                .flatten()
+                .filter_map(|entry| load_webapp_desktop_launch(&entry.path(), &identities)),
+        );
     }
 
     let strongest_specificity = matches.iter().map(|launch| launch.specificity).max()?;
@@ -380,18 +345,31 @@ fn find_webapp_launch_info_in_directories(
         .collect::<Vec<_>>();
     let mut unique = Vec::new();
     for launch in strongest {
-        if !unique.iter().any(|existing: &DesktopLaunch| {
-            existing.command == launch.command && existing.args == launch.args
-        }) {
+        if !unique
+            .iter()
+            .any(|existing: &DesktopLaunch| existing.command == launch.command && existing.args == launch.args)
+        {
             unique.push(launch);
         }
     }
-    let launch = (unique.len() == 1).then(|| unique.pop().expect("one launch"))?;
+    if unique.len() != 1 {
+        return None;
+    }
+    let launch = unique.pop()?;
     Some(LaunchInfo {
         command: launch.command,
         args: launch.args,
         hint: None,
     })
+}
+
+fn load_webapp_desktop_launch(path: &std::path::Path, identities: &[&str]) -> Option<DesktopLaunch> {
+    let extension = path.extension().and_then(|extension| extension.to_str())?;
+    if extension != "desktop" {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_webapp_desktop_file(&contents, identities)
 }
 
 fn desktop_application_directories() -> Vec<PathBuf> {
@@ -407,14 +385,9 @@ fn desktop_application_directories() -> Vec<PathBuf> {
     }
 
     if let Some(data_dirs) = std::env::var_os("XDG_DATA_DIRS") {
-        data_directories.extend(
-            std::env::split_paths(&data_dirs).filter(|directory| !directory.as_os_str().is_empty()),
-        );
+        data_directories.extend(std::env::split_paths(&data_dirs).filter(|directory| !directory.as_os_str().is_empty()));
     } else {
-        data_directories.extend([
-            PathBuf::from("/usr/local/share"),
-            PathBuf::from("/usr/share"),
-        ]);
+        data_directories.extend([PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")]);
     }
     // Omarchy's bundled application entries live here on a standard install,
     // even when the host's XDG_DATA_DIRS does not mention the parent.
@@ -447,63 +420,37 @@ fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<Desk
 
     let tokens = tokenize_desktop_exec(exec?)?;
     let command = tokens.first()?.as_str();
-    if !OMARCHY_WEBAPP_LAUNCHERS
-        .iter()
-        .any(|launcher| launcher.eq_ignore_ascii_case(command))
-    {
+    if !OMARCHY_WEBAPP_LAUNCHERS.iter().any(|launcher| launcher.eq_ignore_ascii_case(command)) {
         return None;
     }
 
-    let class_argument_matches = tokens
-        .get(1)
-        .map(|argument| {
-            identities
-                .iter()
-                .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(argument))
-        })
-        .unwrap_or(false);
+    let class_argument_matches = tokens.get(1).is_some_and(|argument| {
+        identities
+            .iter()
+            .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(argument))
+    });
     let url_argument_matches = if command.eq_ignore_ascii_case("omarchy-launch-webapp") {
         tokens
             .get(1)
-            .map(|url| {
-                identities
-                    .iter()
-                    .any(|identity| webapp_class_matches_url(identity, url))
-            })
-            .unwrap_or(false)
+            .is_some_and(|url| identities.iter().any(|identity| webapp_class_matches_url(identity, url)))
     } else if command.eq_ignore_ascii_case("omarchy-launch-or-focus-webapp") {
         tokens
             .get(2)
-            .map(|url| {
-                identities
-                    .iter()
-                    .any(|identity| webapp_class_matches_url(identity, url))
-            })
-            .unwrap_or(false)
+            .is_some_and(|url| identities.iter().any(|identity| webapp_class_matches_url(identity, url)))
     } else {
         tokens
             .get(2)
             .and_then(|nested| nested.strip_prefix("omarchy-launch-webapp "))
             .and_then(|nested| nested.split_whitespace().next())
-            .map(|url| {
-                identities
-                    .iter()
-                    .any(|identity| webapp_class_matches_url(identity, url))
-            })
-            .unwrap_or(false)
+            .is_some_and(|url| identities.iter().any(|identity| webapp_class_matches_url(identity, url)))
     };
-    let startup_class_matches = startup_class
-        .map(|startup| {
-            identities
-                .iter()
-                .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(startup))
-        })
-        .unwrap_or(false);
+    let startup_class_matches = startup_class.is_some_and(|startup| {
+        identities
+            .iter()
+            .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(startup))
+    });
     let matches = if command.eq_ignore_ascii_case("omarchy-launch-webapp") {
-        url_argument_matches
-            && identities
-                .iter()
-                .any(|identity| webapp_class_uses_default_profile(identity))
+        url_argument_matches && identities.iter().any(|identity| webapp_class_uses_default_profile(identity))
     } else {
         (class_argument_matches || startup_class_matches) && url_argument_matches
     };
@@ -526,6 +473,9 @@ fn parse_webapp_desktop_file(contents: &str, identities: &[&str]) -> Option<Desk
     })
 }
 
+// This parser is deliberately written as a small state machine so quoting and
+// escaping rules stay visible together.
+#[allow(clippy::excessive_nesting)]
 fn tokenize_desktop_exec(value: &str) -> Option<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -572,10 +522,7 @@ fn tokenize_desktop_exec(value: &str) -> Option<Vec<String>> {
 }
 
 fn is_webapp_class(class: &str) -> bool {
-    class
-        .get(.."chrome-".len())
-        .map(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
-        .unwrap_or(false)
+    class.get(.."chrome-".len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case("chrome-"))
 }
 
 pub(crate) fn webapp_class_matches_url(class: &str, url: &str) -> bool {
@@ -596,12 +543,8 @@ pub(crate) fn webapp_class_matches_url(class: &str, url: &str) -> bool {
         if class_host.is_empty() {
             return false;
         }
-        let class_route = class_suffix
-            .rsplit_once('-')
-            .map(|(route, _profile)| route)
-            .unwrap_or(class_suffix);
-        return class_host.eq_ignore_ascii_case(url_host)
-            && class_route == url_route.replace('/', "_");
+        let class_route = class_suffix.rsplit_once('-').map_or(class_suffix, |(route, _profile)| route);
+        return class_host.eq_ignore_ascii_case(url_host) && class_route == url_route.replace('/', "_");
     }
 
     // Chromium also emits a compact root-app class such as
@@ -630,8 +573,7 @@ fn webapp_class_uses_default_profile(class: &str) -> bool {
     }
     class["chrome-".len()..]
         .rsplit_once('-')
-        .map(|(_route, profile)| profile.eq_ignore_ascii_case("Default"))
-        .unwrap_or(false)
+        .is_some_and(|(_route, profile)| profile.eq_ignore_ascii_case("Default"))
 }
 
 fn is_webapp_profile_suffix(profile: &str) -> bool {
@@ -648,10 +590,7 @@ fn webapp_url_host(url: &str) -> Option<&str> {
         return None;
     }
     let authority = &url[scheme_end + 3..];
-    let authority = authority
-        .split(['/', '?', '#'])
-        .next()
-        .filter(|authority| !authority.is_empty())?;
+    let authority = authority.split(['/', '?', '#']).next().filter(|authority| !authority.is_empty())?;
     let host = authority.rsplit('@').next()?.split(':').next()?;
     (!host.is_empty()).then_some(host)
 }
@@ -659,10 +598,7 @@ fn webapp_url_host(url: &str) -> Option<&str> {
 fn webapp_url_route(url: &str) -> Option<&str> {
     let scheme_end = url.find("://")?;
     let authority = &url[scheme_end + 3..];
-    let route = authority
-        .find(['/', '?', '#'])
-        .map(|index| &authority[index..])
-        .unwrap_or("");
+    let route = authority.find(['/', '?', '#']).map_or("", |index| &authority[index..]);
     Some(route.split(['?', '#']).next()?.trim_matches('/'))
 }
 
@@ -672,10 +608,7 @@ fn webapp_url_route(url: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use crate::config::{AppConfig, Config, FilterConfig, GeneralConfig};
-    use crate::hyprctl::{
-        HyprClient as RawClient, HyprMonitor as RawMonitor, HyprWorkspace as RawWorkspace,
-        HyprctlClient, HyprctlError,
-    };
+    use crate::hyprctl::{HyprClient as RawClient, HyprMonitor as RawMonitor, HyprWorkspace as RawWorkspace, HyprctlClient, HyprctlError};
     use crate::process::{ChildProcess, ProcessError, ProcessInfoProvider};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -711,10 +644,7 @@ mod tests {
 
     impl ProcessInfoProvider for MockProcess {
         fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
-            self.cwds
-                .get(&pid)
-                .cloned()
-                .ok_or(ProcessError::NotFound(pid))
+            self.cwds.get(&pid).cloned().ok_or(ProcessError::NotFound(pid))
         }
         fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
             Ok(self.children.get(&pid).cloned().unwrap_or_default())
@@ -822,16 +752,12 @@ mod tests {
             apps: HashMap::new(),
         };
 
-        let session =
-            capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
 
         assert_eq!(session.clients.len(), 2, "waybar must be excluded");
         let classes: Vec<&str> = session.clients.iter().map(|c| c.class.as_str()).collect();
         assert!(classes.contains(&"kitty"), "kitty must be present");
-        assert!(
-            classes.contains(&"brave-browser"),
-            "brave-browser must be present"
-        );
+        assert!(classes.contains(&"brave-browser"), "brave-browser must be present");
         assert!(!classes.contains(&"waybar"), "waybar must be absent");
     }
 
@@ -882,9 +808,7 @@ mod tests {
 
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: app_configs,
         };
 
@@ -914,10 +838,7 @@ mod tests {
             vec!["--directory", "/home/user/project"],
             "args must contain --directory <cwd>"
         );
-        assert!(
-            launch.hint.is_none(),
-            "no hint expected when capture_last_command is off"
-        );
+        assert!(launch.hint.is_none(), "no hint expected when capture_last_command is off");
     }
 
     // ── Test 3: generic app — binary override, no CWD ────────────────────
@@ -946,22 +867,16 @@ mod tests {
 
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: app_configs,
         };
 
-        let session = capture_session("test", &hyprctl, &BraveNoProfileProcess, &config)
-            .expect("capture failed");
+        let session = capture_session("test", &hyprctl, &BraveNoProfileProcess, &config).expect("capture failed");
 
         assert_eq!(session.clients.len(), 1);
         let launch = &session.clients[0].launch;
         assert_eq!(launch.command, "brave", "binary override must be applied");
-        assert!(
-            launch.args.is_empty(),
-            "no args expected without CWD capture"
-        );
+        assert!(launch.args.is_empty(), "no args expected without CWD capture");
         assert!(launch.hint.is_none());
         assert_eq!(
             session.clients[0].profile_directory.as_deref(),
@@ -978,8 +893,7 @@ mod tests {
             monitors: vec![make_monitor("HDMI-A-1")],
         };
 
-        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default())
-            .expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default()).expect("capture failed");
 
         assert!(session.clients[0].profile_directory.is_none());
         assert!(session.clients[0].profile_identity_ambiguous);
@@ -992,13 +906,7 @@ mod tests {
             monitors: vec![make_monitor("HDMI-A-1")],
         };
 
-        let session = capture_session(
-            "test",
-            &hyprctl,
-            &BravePartialProfileProcess,
-            &Config::default(),
-        )
-        .expect("capture failed");
+        let session = capture_session("test", &hyprctl, &BravePartialProfileProcess, &Config::default()).expect("capture failed");
 
         assert!(session.clients[0].profile_directory.is_none());
         assert!(session.clients[0].profile_identity_ambiguous);
@@ -1011,8 +919,7 @@ mod tests {
             monitors: vec![make_monitor("DP-1")],
         };
 
-        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default())
-            .expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default()).expect("capture failed");
 
         assert_eq!(session.clients[0].launch.command, "brave");
     }
@@ -1025,8 +932,7 @@ mod tests {
             Exec=omarchy-launch-or-focus chrome-youtube.com__-Profile_1 "omarchy-launch-webapp https://youtube.com/ --profile-directory='Profile 1'"
         "#;
 
-        let launch = parse_webapp_desktop_file(contents, &["chrome-youtube.com__-Profile_1", ""])
-            .expect("webapp desktop entry should be recognized");
+        let launch = parse_webapp_desktop_file(contents, &["chrome-youtube.com__-Profile_1", ""]).expect("webapp desktop entry should be recognized");
 
         assert_eq!(launch.command, "omarchy-launch-or-focus");
         assert_eq!(
@@ -1040,8 +946,7 @@ mod tests {
 
     #[test]
     fn test_parse_webapp_entry_rejects_unrelated_class() {
-        let contents =
-            "Exec=omarchy-launch-or-focus-webapp chrome-chatgpt.com__-Default https://chatgpt.com/";
+        let contents = "Exec=omarchy-launch-or-focus-webapp chrome-chatgpt.com__-Default https://chatgpt.com/";
 
         assert!(parse_webapp_desktop_file(contents, &["chrome-other.com__-Default"]).is_none());
     }
@@ -1050,8 +955,8 @@ mod tests {
     fn test_parse_standard_omarchy_webapp_desktop_entry() {
         let contents = "[Desktop Entry]\nExec=omarchy-launch-webapp https://chatgpt.com/\n";
 
-        let launch = parse_webapp_desktop_file(contents, &["chrome-chatgpt.com__-Default", ""])
-            .expect("standard direct webapp entry should be recognized");
+        let launch =
+            parse_webapp_desktop_file(contents, &["chrome-chatgpt.com__-Default", ""]).expect("standard direct webapp entry should be recognized");
 
         assert_eq!(launch.command, "omarchy-launch-webapp");
         assert_eq!(launch.args, vec!["https://chatgpt.com/"]);
@@ -1062,22 +967,11 @@ mod tests {
     fn test_webapp_route_and_profile_suffixes_must_match() {
         let class = "chrome-discord.com__channels_@me-Default";
 
-        assert!(webapp_class_matches_url(
-            class,
-            "https://discord.com/channels/@me"
-        ));
-        assert!(webapp_class_matches_url(
-            class,
-            "https://discord.com/channels/@me?view=unread"
-        ));
-        assert!(!webapp_class_matches_url(
-            class,
-            "https://discord.com/other"
-        ));
+        assert!(webapp_class_matches_url(class, "https://discord.com/channels/@me"));
+        assert!(webapp_class_matches_url(class, "https://discord.com/channels/@me?view=unread"));
+        assert!(!webapp_class_matches_url(class, "https://discord.com/other"));
         assert!(webapp_class_uses_default_profile(class));
-        assert!(!webapp_class_uses_default_profile(
-            "chrome-discord.com__channels_@me-Profile_1"
-        ));
+        assert!(!webapp_class_uses_default_profile("chrome-discord.com__channels_@me-Profile_1"));
     }
 
     #[test]
@@ -1085,10 +979,7 @@ mod tests {
         let class = "chrome-example.com-Default";
 
         assert!(webapp_class_matches_url(class, "https://example.com/"));
-        assert!(webapp_class_matches_url(
-            class,
-            "https://example.com/?view=home"
-        ));
+        assert!(webapp_class_matches_url(class, "https://example.com/?view=home"));
         assert!(webapp_class_uses_default_profile(class));
         assert!(!webapp_class_matches_url(class, "https://example.com/app"));
     }
@@ -1103,18 +994,11 @@ mod tests {
         .unwrap();
         let client = make_hypr_client("chrome-chatgpt.com__-Default", 3003);
 
-        let launch = find_webapp_launch_info_in_directories(
-            &client.class,
-            &client.initial_class,
-            &[directory.path().to_path_buf()],
-        )
-        .expect("matching webapp desktop entry should be found");
+        let launch = find_webapp_launch_info_in_directories(&client.class, &client.initial_class, &[directory.path().to_path_buf()])
+            .expect("matching webapp desktop entry should be found");
 
         assert_eq!(launch.command, "omarchy-launch-or-focus-webapp");
-        assert_eq!(
-            launch.args,
-            vec!["chrome-chatgpt.com__-Default", "https://chatgpt.com/"]
-        );
+        assert_eq!(launch.args, vec!["chrome-chatgpt.com__-Default", "https://chatgpt.com/"]);
     }
 
     #[test]
@@ -1131,12 +1015,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(find_webapp_launch_info_in_directories(
-            "chrome-example.com__foo_bar-Default",
-            "",
-            &[directory.path().to_path_buf()],
-        )
-        .is_none());
+        assert!(find_webapp_launch_info_in_directories("chrome-example.com__foo_bar-Default", "", &[directory.path().to_path_buf()],).is_none());
     }
 
     #[test]
@@ -1153,12 +1032,8 @@ mod tests {
         )
         .unwrap();
 
-        let launch = find_webapp_launch_info_in_directories(
-            "chrome-example.com__-Default",
-            "",
-            &[directory.path().to_path_buf()],
-        )
-        .expect("explicit class launcher should win over a generic URL entry");
+        let launch = find_webapp_launch_info_in_directories("chrome-example.com__-Default", "", &[directory.path().to_path_buf()])
+            .expect("explicit class launcher should win over a generic URL entry");
 
         assert_eq!(launch.command, "omarchy-launch-or-focus-webapp");
         assert_eq!(launch.args[0], "chrome-example.com__-Default");
@@ -1189,9 +1064,7 @@ mod tests {
 
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: app_configs,
         };
 
@@ -1211,10 +1084,7 @@ mod tests {
         let client = &session.clients[0];
 
         assert_eq!(client.launch.command, "ghostty");
-        assert_eq!(
-            client.launch.args,
-            vec!["--working-directory", "/home/user/project"]
-        );
+        assert_eq!(client.launch.args, vec!["--working-directory", "/home/user/project"]);
         assert_eq!(client.initial_class, "com.mitchellh.ghostty");
     }
 
@@ -1229,14 +1099,11 @@ mod tests {
 
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: HashMap::new(),
         };
 
-        let session =
-            capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
 
         assert_eq!(session.clients[0].monitor, "DP-2");
     }
@@ -1254,8 +1121,7 @@ mod tests {
             monitors: vec![make_monitor("DP-1")],
         };
 
-        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default())
-            .expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &Config::default()).expect("capture failed");
         let saved = &session.clients[0];
         assert_eq!(saved.workspace, -99);
         assert_eq!(saved.workspace_name, "special:magic");
@@ -1272,8 +1138,7 @@ mod tests {
         };
         let config = Config::default();
 
-        let session =
-            capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
 
         assert_eq!(session.hyprland_version, "0.54.1");
     }
@@ -1306,9 +1171,7 @@ mod tests {
 
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: app_configs,
         };
 
@@ -1357,22 +1220,16 @@ mod tests {
 
         let hyprctl = MockHyprctl {
             clients: vec![client],
-            monitors: vec![
-                make_monitor_with_id(1, "DP-4"),
-                make_monitor_with_id(0, "DP-5"),
-            ],
+            monitors: vec![make_monitor_with_id(1, "DP-4"), make_monitor_with_id(0, "DP-5")],
         };
 
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: HashMap::new(),
         };
 
-        let session =
-            capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
+        let session = capture_session("test", &hyprctl, &empty_process(), &config).expect("capture failed");
 
         assert_eq!(
             session.clients[0].monitor, "DP-5",
@@ -1390,9 +1247,7 @@ mod tests {
         };
         let config = Config {
             general: GeneralConfig::default(),
-            filters: FilterConfig {
-                ignore_classes: vec![],
-            },
+            filters: FilterConfig { ignore_classes: vec![] },
             apps: HashMap::new(),
         };
 

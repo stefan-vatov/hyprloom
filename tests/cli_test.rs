@@ -1,3 +1,7 @@
+//! Command-line smoke tests for the Hyprloom executable.
+
+#![allow(unused_crate_dependencies)]
+
 use predicates::prelude::*;
 
 #[test]
@@ -40,7 +44,8 @@ fn test_cli_help_describes_reconciliation() {
         .args(["restore", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("reconcile"));
+        .stdout(predicate::str::contains("reconcile"))
+        .stdout(predicate::str::contains("greedy"));
 }
 
 #[test]
@@ -78,7 +83,5 @@ fn test_cli_config_shows_paths() {
 fn test_autosave_help() {
     let mut cmd = assert_cmd::cargo::cargo_bin_cmd!("hyprloom");
     cmd.args(["autosave", "--help"]);
-    cmd.assert()
-        .success()
-        .stdout(predicate::str::contains("autosave"));
+    cmd.assert().success().stdout(predicate::str::contains("autosave"));
 }

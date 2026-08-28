@@ -4,7 +4,7 @@ version = "0.3.9"
 edition = "2021"
 description = "Save, restore, and reconcile Hyprland window sessions"
 license = "MIT"
-repository = "https://github.com/thethracian/hyprloom"
+repository = "https://github.com/stefan-vatov/hyprloom"
 readme = "README.md"
 keywords = ["hyprland", "wayland", "session", "restore"]
 categories = ["command-line-utilities"]
@@ -19,9 +19,36 @@ chrono = { version = "0.4", features = ["serde"] }
 which = "8.0"
 thiserror = "2"
 libc = "0.2"
+nix = { version = "0.30", features = ["user"] }
 sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+
+# BEGIN cargo-thx-lint
+# VERSION 0.1.0
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "deny"
+missing_debug_implementations = "deny"
+unused_must_use = "deny"
+unused_mut = "deny"
+unused_crate_dependencies = "deny"
+
+[lints.clippy]
+wildcard_enum_match_arm = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+todo = "deny"
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
+cargo = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+unused_result_ok = "deny"
+as_conversions = "deny"
+too_many_lines = "deny"
+# END cargo-thx-lint

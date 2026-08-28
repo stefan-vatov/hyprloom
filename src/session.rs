@@ -3,19 +3,27 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
+use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-#[cfg(unix)]
-use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use crate::platform::current_user_id;
+
+/// Maximum serialized session size accepted by the storage layer.
 pub const MAX_SESSION_FILE_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum number of clients accepted in one session.
 pub const MAX_SESSION_CLIENTS: usize = 4_096;
+/// Maximum number of monitors accepted in one session.
 pub const MAX_SESSION_MONITORS: usize = 128;
+/// Maximum number of Brave profiles accepted in one session.
 pub const MAX_SESSION_BRAVE_PROFILES: usize = 1_024;
+/// Maximum number of launch arguments accepted for one client.
 pub const MAX_SESSION_ARGS: usize = 2_048;
+/// Maximum length of any session string, in bytes.
 pub const MAX_SESSION_STRING_BYTES: usize = 64 * 1024;
 
 // Older session writers sometimes emitted JSON null for fields that were
@@ -25,53 +33,73 @@ fn deserialize_nullable_string<'de, D>(deserializer: D) -> Result<String, D::Err
 where
     D: Deserializer<'de>,
 {
-    Option::<String>::deserialize(deserializer).map(|value| value.unwrap_or_default())
+    Option::<String>::deserialize(deserializer).map(std::option::Option::unwrap_or_default)
 }
 
 fn deserialize_nullable_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
 where
     D: Deserializer<'de>,
 {
-    Option::<bool>::deserialize(deserializer).map(|value| value.unwrap_or_default())
+    Option::<bool>::deserialize(deserializer).map(std::option::Option::unwrap_or_default)
 }
 
 // === Hyprloom session structs (what we save to disk) ===
 
+/// A Brave profile captured as part of a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BraveProfile {
-    pub directory: String, // "Default", "Profile 1", etc.
-    pub name: String,      // "Credifit", "LinkPJ", etc.
+    /// Profile directory name, such as `Default` or `Profile 1`.
+    pub directory: String,
+    /// Human-readable profile name shown by Brave.
+    pub name: String,
 }
 
+/// A named snapshot of the Hyprland desktop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
+    /// User-facing snapshot name.
     pub name: String,
+    /// Time at which the snapshot was captured.
     pub created_at: DateTime<Utc>,
+    /// Hyprland version reported during capture.
     pub hyprland_version: String,
+    /// Monitor topology captured with the session.
     pub monitors: Vec<Monitor>,
+    /// Saved client windows and their launch/placement state.
     pub clients: Vec<SessionClient>,
+    /// Brave profiles observed during capture.
     #[serde(default)]
     pub brave_profiles: Vec<BraveProfile>,
 }
 
+/// A monitor's geometry captured with a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Monitor {
+    /// Hyprland connector name, such as `DP-1`.
     pub name: String,
+    /// Monitor width in pixels.
     pub width: u32,
+    /// Monitor height in pixels.
     pub height: u32,
+    /// Hyprland transform value.
     pub transform: u32,
     /// Monitor origin in Hyprland's global coordinate space.  `None` keeps
     /// older session files from being treated as if they were captured at
     /// (0, 0), which would make geometry adaptation unsafe.
+    /// Global X origin, when available.
     #[serde(default)]
     pub x: Option<i32>,
+    /// Global Y origin, when available.
     #[serde(default)]
     pub y: Option<i32>,
 }
 
+/// A saved Hyprland client and the information needed to restore it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionClient {
+    /// Runtime Hyprland window class.
     pub class: String,
+    /// Window title at capture time.
     pub title: String,
     /// Hyprland's address is a window-level identity while the window remains
     /// open.  Older snapshots do not contain it and deserialize as `None`.
@@ -83,6 +111,7 @@ pub struct SessionClient {
     /// contain either field.
     #[serde(default)]
     pub pid: Option<u32>,
+    /// Process start timestamp captured from `/proc`, when available.
     #[serde(default)]
     pub process_start_time: Option<u64>,
     /// Hyprland's stable window identifier, when the compositor provides it.
@@ -93,35 +122,53 @@ pub struct SessionClient {
     /// Initial Hyprland app identity.  These fields are optional in spirit:
     /// older session files do not contain them and reconciliation falls back
     /// to `class` and `title` when they are empty.
+    /// App class reported when the window was created.
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub initial_class: String,
+    /// Title reported when the window was created.
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub initial_title: String,
+    /// Numeric workspace identifier.
     pub workspace: i32,
+    /// Workspace name, including named or special-workspace prefixes.
     #[serde(default, deserialize_with = "deserialize_nullable_string")]
     pub workspace_name: String,
+    /// Monitor connector name at capture time.
     pub monitor: String,
+    /// Top-left position in global compositor coordinates.
     pub at: [i32; 2],
+    /// Window size in pixels.
     pub size: [i32; 2],
+    /// Whether the window was floating.
     pub floating: bool,
+    /// Hyprland fullscreen state.
     pub fullscreen: u8,
+    /// Whether the window was pinned.
     #[serde(default, deserialize_with = "deserialize_nullable_bool")]
     pub pinned: bool,
+    /// Browser profile directory associated with the client, when known.
     #[serde(default)]
     pub profile_directory: Option<String>,
     /// True when the captured browser process did not provide a safe
     /// window-specific profile identity.  Automatic restore must not use such
     /// a client to move or launch a guessed Brave profile.
+    /// Whether profile identity was ambiguous during capture.
     #[serde(default, deserialize_with = "deserialize_nullable_bool")]
     pub profile_identity_ambiguous: bool,
+    /// Hyprland focus-history sequence at capture time.
     pub focus_history_id: i32,
+    /// Command, arguments, and optional desktop-entry hint used to relaunch.
     pub launch: LaunchInfo,
 }
 
+/// Launch information captured for a session client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LaunchInfo {
+    /// Executable or desktop-entry command.
     pub command: String,
+    /// Arguments passed to the command.
     pub args: Vec<String>,
+    /// Optional launcher hint for web apps or desktop entries.
     pub hint: Option<String>,
 }
 
@@ -129,55 +176,83 @@ pub struct LaunchInfo {
 
 use std::path::Path;
 
+/// Errors returned while reading or writing session state.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("IO error: {0}")]
+    /// Filesystem operation failed.
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
+    /// Session JSON was invalid.
     Json(#[from] serde_json::Error),
     #[error("session '{0}' not found")]
+    /// The requested session does not exist.
     NotFound(String),
     #[error("session '{0}' already exists")]
+    /// A session with the requested name already exists.
     AlreadyExists(String),
     #[error("invalid session name '{0}': use 1-128 ASCII letters, numbers, '.', '_' or '-'")]
+    /// The requested name is not safe for use as a file name.
     InvalidName(String),
     #[error("unsafe session path for '{0}'")]
+    /// A session path failed an ownership, permission, or symlink check.
     UnsafePath(String),
     #[error("session file '{requested}' contains payload for '{actual}'")]
-    NameMismatch { requested: String, actual: String },
+    /// The filename and serialized session name do not agree.
+    NameMismatch {
+        /// Name requested by the caller or inferred from the filename.
+        requested: String,
+        /// Name stored inside the session payload.
+        actual: String,
+    },
     #[error("session data exceeds safety limits: {0}")]
+    /// Session data exceeded one of the storage safety limits.
     TooLarge(String),
 }
 
+/// Summary metadata for one stored session.
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
+    /// Session name.
     pub name: String,
+    /// Session capture time.
     pub created_at: DateTime<Utc>,
+    /// Number of saved client windows.
     pub client_count: usize,
 }
 
+/// Durable phases of a destructive replacement transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReplacePhase {
+    /// Safety snapshot and prepared marker have been written.
     Prepared,
+    /// The first current window is about to be closed.
     Closing,
+    /// Current windows are being closed or the target is being restored.
     InProgress,
     /// The target reconciliation completed.  This durable phase lets startup
     /// finish cleanup safely if writing the final committed marker is
     /// interrupted after the desktop has already been restored.
     Finalizing,
+    /// Replacement completed and its marker can be removed.
     Committed,
 }
 
+/// Durable metadata used to recover an interrupted replacement.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplaceMarker {
+    /// Name of the safety snapshot to restore if recovery is required.
     pub backup_name: String,
+    /// Current replacement phase.
     pub phase: ReplacePhase,
+    /// Address of the first client selected for closing.
     pub closing_address: Option<String>,
     /// Process identity for the first close candidate.  New markers use this
     /// to distinguish a close that actually happened from a different window
     /// which later reused the same Hyprland address.  Older markers leave it
     /// absent and are recovered conservatively.
     pub closing_pid: Option<u32>,
+    /// Start timestamp of the first close candidate's process.
     pub closing_start_time: Option<u64>,
     /// Hyprland's window-specific stable ID for the first close candidate.
     /// This protects recovery from address reuse inside one shared browser
@@ -185,22 +260,33 @@ pub struct ReplaceMarker {
     pub closing_stable_id: Option<String>,
     /// The session being installed.  Older markers do not contain this and
     /// therefore retain the conservative exact-recovery behavior.
+    /// Target session name, when the marker records one.
     pub target_name: Option<String>,
     /// SHA-256 fingerprint of the exact target session used by a replacement.
     /// A changed target must not be used to declare an interrupted transaction
     /// complete, because recovery must reason about the plan that actually
     /// started.
+    /// Fingerprint of the target session used by the replacement.
     pub target_digest: Option<String>,
 }
 
-/// Process-wide lock for all CLI operations that can observe or mutate the
-/// desktop/session store.  Keeping this in the helper means the UI, systemd
+/// Process-wide lock for CLI operations that can observe or mutate the
+/// desktop/session store.
+///
+/// Keeping this in the helper means the UI, systemd
 /// autosave, and manually invoked commands share one serialization boundary.
+#[derive(Debug)]
 pub struct OperationLock {
-    file: File,
+    _file: File,
 }
 
 impl OperationLock {
+    /// Acquire the process-wide operation lock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the lock directory or lock file is unsafe or
+    /// cannot be opened.
     pub fn acquire() -> Result<Self, SessionError> {
         let lock_dir = operation_lock_dir()?;
         match std::fs::symlink_metadata(&lock_dir) {
@@ -223,21 +309,9 @@ impl OperationLock {
         let file = options.open(&path)?;
         ensure_private_file(&path, "operation.lock")?;
 
-        #[cfg(unix)]
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(SessionError::Io(std::io::Error::last_os_error()));
-        }
+        file.lock().map_err(SessionError::Io)?;
 
-        Ok(Self { file })
-    }
-}
-
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
-        }
+        Ok(Self { _file: file })
     }
 }
 
@@ -254,12 +328,18 @@ fn operation_lock_dir() -> Result<std::path::PathBuf, SessionError> {
         })
 }
 
+/// Save a validated session snapshot in `sessions_dir`.
+///
+/// # Errors
+///
+/// Returns an error when validation fails or the snapshot cannot be written
+/// safely.
 pub fn save_session(session: &Session, sessions_dir: &Path) -> Result<(), SessionError> {
     validate_session_structure(session)?;
     ensure_sessions_dir(sessions_dir)?;
     let path = sessions_dir.join(format!("{}.json", session.name));
     let json = serde_json::to_string_pretty(session)?;
-    if json.len() as u64 > MAX_SESSION_FILE_BYTES {
+    if u64::try_from(json.len()).unwrap_or(u64::MAX) > MAX_SESSION_FILE_BYTES {
         return Err(SessionError::TooLarge(format!(
             "serialized session is larger than {MAX_SESSION_FILE_BYTES} bytes"
         )));
@@ -296,6 +376,12 @@ fn existing_sessions_dir(sessions_dir: &Path) -> Result<bool, SessionError> {
     }
 }
 
+/// Load and validate a named session snapshot.
+///
+/// # Errors
+///
+/// Returns an error when the name is invalid, the snapshot is missing or
+/// unsafe, or its contents fail validation.
 pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionError> {
     validate_session_name(name)?;
     if !existing_sessions_dir(sessions_dir)? {
@@ -305,9 +391,7 @@ pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionE
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Err(SessionError::UnsafePath(name.to_string())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SessionError::NotFound(name.to_string()))
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(SessionError::NotFound(name.to_string())),
         Err(error) => return Err(SessionError::Io(error)),
     }
     ensure_private_file(&path, name)?;
@@ -323,6 +407,14 @@ pub fn load_session(name: &str, sessions_dir: &Path) -> Result<Session, SessionE
     Ok(session)
 }
 
+/// List valid session snapshots in capture-time order.
+///
+/// # Errors
+///
+/// Returns an error when the session directory cannot be inspected safely.
+// Invalid or unsafe entries are intentionally ignored while valid snapshots
+// are collected; the nested checks keep that fail-closed policy local.
+#[allow(clippy::excessive_nesting)]
 pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
     if !existing_sessions_dir(sessions_dir)? {
         return Ok(vec![]);
@@ -331,12 +423,9 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
     for entry in std::fs::read_dir(sessions_dir)? {
         let entry = entry?;
         let path = entry.path();
-        let is_regular_file = entry
-            .file_type()
-            .map(|file_type| file_type.is_file())
-            .unwrap_or(false);
+        let is_regular_file = entry.file_type().is_ok_and(|file_type| file_type.is_file());
         if is_regular_file
-            && path.extension().map(|e| e == "json").unwrap_or(false)
+            && path.extension().is_some_and(|e| e == "json")
             && ensure_private_file(&path, &entry.file_name().to_string_lossy()).is_ok()
         {
             if let Ok(content) = read_limited_file(&path, &entry.file_name().to_string_lossy()) {
@@ -361,14 +450,16 @@ pub fn list_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, Session
             }
         }
     }
-    summaries.sort_by(|left, right| {
-        Reverse(left.created_at)
-            .cmp(&Reverse(right.created_at))
-            .then(left.name.cmp(&right.name))
-    });
+    summaries.sort_by(|left, right| Reverse(left.created_at).cmp(&Reverse(right.created_at)).then(left.name.cmp(&right.name)));
     Ok(summaries)
 }
 
+/// Delete one named session snapshot.
+///
+/// # Errors
+///
+/// Returns an error when the name or target path is invalid, missing, or
+/// unsafe.
 pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionError> {
     validate_session_name(name)?;
     if !existing_sessions_dir(sessions_dir)? {
@@ -378,9 +469,7 @@ pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionErro
     match std::fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
         Ok(_) => return Err(SessionError::UnsafePath(name.to_string())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SessionError::NotFound(name.to_string()))
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(SessionError::NotFound(name.to_string())),
         Err(error) => return Err(SessionError::Io(error)),
     }
     ensure_private_file(&path, name)?;
@@ -388,6 +477,8 @@ pub fn delete_session(name: &str, sessions_dir: &Path) -> Result<(), SessionErro
     Ok(())
 }
 
+/// Check whether a named session exists in the session directory.
+#[must_use]
 pub fn session_exists(name: &str, sessions_dir: &Path) -> bool {
     if validate_session_name(name).is_err() {
         return false;
@@ -396,12 +487,15 @@ pub fn session_exists(name: &str, sessions_dir: &Path) -> bool {
         return false;
     }
     let path = sessions_dir.join(format!("{name}.json"));
-    std::fs::symlink_metadata(&path)
-        .map(|metadata| metadata.file_type().is_file())
-        .unwrap_or(false)
-        && ensure_private_file(&path, name).is_ok()
+    std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) && ensure_private_file(&path, name).is_ok()
 }
 
+/// Validate a session name for safe use as a storage filename.
+///
+/// # Errors
+///
+/// Returns [`SessionError::InvalidName`] when the name is empty, too long, or
+/// contains a character outside the supported ASCII set.
 pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
     if name.is_empty()
         || name == "."
@@ -418,6 +512,11 @@ pub fn validate_session_name(name: &str) -> Result<(), SessionError> {
 
 /// Validate a name supplied by a user.  Autosave names are reserved for the
 /// helper so retention can never prune a manually saved session by accident.
+///
+/// # Errors
+///
+/// Returns [`SessionError::InvalidName`] when the name is invalid or uses the
+/// reserved autosave prefix.
 pub fn validate_user_session_name(name: &str) -> Result<(), SessionError> {
     validate_session_name(name)?;
     if name.starts_with(AUTOSAVE_PREFIX) {
@@ -429,12 +528,19 @@ pub fn validate_user_session_name(name: &str) -> Result<(), SessionError> {
 }
 
 /// Copy legacy hyprflow sessions into the fork's storage without removing or
-/// overwriting anything.  This is intentionally idempotent so a user can run
+/// overwriting anything.
+///
+/// This is intentionally idempotent so a user can run
 /// the fork repeatedly while keeping the original files as a rollback path.
-pub fn migrate_legacy_sessions(
-    sessions_dir: &Path,
-    legacy_sessions_dir: &Path,
-) -> Result<usize, SessionError> {
+///
+/// # Errors
+///
+/// Returns an error when either session directory cannot be inspected or a
+/// valid legacy snapshot cannot be copied safely.
+// Migration validates every candidate independently so one malformed legacy
+// file cannot prevent healthy snapshots from being copied.
+#[allow(clippy::excessive_nesting)]
+pub fn migrate_legacy_sessions(sessions_dir: &Path, legacy_sessions_dir: &Path) -> Result<usize, SessionError> {
     if sessions_dir == legacy_sessions_dir {
         return Ok(0);
     }
@@ -451,19 +557,13 @@ pub fn migrate_legacy_sessions(
     for entry in std::fs::read_dir(legacy_sessions_dir)? {
         let entry = entry?;
         let source = entry.path();
-        let source_is_regular = entry
-            .file_type()
-            .map(|file_type| file_type.is_file())
-            .unwrap_or(false);
-        if source_is_regular && source.extension().map(|ext| ext == "json").unwrap_or(false) {
+        let source_is_regular = entry.file_type().is_ok_and(|file_type| file_type.is_file());
+        if source_is_regular && source.extension().is_some_and(|ext| ext == "json") {
             let destination = sessions_dir.join(entry.file_name());
             if std::fs::symlink_metadata(&destination).is_ok() {
                 continue;
             }
-            let name = source
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or_default();
+            let name = source.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
             if validate_session_name(name).is_err() {
                 continue;
             }
@@ -496,35 +596,33 @@ pub fn migrate_legacy_sessions(
 
 // === Autosave helpers ===
 
+/// Prefix reserved for automatically captured safety snapshots.
 pub const AUTOSAVE_PREFIX: &str = "autosave-";
 const REPLACE_MARKER_NAME: &str = ".replace-in-progress";
 static AUTOSAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+/// Generate a unique autosave name using the current time and process ID.
 pub fn autosave_name_now() -> String {
     let now = Utc::now();
     let sequence = AUTOSAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "autosave-{}-{}-{}",
-        now.format("%Y%m%dT%H%M%S%f"),
-        std::process::id(),
-        sequence
-    )
+    format!("autosave-{}-{}-{}", now.format("%Y%m%dT%H%M%S%f"), std::process::id(), sequence)
 }
 
-/// Record that a replace operation has a saved desktop which can be used for
-/// recovery if the helper is interrupted after it starts closing windows.
-pub fn mark_replace_in_progress(
-    backup_name: &str,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+/// Mark a replacement as having started without a named target.
+///
+/// # Errors
+///
+/// Returns an error when the backup name or marker path is invalid.
+pub fn mark_replace_in_progress(backup_name: &str, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     mark_replace_in_progress_for_target(backup_name, None, sessions_dir)
 }
 
-pub fn mark_replace_in_progress_for_target(
-    backup_name: &str,
-    target_name: Option<&str>,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+/// Mark a replacement as having started, optionally naming its target.
+///
+/// # Errors
+///
+/// Returns an error when the names or marker path are invalid.
+pub fn mark_replace_in_progress_for_target(backup_name: &str, target_name: Option<&str>, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
@@ -547,17 +645,24 @@ pub fn mark_replace_in_progress_for_target(
 }
 
 /// Record the address of the first window whose close dispatch is about to be
-/// sent. Startup can use this evidence to distinguish a marker written just
+/// sent.
+///
+/// Startup can use this evidence to distinguish a marker written just
 /// before a failed dispatch from a replacement that actually started closing
 /// the desktop.
-pub fn mark_replace_closing(
-    backup_name: &str,
-    sessions_dir: &std::path::Path,
-    address: &str,
-) -> Result<(), SessionError> {
+///
+/// # Errors
+///
+/// Returns an error when the names, address, or marker path is invalid.
+pub fn mark_replace_closing(backup_name: &str, sessions_dir: &std::path::Path, address: &str) -> Result<(), SessionError> {
     mark_replace_closing_for_target(backup_name, None, sessions_dir, address)
 }
 
+/// Record the first client address selected for closing.
+///
+/// # Errors
+///
+/// Returns an error when the names, address, or marker path is invalid.
 pub fn mark_replace_closing_for_target(
     backup_name: &str,
     target_name: Option<&str>,
@@ -586,9 +691,17 @@ pub fn mark_replace_closing_for_target(
     )
 }
 
-/// Record the first close candidate together with its process identity.  The
-/// identity is intentionally optional because Hyprland can report a window
+/// Record the first close candidate together with its process identity.
+///
+/// The identity is intentionally optional because Hyprland can report a window
 /// whose process has already exited by the time `/proc` is inspected.
+///
+/// # Errors
+///
+/// Returns an error when the names, address, or marker path is invalid.
+// The marker API keeps each identity field explicit because it is also the
+// durable transaction boundary used by startup recovery.
+#[allow(clippy::too_many_arguments)]
 pub fn mark_replace_closing_for_target_with_identity(
     backup_name: &str,
     target_name: Option<&str>,
@@ -597,19 +710,19 @@ pub fn mark_replace_closing_for_target_with_identity(
     pid: u32,
     start_time: Option<u64>,
 ) -> Result<(), SessionError> {
-    mark_replace_closing_for_target_with_identity_and_stable_id(
-        backup_name,
-        target_name,
-        sessions_dir,
-        address,
-        pid,
-        start_time,
-        None,
-    )
+    mark_replace_closing_for_target_with_identity_and_stable_id(backup_name, target_name, sessions_dir, address, pid, start_time, None)
 }
 
 /// Record the first close candidate with process and compositor identity.
 /// The stable ID is optional for compatibility with older Hyprland versions.
+///
+/// # Errors
+///
+/// Returns an error when the names, address, stable ID, or marker path is
+/// invalid.
+// Keep the durable marker API explicit so every identity component is visible
+// at the call site and compatible with older recovery callers.
+#[allow(clippy::too_many_arguments)]
 pub fn mark_replace_closing_for_target_with_identity_and_stable_id(
     backup_name: &str,
     target_name: Option<&str>,
@@ -647,21 +760,28 @@ pub fn mark_replace_closing_for_target_with_identity_and_stable_id(
 /// Record that a replacement has been prepared but has not started closing
 /// the desktop yet.  A crash in this phase must not roll back user activity
 /// that happened after the safety snapshot was captured.
-pub fn mark_replace_prepared(
-    backup_name: &str,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+///
+/// # Errors
+///
+/// Returns an error when the backup name or marker path is invalid.
+pub fn mark_replace_prepared(backup_name: &str, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     mark_replace_prepared_for_target(backup_name, None, sessions_dir)
 }
 
-pub fn mark_replace_prepared_for_target(
-    backup_name: &str,
-    target_name: Option<&str>,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+/// Record a prepared replacement with an optional target name.
+///
+/// # Errors
+///
+/// Returns an error when a name or the marker path is invalid.
+pub fn mark_replace_prepared_for_target(backup_name: &str, target_name: Option<&str>, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     mark_replace_prepared_for_target_with_digest(backup_name, target_name, None, sessions_dir)
 }
 
+/// Record a prepared replacement and its optional target fingerprint.
+///
+/// # Errors
+///
+/// Returns an error when a name, fingerprint, or marker path is invalid.
 pub fn mark_replace_prepared_for_target_with_digest(
     backup_name: &str,
     target_name: Option<&str>,
@@ -691,21 +811,23 @@ pub fn mark_replace_prepared_for_target_with_digest(
     )
 }
 
-pub fn mark_replace_committed(
-    backup_name: &str,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+/// Mark a replacement as committed without a named target.
+///
+/// # Errors
+///
+/// Returns an error when the backup name or marker path is invalid.
+pub fn mark_replace_committed(backup_name: &str, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     mark_replace_committed_for_target(backup_name, None, sessions_dir)
 }
 
 /// Record that the target desktop is complete and only recovery-marker cleanup
 /// remains.  Startup can safely finalize this phase without replaying the old
 /// safety snapshot.
-pub fn mark_replace_finalizing_for_target(
-    backup_name: &str,
-    target_name: Option<&str>,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+///
+/// # Errors
+///
+/// Returns an error when a name or marker path is invalid.
+pub fn mark_replace_finalizing_for_target(backup_name: &str, target_name: Option<&str>, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
@@ -727,11 +849,12 @@ pub fn mark_replace_finalizing_for_target(
     )
 }
 
-pub fn mark_replace_committed_for_target(
-    backup_name: &str,
-    target_name: Option<&str>,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+/// Mark a named replacement as committed.
+///
+/// # Errors
+///
+/// Returns an error when a name or marker path is invalid.
+pub fn mark_replace_committed_for_target(backup_name: &str, target_name: Option<&str>, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
     if let Some(target_name) = target_name {
         validate_session_name(target_name)?;
@@ -753,9 +876,16 @@ pub fn mark_replace_committed_for_target(
     )
 }
 
-pub fn replace_marker(
-    sessions_dir: &std::path::Path,
-) -> Result<Option<ReplaceMarker>, SessionError> {
+/// Read the durable replacement marker, if one exists.
+///
+/// # Errors
+///
+/// Returns an error when the marker is malformed, unsafe, or unreadable.
+// Marker parsing is a compact compatibility state machine for the historical
+// and current on-disk formats.
+#[allow(clippy::excessive_nesting)]
+#[allow(clippy::too_many_lines)]
+pub fn replace_marker(sessions_dir: &std::path::Path) -> Result<Option<ReplaceMarker>, SessionError> {
     if !existing_sessions_dir(sessions_dir)? {
         return Ok(None);
     }
@@ -769,12 +899,7 @@ pub fn replace_marker(
     ensure_private_file(&path, REPLACE_MARKER_NAME)?;
     let content = read_limited_file(&path, REPLACE_MARKER_NAME)?;
     let text = std::str::from_utf8(&content)
-        .map_err(|error| {
-            SessionError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                error.to_string(),
-            ))
-        })?
+        .map_err(|error| SessionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())))?
         .trim()
         .to_string();
     let lines: Vec<&str> = text.lines().collect();
@@ -796,8 +921,7 @@ pub fn replace_marker(
         )));
     }
     let name = lines.get(name_index).copied().unwrap_or_default();
-    let closing_address = (phase == ReplacePhase::Closing)
-        .then(|| lines.get(2).copied().unwrap_or_default().to_string());
+    let closing_address = (phase == ReplacePhase::Closing).then(|| lines.get(2).copied().unwrap_or_default().to_string());
     let mut next_index = cursor;
     let mut closing_pid = None;
     let mut closing_start_time = None;
@@ -807,10 +931,7 @@ pub fn replace_marker(
         // the optional target name.  Their prefixes keep the old three/four-
         // line marker formats unambiguous and readable during upgrades.
         loop {
-            if let Some(identity) = lines
-                .get(next_index)
-                .filter(|line| line.starts_with("identity:"))
-            {
+            if let Some(identity) = lines.get(next_index).filter(|line| line.starts_with("identity:")) {
                 let value = identity.strip_prefix("identity:").unwrap_or_default();
                 let (pid, start_time) = value.split_once(':').ok_or_else(|| {
                     SessionError::Io(std::io::Error::new(
@@ -837,10 +958,7 @@ pub fn replace_marker(
                 next_index += 1;
                 continue;
             }
-            if let Some(stable) = lines
-                .get(next_index)
-                .filter(|line| line.starts_with("stable:"))
-            {
+            if let Some(stable) = lines.get(next_index).filter(|line| line.starts_with("stable:")) {
                 let value = stable.strip_prefix("stable:").unwrap_or_default();
                 validate_replace_stable_id(value)?;
                 closing_stable_id = Some(value.to_string());
@@ -892,16 +1010,16 @@ pub fn replace_marker(
     }))
 }
 
-pub fn pending_replace_backup(
-    sessions_dir: &std::path::Path,
-) -> Result<Option<String>, SessionError> {
+/// Return the safety snapshot named by a still-pending replacement.
+///
+/// # Errors
+///
+/// Returns an error when the marker cannot be read or validated.
+pub fn pending_replace_backup(sessions_dir: &std::path::Path) -> Result<Option<String>, SessionError> {
     Ok(replace_marker(sessions_dir)?.map(|marker| marker.backup_name))
 }
 
-fn write_replace_marker(
-    marker: &ReplaceMarker,
-    sessions_dir: &std::path::Path,
-) -> Result<(), SessionError> {
+fn write_replace_marker(marker: &ReplaceMarker, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     if let Some(target_name) = &marker.target_name {
         validate_session_name(target_name)?;
     }
@@ -927,11 +1045,7 @@ fn write_replace_marker(
     atomic_write(&sessions_dir.join(REPLACE_MARKER_NAME), content.as_bytes())
 }
 
-fn format_marker_content(
-    phase: &str,
-    marker: &ReplaceMarker,
-    closing_address: Option<&str>,
-) -> String {
+fn format_marker_content(phase: &str, marker: &ReplaceMarker, closing_address: Option<&str>) -> String {
     let mut content = format!("{phase}\n{}", marker.backup_name);
     if let Some(address) = closing_address {
         content.push('\n');
@@ -939,10 +1053,10 @@ fn format_marker_content(
     }
     if let (Some(pid), Some(start_time)) = (marker.closing_pid, marker.closing_start_time) {
         content.push('\n');
-        content.push_str(&format!("identity:{pid}:{start_time}"));
+        let _ = write!(content, "identity:{pid}:{start_time}");
     } else if let Some(pid) = marker.closing_pid {
         content.push('\n');
-        content.push_str(&format!("identity:{pid}:"));
+        let _ = write!(content, "identity:{pid}:");
     }
     if let Some(stable_id) = &marker.closing_stable_id {
         content.push('\n');
@@ -962,10 +1076,7 @@ fn format_marker_content(
 }
 
 fn validate_replace_address(address: &str) -> Result<(), SessionError> {
-    if address.is_empty()
-        || address.len() > MAX_SESSION_STRING_BYTES
-        || address.contains(['\r', '\n'])
-    {
+    if address.is_empty() || address.len() > MAX_SESSION_STRING_BYTES || address.contains(['\r', '\n']) {
         return Err(SessionError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "replacement marker has an invalid window address",
@@ -975,10 +1086,7 @@ fn validate_replace_address(address: &str) -> Result<(), SessionError> {
 }
 
 fn validate_replace_stable_id(stable_id: &str) -> Result<(), SessionError> {
-    if stable_id.is_empty()
-        || stable_id.len() > MAX_SESSION_STRING_BYTES
-        || stable_id.contains(['\r', '\n'])
-    {
+    if stable_id.is_empty() || stable_id.len() > MAX_SESSION_STRING_BYTES || stable_id.contains(['\r', '\n']) {
         return Err(SessionError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "replacement marker has an invalid stable window ID",
@@ -997,20 +1105,22 @@ fn validate_replace_digest(digest: &str) -> Result<(), SessionError> {
     Ok(())
 }
 
-/// Fingerprint the semantic target session stored in a replacement marker.
-/// JSON serialization is deterministic for this struct, so formatting-only
-/// edits do not change the fingerprint while any session field change does.
+/// Compute the deterministic SHA-256 fingerprint of a session.
+///
+/// # Errors
+///
+/// Returns an error when the session cannot be serialized.
 pub fn session_fingerprint(session: &Session) -> Result<String, SessionError> {
     let bytes = serde_json::to_vec(session)?;
     let digest = Sha256::digest(bytes);
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut fingerprint = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(fingerprint, "{byte:02x}");
+    }
+    Ok(fingerprint)
 }
 
-fn existing_target_digest(
-    backup_name: &str,
-    target_name: Option<&str>,
-    sessions_dir: &Path,
-) -> Result<Option<String>, SessionError> {
+fn existing_target_digest(backup_name: &str, target_name: Option<&str>, sessions_dir: &Path) -> Result<Option<String>, SessionError> {
     let Some(marker) = replace_marker(sessions_dir)? else {
         return Ok(None);
     };
@@ -1021,6 +1131,11 @@ fn existing_target_digest(
     }
 }
 
+/// Remove a completed replacement marker from the session directory.
+///
+/// # Errors
+///
+/// Returns an error when the marker path is unsafe or cannot be removed.
 pub fn clear_replace_marker(sessions_dir: &std::path::Path) -> Result<(), SessionError> {
     if !existing_sessions_dir(sessions_dir)? {
         return Ok(());
@@ -1038,9 +1153,14 @@ pub fn clear_replace_marker(sessions_dir: &std::path::Path) -> Result<(), Sessio
     Ok(())
 }
 
-/// Returns autosave sessions only (name starts with `AUTOSAVE_PREFIX`),
-/// sorted by name descending. The timestamp, process ID, and sequence suffix
+/// Returns autosave sessions only (name starts with `AUTOSAVE_PREFIX`).
+///
+/// They are sorted by name descending. The timestamp, process ID, and sequence suffix
 /// make names unique even when multiple captures happen in one second.
+///
+/// # Errors
+///
+/// Returns an error when the session directory cannot be listed safely.
 pub fn list_autosave_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>, SessionError> {
     let mut all = list_sessions(sessions_dir)?;
     all.retain(|s| s.name.starts_with(AUTOSAVE_PREFIX));
@@ -1051,6 +1171,14 @@ pub fn list_autosave_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>
 
 /// Deletes the oldest autosave sessions, keeping only the `retain` newest.
 /// Returns the count of sessions deleted. Non-autosave sessions are untouched.
+///
+/// # Errors
+///
+/// Returns an error when the session directory cannot be inspected or a
+/// selected autosave cannot be deleted safely.
+// Rotation must skip the active recovery backup while tolerating a concurrent
+// idempotent deletion, hence the nested guard and match.
+#[allow(clippy::excessive_nesting)]
 pub fn rotate_autosaves(sessions_dir: &Path, retain: usize) -> Result<usize, SessionError> {
     let retain = retain.min(MAX_AUTOSAVE_RETAIN);
     let pending_backup = pending_replace_backup(sessions_dir)?;
@@ -1080,18 +1208,11 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
             "session path has no parent directory",
         ))
     })?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("session.json");
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("session.json");
 
     for _ in 0..100 {
         let sequence = AUTOSAVE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
+        let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), sequence));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1103,7 +1224,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> Result<(), SessionError> {
             Err(error) => return Err(SessionError::Io(error)),
         };
 
-        let write_result = file.write_all(contents).and_then(|_| file.sync_all());
+        let write_result = file.write_all(contents).and_then(|()| file.sync_all());
         drop(file);
         if let Err(error) = write_result {
             let _ = std::fs::remove_file(&temporary);
@@ -1139,23 +1260,20 @@ fn read_limited_file(path: &Path, label: &str) -> Result<Vec<u8>, SessionError> 
         return Err(SessionError::UnsafePath(label.to_string()));
     }
     #[cfg(unix)]
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o077 != 0 {
+    if metadata.uid() != current_user_id() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(SessionError::UnsafePath(label.to_string()));
     }
     if metadata.len() > MAX_SESSION_FILE_BYTES {
-        return Err(SessionError::TooLarge(format!(
-            "'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes"
-        )));
+        return Err(SessionError::TooLarge(format!("'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes")));
     }
 
-    let mut content = Vec::with_capacity(metadata.len().min(MAX_SESSION_FILE_BYTES) as usize);
+    let capacity = usize::try_from(metadata.len().min(MAX_SESSION_FILE_BYTES)).unwrap_or(usize::MAX);
+    let mut content = Vec::with_capacity(capacity);
     Read::by_ref(&mut file)
         .take(MAX_SESSION_FILE_BYTES.saturating_add(1))
         .read_to_end(&mut content)?;
-    if content.len() as u64 > MAX_SESSION_FILE_BYTES {
-        return Err(SessionError::TooLarge(format!(
-            "'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes"
-        )));
+    if u64::try_from(content.len()).unwrap_or(u64::MAX) > MAX_SESSION_FILE_BYTES {
+        return Err(SessionError::TooLarge(format!("'{label}' is larger than {MAX_SESSION_FILE_BYTES} bytes")));
     }
     Ok(content)
 }
@@ -1165,9 +1283,12 @@ fn ensure_private_directory(path: &Path) -> Result<(), SessionError> {
 }
 
 fn ensure_private_file(path: &Path, label: &str) -> Result<(), SessionError> {
-    ensure_private_path(path, false).map_err(|error| match error {
-        SessionError::UnsafePath(_) => SessionError::UnsafePath(label.to_string()),
-        other => other,
+    ensure_private_path(path, false).map_err(|error| {
+        if matches!(&error, SessionError::UnsafePath(_)) {
+            SessionError::UnsafePath(label.to_string())
+        } else {
+            error
+        }
     })
 }
 
@@ -1175,7 +1296,7 @@ fn ensure_private_path(path: &Path, directory: bool) -> Result<(), SessionError>
     #[cfg(unix)]
     {
         let metadata = std::fs::symlink_metadata(path)?;
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        if metadata.uid() != current_user_id() {
             return Err(SessionError::UnsafePath(path.display().to_string()));
         }
         let expected_mode = if directory { 0o700 } else { 0o600 };
@@ -1185,9 +1306,7 @@ fn ensure_private_path(path: &Path, directory: bool) -> Result<(), SessionError>
             std::fs::set_permissions(path, permissions)?;
         }
         let verified = std::fs::symlink_metadata(path)?;
-        if verified.uid() != unsafe { libc::geteuid() }
-            || verified.permissions().mode() & 0o077 != 0
-        {
+        if verified.uid() != current_user_id() || verified.permissions().mode() & 0o077 != 0 {
             return Err(SessionError::UnsafePath(path.display().to_string()));
         }
     }
@@ -1200,19 +1319,13 @@ fn validate_session_structure(session: &Session) -> Result<(), SessionError> {
     validate_session_name(&session.name)?;
     validate_text("session version", &session.hyprland_version)?;
     if session.monitors.len() > MAX_SESSION_MONITORS {
-        return Err(SessionError::TooLarge(format!(
-            "more than {MAX_SESSION_MONITORS} monitors"
-        )));
+        return Err(SessionError::TooLarge(format!("more than {MAX_SESSION_MONITORS} monitors")));
     }
     if session.clients.len() > MAX_SESSION_CLIENTS {
-        return Err(SessionError::TooLarge(format!(
-            "more than {MAX_SESSION_CLIENTS} clients"
-        )));
+        return Err(SessionError::TooLarge(format!("more than {MAX_SESSION_CLIENTS} clients")));
     }
     if session.brave_profiles.len() > MAX_SESSION_BRAVE_PROFILES {
-        return Err(SessionError::TooLarge(format!(
-            "more than {MAX_SESSION_BRAVE_PROFILES} browser profiles"
-        )));
+        return Err(SessionError::TooLarge(format!("more than {MAX_SESSION_BRAVE_PROFILES} browser profiles")));
     }
 
     for monitor in &session.monitors {
@@ -1243,9 +1356,7 @@ fn validate_session_structure(session: &Session) -> Result<(), SessionError> {
             validate_text("launch hint", hint)?;
         }
         if client.launch.args.len() > MAX_SESSION_ARGS {
-            return Err(SessionError::TooLarge(format!(
-                "more than {MAX_SESSION_ARGS} launch arguments"
-            )));
+            return Err(SessionError::TooLarge(format!("more than {MAX_SESSION_ARGS} launch arguments")));
         }
         for argument in &client.launch.args {
             validate_text("launch argument", argument)?;
@@ -1260,9 +1371,7 @@ fn validate_session_structure(session: &Session) -> Result<(), SessionError> {
 
 fn validate_text(label: &str, value: &str) -> Result<(), SessionError> {
     if value.len() > MAX_SESSION_STRING_BYTES {
-        return Err(SessionError::TooLarge(format!(
-            "{label} is longer than {MAX_SESSION_STRING_BYTES} bytes"
-        )));
+        return Err(SessionError::TooLarge(format!("{label} is longer than {MAX_SESSION_STRING_BYTES} bytes")));
     }
     Ok(())
 }
@@ -1271,6 +1380,11 @@ fn validate_text(label: &str, value: &str) -> Result<(), SessionError> {
 ///
 /// Supported suffixes: `m` (minutes), `h` (hours), `d` (days).
 /// Examples: `"30m"`, `"24h"`, `"7d"`.
+/// Parse a duration such as `30m`, `24h`, or `7d`.
+///
+/// # Errors
+///
+/// Returns an error when the value has no supported suffix or overflows.
 pub fn parse_max_age(s: &str) -> Result<chrono::Duration, String> {
     let Some((unit_index, unit)) = s.char_indices().next_back() else {
         return Err(format!("invalid duration: '{s}'"));
@@ -1279,9 +1393,7 @@ pub fn parse_max_age(s: &str) -> Result<chrono::Duration, String> {
         return Err(format!("invalid duration: '{s}'"));
     }
     let num_str = &s[..unit_index];
-    let num: i64 = num_str
-        .parse()
-        .map_err(|_| format!("invalid duration: '{s}'"))?;
+    let num: i64 = num_str.parse().map_err(|_| format!("invalid duration: '{s}'"))?;
     if num <= 0 {
         return Err(format!("duration must be greater than zero: '{s}'"));
     }
@@ -1289,55 +1401,77 @@ pub fn parse_max_age(s: &str) -> Result<chrono::Duration, String> {
         'm' => chrono::Duration::try_minutes(num),
         'h' => chrono::Duration::try_hours(num),
         'd' => chrono::Duration::try_days(num),
-        _ => {
-            return Err(format!(
-                "invalid duration unit '{unit}' in '{s}'. Use m, h, or d."
-            ))
-        }
+        _ => return Err(format!("invalid duration unit '{unit}' in '{s}'. Use m, h, or d.")),
     };
     duration.ok_or_else(|| format!("duration is out of range: '{s}'"))
 }
 
 // === Raw hyprctl JSON structs (what hyprctl returns) ===
 
+/// Raw Hyprland client JSON returned by `hyprctl clients -j`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyprClient {
+    /// Hyprland window address.
     pub address: String,
+    /// Runtime window class.
     pub class: String,
+    /// Current window title.
     pub title: String,
+    /// Stable window identifier, when provided by Hyprland.
     #[serde(default, rename = "stableId")]
     pub stable_id: Option<String>,
+    /// Class assigned when the window was created.
     #[serde(default, rename = "initialClass")]
     pub initial_class: String,
+    /// Title assigned when the window was created.
     #[serde(default, rename = "initialTitle")]
     pub initial_title: String,
+    /// Current workspace.
     pub workspace: HyprWorkspace,
+    /// Numeric monitor identifier.
     pub monitor: i32,
+    /// Top-left position in global compositor coordinates.
     pub at: [i32; 2],
+    /// Window size in pixels.
     pub size: [i32; 2],
+    /// Whether the window is floating.
     pub floating: bool,
+    /// Hyprland fullscreen state.
     pub fullscreen: u8,
+    /// Whether the window is pinned.
     #[serde(default)]
     pub pinned: bool,
+    /// Focus-history sequence.
     #[serde(rename = "focusHistoryID")]
     pub focus_history_id: i32,
+    /// Owning process ID.
     pub pid: u32,
 }
 
+/// Workspace data embedded in raw Hyprland client JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyprWorkspace {
+    /// Numeric workspace identifier.
     pub id: i32,
+    /// Workspace name.
     pub name: String,
 }
 
+/// Raw Hyprland monitor JSON returned by `hyprctl monitors -j`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HyprMonitor {
+    /// Monitor connector name.
     pub name: String,
+    /// Monitor width in pixels.
     pub width: u32,
+    /// Monitor height in pixels.
     pub height: u32,
+    /// Hyprland transform value.
     pub transform: u32,
+    /// Global X origin, when reported.
     #[serde(default)]
     pub x: Option<i32>,
+    /// Global Y origin, when reported.
     #[serde(default)]
     pub y: Option<i32>,
 }
@@ -1351,9 +1485,7 @@ mod tests {
     fn test_session_roundtrip() {
         let session = Session {
             name: "work".to_string(),
-            created_at: DateTime::parse_from_rfc3339("2026-03-08T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: DateTime::parse_from_rfc3339("2026-03-08T10:00:00Z").unwrap().with_timezone(&Utc),
             hyprland_version: "0.47.0".to_string(),
             monitors: vec![Monitor {
                 name: "DP-4".to_string(),
@@ -1462,9 +1594,7 @@ mod tests {
     fn test_session_roundtrip_with_brave_profiles() {
         let session = Session {
             name: "brave-test".to_string(),
-            created_at: DateTime::parse_from_rfc3339("2026-03-08T10:00:00Z")
-                .unwrap()
-                .with_timezone(&Utc),
+            created_at: DateTime::parse_from_rfc3339("2026-03-08T10:00:00Z").unwrap().with_timezone(&Utc),
             hyprland_version: "0.54.1".to_string(),
             monitors: vec![],
             clients: vec![],
@@ -1565,8 +1695,7 @@ mod tests {
             }]
         }"#;
 
-        let session: Session =
-            serde_json::from_str(json).expect("null compatibility fields must load");
+        let session: Session = serde_json::from_str(json).expect("null compatibility fields must load");
         let client = &session.clients[0];
         assert_eq!(client.initial_class, "");
         assert_eq!(client.initial_title, "");
@@ -1593,19 +1722,13 @@ mod tests {
         let current = tempfile::tempdir().unwrap();
         save_session(&make_test_session("work"), legacy.path()).unwrap();
 
-        assert_eq!(
-            migrate_legacy_sessions(current.path(), legacy.path()).unwrap(),
-            1
-        );
+        assert_eq!(migrate_legacy_sessions(current.path(), legacy.path()).unwrap(), 1);
         assert_eq!(load_session("work", current.path()).unwrap().name, "work");
 
         // Existing fork data is never overwritten, and a second pass copies nothing.
         let existing = make_test_session("work");
         save_session(&existing, current.path()).unwrap();
-        assert_eq!(
-            migrate_legacy_sessions(current.path(), legacy.path()).unwrap(),
-            0
-        );
+        assert_eq!(migrate_legacy_sessions(current.path(), legacy.path()).unwrap(), 0);
         assert_eq!(load_session("work", current.path()).unwrap().name, "work");
     }
 
@@ -1618,19 +1741,14 @@ mod tests {
         ensure_private_file(&malformed, "malformed").unwrap();
 
         let oversized = legacy.path().join("oversized.json");
-        std::fs::write(&oversized, vec![b'x'; MAX_SESSION_FILE_BYTES as usize + 1]).unwrap();
+        let oversized_len = usize::try_from(MAX_SESSION_FILE_BYTES).unwrap_or(usize::MAX).saturating_add(1);
+        std::fs::write(&oversized, vec![b'x'; oversized_len]).unwrap();
         ensure_private_file(&oversized, "oversized").unwrap();
 
         save_session(&make_test_session("healthy"), legacy.path()).unwrap();
 
-        assert_eq!(
-            migrate_legacy_sessions(current.path(), legacy.path()).unwrap(),
-            1
-        );
-        assert_eq!(
-            load_session("healthy", current.path()).unwrap().name,
-            "healthy"
-        );
+        assert_eq!(migrate_legacy_sessions(current.path(), legacy.path()).unwrap(), 1);
+        assert_eq!(load_session("healthy", current.path()).unwrap().name, "healthy");
         assert!(!current.path().join("malformed.json").exists());
         assert!(!current.path().join("oversized.json").exists());
     }
@@ -1703,6 +1821,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_replace_recovery_marker_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         mark_replace_prepared("autosave-recovery", dir.path()).unwrap();
@@ -1734,10 +1853,7 @@ mod tests {
             })
         );
         mark_replace_in_progress("autosave-recovery", dir.path()).unwrap();
-        assert_eq!(
-            pending_replace_backup(dir.path()).unwrap().as_deref(),
-            Some("autosave-recovery")
-        );
+        assert_eq!(pending_replace_backup(dir.path()).unwrap().as_deref(), Some("autosave-recovery"));
         assert_eq!(
             replace_marker(dir.path()).unwrap(),
             Some(ReplaceMarker {
@@ -1765,8 +1881,7 @@ mod tests {
                 target_digest: None,
             })
         );
-        mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path())
-            .unwrap();
+        mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path()).unwrap();
         assert_eq!(
             replace_marker(dir.path()).unwrap(),
             Some(ReplaceMarker {
@@ -1804,51 +1919,26 @@ mod tests {
         let target = make_test_session("target");
         let digest = session_fingerprint(&target).unwrap();
 
-        mark_replace_prepared_for_target_with_digest(
-            "autosave-recovery",
-            Some("target"),
-            Some(&digest),
-            dir.path(),
-        )
-        .unwrap();
+        mark_replace_prepared_for_target_with_digest("autosave-recovery", Some("target"), Some(&digest), dir.path()).unwrap();
         assert_eq!(
-            replace_marker(dir.path())
-                .unwrap()
-                .and_then(|marker| marker.target_digest),
+            replace_marker(dir.path()).unwrap().and_then(|marker| marker.target_digest),
             Some(digest.clone())
         );
 
-        mark_replace_in_progress_for_target("autosave-recovery", Some("target"), dir.path())
-            .unwrap();
+        mark_replace_in_progress_for_target("autosave-recovery", Some("target"), dir.path()).unwrap();
         assert_eq!(
-            replace_marker(dir.path())
-                .unwrap()
-                .and_then(|marker| marker.target_digest),
+            replace_marker(dir.path()).unwrap().and_then(|marker| marker.target_digest),
             Some(digest.clone())
         );
 
-        mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path())
-            .unwrap();
-        assert_eq!(
-            replace_marker(dir.path())
-                .unwrap()
-                .and_then(|marker| marker.target_digest),
-            Some(digest)
-        );
+        mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path()).unwrap();
+        assert_eq!(replace_marker(dir.path()).unwrap().and_then(|marker| marker.target_digest), Some(digest));
     }
 
     #[test]
     fn test_replace_closing_marker_preserves_process_identity() {
         let dir = tempfile::tempdir().unwrap();
-        mark_replace_closing_for_target_with_identity(
-            "autosave-recovery",
-            Some("target"),
-            dir.path(),
-            "0xclosing",
-            1234,
-            Some(5678),
-        )
-        .unwrap();
+        mark_replace_closing_for_target_with_identity("autosave-recovery", Some("target"), dir.path(), "0xclosing", 1234, Some(5678)).unwrap();
 
         assert_eq!(
             replace_marker(dir.path()).unwrap(),
@@ -1906,10 +1996,7 @@ mod tests {
         let sessions = list_sessions(dir.path()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].name, "target");
-        assert!(matches!(
-            load_session("autosave-old", dir.path()),
-            Err(SessionError::NameMismatch { .. })
-        ));
+        assert!(matches!(load_session("autosave-old", dir.path()), Err(SessionError::NameMismatch { .. })));
     }
 
     #[test]
@@ -1925,10 +2012,7 @@ mod tests {
             })
             .collect();
 
-        assert!(matches!(
-            save_session(&session, dir.path()),
-            Err(SessionError::TooLarge(_))
-        ));
+        assert!(matches!(save_session(&session, dir.path()), Err(SessionError::TooLarge(_))));
         assert!(!dir.path().join("large.json").exists());
     }
 
@@ -2047,10 +2131,7 @@ mod tests {
 
         assert_eq!(std::fs::read(outside.path()).unwrap(), original);
         assert_eq!(load_session("work", dir.path()).unwrap().name, "work");
-        assert!(!std::fs::symlink_metadata(dir.path().join("work.json"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(!std::fs::symlink_metadata(dir.path().join("work.json")).unwrap().file_type().is_symlink());
     }
 
     #[cfg(unix)]
@@ -2063,8 +2144,7 @@ mod tests {
         let sessions_dir = root.path().join("sessions");
         symlink(outside.path(), &sessions_dir).unwrap();
 
-        let error = save_session(&make_test_session("work"), &sessions_dir)
-            .expect_err("symlinked sessions directory must be rejected");
+        let error = save_session(&make_test_session("work"), &sessions_dir).expect_err("symlinked sessions directory must be rejected");
         assert!(matches!(error, SessionError::UnsafePath(_)));
         assert!(!outside.path().join("work.json").exists());
     }
@@ -2079,16 +2159,9 @@ mod tests {
 
         save_session(&make_test_session("work"), dir.path()).unwrap();
 
+        assert_eq!(std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777, 0o700);
         assert_eq!(
-            std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            std::fs::metadata(dir.path().join("work.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            std::fs::metadata(dir.path().join("work.json")).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
@@ -2097,7 +2170,8 @@ mod tests {
     fn test_oversized_session_file_is_rejected_before_parsing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("work.json");
-        std::fs::write(&path, vec![b' '; MAX_SESSION_FILE_BYTES as usize + 1]).unwrap();
+        let oversized_len = usize::try_from(MAX_SESSION_FILE_BYTES).unwrap_or(usize::MAX).saturating_add(1);
+        std::fs::write(&path, vec![b' '; oversized_len]).unwrap();
 
         let error = load_session("work", dir.path()).expect_err("oversized session must fail");
         assert!(matches!(error, SessionError::TooLarge(_)));
@@ -2108,8 +2182,7 @@ mod tests {
         let mut session = make_test_session("work");
         session.clients = vec![session.clients[0].clone(); MAX_SESSION_CLIENTS + 1];
 
-        let error = save_session(&session, tempfile::tempdir().unwrap().path())
-            .expect_err("too many clients must fail");
+        let error = save_session(&session, tempfile::tempdir().unwrap().path()).expect_err("too many clients must fail");
         assert!(matches!(error, SessionError::TooLarge(_)));
     }
 

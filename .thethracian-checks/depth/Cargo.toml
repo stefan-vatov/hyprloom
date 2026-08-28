@@ -1,0 +1,11 @@
+[package]
+name = "thethracian-max-directory-depth"
+version = "0.1.0"
+edition = "2021"
+description = "Dylint lint enforcing maximum directory depth in Rust projects"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dylint_linting = "5"

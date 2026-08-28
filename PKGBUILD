@@ -1,10 +1,10 @@
-# Maintainer: Thethracian
+# Maintainer: Stefan Vatov
 pkgname=hyprloom
 pkgver=0.3.9
 pkgrel=1
 pkgdesc="Save, restore, and reconcile Hyprland window sessions"
 arch=('x86_64')
-url="https://github.com/thethracian/hyprloom"
+url="https://github.com/stefan-vatov/hyprloom"
 license=('MIT')
 depends=('hyprland')
 makedepends=('cargo')

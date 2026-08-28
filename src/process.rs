@@ -1,39 +1,67 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 
+/// Errors returned while inspecting a process or its descendants.
 #[derive(Debug, thiserror::Error)]
 pub enum ProcessError {
     #[error("process {0} not found")]
+    /// The requested process no longer exists or is not visible.
     NotFound(u32),
     #[error("IO error: {0}")]
+    /// Process metadata could not be read.
     IoError(#[from] std::io::Error),
 }
 
+/// Process metadata used to identify terminal shells and browser instances.
 #[derive(Debug, Clone)]
 pub struct ChildProcess {
+    /// Process ID.
     pub pid: u32,
+    /// Current working directory, when available.
     pub cwd: PathBuf,
+    /// Space-separated process command line.
     pub cmdline: String,
 }
 
 /// The profile flags found while walking a Chromium process tree, together
 /// with whether every process lookup needed for that conclusion succeeded.
+///
 /// An empty profile list is only evidence of the normal `Default` profile when
 /// the walk completed; an incomplete walk could simply have missed a flag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProfileDiscovery {
+    /// Distinct browser profile directories found in the process tree.
     pub profiles: Vec<String>,
+    /// Whether every process lookup needed for the result succeeded.
     pub complete: bool,
 }
 
+/// Provider for process metadata used during capture and restore.
 pub trait ProcessInfoProvider {
+    /// Return the current working directory for `pid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process cannot be inspected.
     fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError>;
+    /// Return direct child processes for `pid`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the process tree cannot be inspected.
     fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError>;
 
     /// Return all descendants in deterministic PID order.  Process trees can
     /// contain wrappers, multiplexers, and helper processes between a
     /// terminal and its interactive shell, so callers should not assume that
     /// the shell is an immediate child.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when one of the process-tree reads fails.
+    // Breadth-first traversal deliberately keeps queue, visited, and output
+    // updates in one place so process identity cannot be recorded twice.
+    #[allow(clippy::excessive_nesting)]
     fn get_descendants(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
         let mut descendants = Vec::new();
         let mut queue = VecDeque::from([pid]);
@@ -42,11 +70,9 @@ pub trait ProcessInfoProvider {
         while let Some(parent_pid) = queue.pop_front() {
             let mut children = self.get_children(parent_pid)?;
             children.sort_by_key(|child| child.pid);
-            for child in children {
-                if visited.insert(child.pid) {
-                    queue.push_back(child.pid);
-                    descendants.push(child);
-                }
+            for child in children.into_iter().filter(|child| visited.insert(child.pid)) {
+                queue.push_back(child.pid);
+                descendants.push(child);
             }
         }
 
@@ -56,12 +82,20 @@ pub trait ProcessInfoProvider {
 
     /// Return the complete process command line when the provider can see it.
     /// Test doubles that only model child processes may keep the default.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the command line is unavailable.
     fn get_cmdline(&self, pid: u32) -> Result<String, ProcessError> {
         Err(ProcessError::NotFound(pid))
     }
 
     /// Return the kernel process-start timestamp when the provider can read
     /// one.  The default keeps lightweight test doubles compatible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the timestamp is unavailable.
     fn get_start_time(&self, pid: u32) -> Result<u64, ProcessError> {
         Err(ProcessError::NotFound(pid))
     }
@@ -77,6 +111,9 @@ pub trait ProcessInfoProvider {
     /// Return whether `candidate_pid` is the root process or one of its
     /// descendants.  This is used to correlate a newly launched process with
     /// the window it eventually creates.
+    // This is the same bounded process-tree walk as `get_descendants`, with an
+    // early match; keeping the traversal explicit avoids recursive stack use.
+    #[allow(clippy::excessive_nesting)]
     fn is_process_related(&self, root_pid: u32, candidate_pid: u32) -> bool {
         if root_pid == candidate_pid {
             return true;
@@ -89,19 +126,19 @@ pub trait ProcessInfoProvider {
                 continue;
             };
             children.sort_by_key(|child| child.pid);
-            for child in children {
-                if child.pid == candidate_pid {
-                    return true;
-                }
-                if visited.insert(child.pid) {
-                    queue.push_back(child.pid);
-                }
+            if children.iter().any(|child| child.pid == candidate_pid) {
+                return true;
+            }
+            for child in children.into_iter().filter(|child| visited.insert(child.pid)) {
+                queue.push_back(child.pid);
             }
         }
         false
     }
 }
 
+/// Reads process metadata from Linux `/proc` entries.
+#[derive(Debug)]
 pub struct RealProcessInfo;
 
 impl ProcessInfoProvider for RealProcessInfo {
@@ -109,6 +146,9 @@ impl ProcessInfoProvider for RealProcessInfo {
         std::fs::read_link(format!("/proc/{pid}/cwd")).map_err(|_| ProcessError::NotFound(pid))
     }
 
+    // `/proc/<pid>/task` can change while it is read, so the loop records
+    // completeness and aggregates thread results in one defensive pass.
+    #[allow(clippy::excessive_nesting)]
     fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
         let mut children_by_pid = std::collections::BTreeMap::new();
         let tasks_dir = format!("/proc/{pid}/task");
@@ -116,43 +156,15 @@ impl ProcessInfoProvider for RealProcessInfo {
         let mut complete = true;
 
         for task in tasks {
-            let task = match task {
-                Ok(task) => task,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
+            let Ok(task) = task else {
+                complete = false;
+                continue;
             };
-            let children_file = task.path().join("children");
-            let content = match std::fs::read_to_string(&children_file) {
-                Ok(content) => content,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
+            let Ok(children) = read_task_children(self, &task) else {
+                complete = false;
+                continue;
             };
-            for child_pid_str in content.split_whitespace() {
-                let child_pid = match child_pid_str.parse::<u32>() {
-                    Ok(child_pid) => child_pid,
-                    Err(_) => {
-                        complete = false;
-                        continue;
-                    }
-                };
-                let cwd = self.get_cwd(child_pid).unwrap_or_default();
-                let cmdline = read_cmdline(child_pid);
-                if cmdline.is_empty() {
-                    complete = false;
-                }
-                children_by_pid.insert(
-                    child_pid,
-                    ChildProcess {
-                        pid: child_pid,
-                        cwd,
-                        cmdline,
-                    },
-                );
-            }
+            children_by_pid.extend(children.into_iter().map(|child| (child.pid, child)));
         }
         if !complete {
             return Err(ProcessError::IoError(std::io::Error::new(
@@ -181,6 +193,29 @@ impl ProcessInfoProvider for RealProcessInfo {
     }
 }
 
+fn read_task_children(process_info: &RealProcessInfo, task: &std::fs::DirEntry) -> Result<Vec<ChildProcess>, ()> {
+    let content = std::fs::read_to_string(task.path().join("children")).map_err(|_| ())?;
+    let child_pids = content
+        .split_whitespace()
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ())?;
+    child_pids
+        .into_iter()
+        .map(|pid| {
+            let cmdline = read_cmdline(pid);
+            if cmdline.is_empty() {
+                return Err(());
+            }
+            Ok(ChildProcess {
+                pid,
+                cwd: process_info.get_cwd(pid).unwrap_or_default(),
+                cmdline,
+            })
+        })
+        .collect()
+}
+
 fn read_cmdline(pid: u32) -> String {
     std::fs::read(format!("/proc/{pid}/cmdline"))
         .ok()
@@ -196,8 +231,7 @@ fn read_cmdline(pid: u32) -> String {
 }
 
 fn read_process_start_time(pid: u32) -> Result<u64, ProcessError> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|_| ProcessError::NotFound(pid))?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| ProcessError::NotFound(pid))?;
     let (_, fields) = stat.rsplit_once(')').ok_or(ProcessError::NotFound(pid))?;
     fields
         .split_whitespace()
@@ -209,15 +243,14 @@ fn read_process_start_time(pid: u32) -> Result<u64, ProcessError> {
 /// Whether a process command line represents an interactive shell itself,
 /// rather than a shell running a command.  This intentionally accepts paths
 /// such as `/usr/bin/zsh` and rejects `zsh -c ...`.
+#[must_use]
 pub fn is_plain_shell(cmdline: &str) -> bool {
     let mut parts = cmdline.split_whitespace();
     let Some(command) = parts.next() else {
         return false;
     };
     if !matches!(
-        Path::new(command)
-            .file_name()
-            .and_then(|name| name.to_str()),
+        Path::new(command).file_name().and_then(|name| name.to_str()),
         Some("zsh" | "bash" | "fish" | "sh")
     ) {
         return false;
@@ -231,9 +264,7 @@ pub fn is_plain_shell(cmdline: &str) -> bool {
         if argument == "--" || argument == "-c" || argument == "--command" {
             return false;
         }
-        if argument.starts_with("--command=")
-            || (argument.starts_with('-') && argument.len() > 1 && argument[1..].contains('c'))
-        {
+        if argument.starts_with("--command=") || (argument.starts_with('-') && argument.len() > 1 && argument[1..].contains('c')) {
             return false;
         }
         if argument.starts_with('-') || argument.starts_with('+') {
@@ -253,6 +284,9 @@ fn is_terminal_wrapper(cmdline: &str) -> bool {
     )
 }
 
+#[must_use]
+/// Return whether `cmdline` names an internal helper process rather than an
+/// interactive application.
 pub fn is_helper_process(cmdline: &str) -> bool {
     matches!(
         Path::new(cmdline.split_whitespace().next().unwrap_or(""))
@@ -265,6 +299,7 @@ pub fn is_helper_process(cmdline: &str) -> bool {
 /// Pick a likely terminal shell deterministically.  A plain shell is
 /// preferred over application commands, and terminal multiplexers are kept
 /// as a last resort; PID is the stable tie-breaker.
+#[must_use]
 pub fn select_terminal_child(children: &[ChildProcess]) -> Option<&ChildProcess> {
     children
         .iter()
@@ -284,12 +319,10 @@ pub fn select_terminal_child(children: &[ChildProcess]) -> Option<&ChildProcess>
 }
 
 /// Select a likely interactive shell from the complete terminal process tree.
+///
 /// This returns an owned value because the provider's descendant list is
 /// temporary and may have been assembled from several `/proc` reads.
-pub fn select_terminal_process(
-    process_info: &dyn ProcessInfoProvider,
-    terminal_pid: u32,
-) -> Option<ChildProcess> {
+pub fn select_terminal_process(process_info: &dyn ProcessInfoProvider, terminal_pid: u32) -> Option<ChildProcess> {
     let descendants = process_info.get_descendants(terminal_pid).ok()?;
     let shell_count = descendants
         .iter()
@@ -307,6 +340,8 @@ pub fn select_terminal_process(
     select_terminal_child(&descendants).cloned()
 }
 
+#[must_use]
+/// Extract a Chromium `--profile-directory` value from a command line.
 pub fn profile_directory_from_cmdline(cmdline: &str) -> Option<String> {
     let marker = "--profile-directory=";
     let start = cmdline.find(marker)? + marker.len();
@@ -319,52 +354,41 @@ pub fn profile_directory_from_cmdline(cmdline: &str) -> Option<String> {
 }
 
 /// Search a process and its descendants for all application profile flags.
+///
 /// Chromium puts the profile flag on either the browser process or a helper,
 /// depending on how an existing browser process was reused.  Returning the
 /// complete set lets capture preserve the active profile inventory even when
 /// one shared process cannot identify a particular top-level window.
-pub fn find_profile_directories(
-    process_info: &dyn ProcessInfoProvider,
-    root_pid: u32,
-) -> Vec<String> {
+pub fn find_profile_directories(process_info: &dyn ProcessInfoProvider, root_pid: u32) -> Vec<String> {
     find_profile_discovery(process_info, root_pid).profiles
 }
 
 /// Search a process and its descendants for profile flags without losing
 /// whether process metadata was unavailable during the walk.
-pub fn find_profile_discovery(
-    process_info: &dyn ProcessInfoProvider,
-    root_pid: u32,
-) -> ProfileDiscovery {
+// Profile discovery combines process-tree traversal with completeness
+// tracking; the branches are the observable states of that walk.
+#[allow(clippy::excessive_nesting)]
+pub fn find_profile_discovery(process_info: &dyn ProcessInfoProvider, root_pid: u32) -> ProfileDiscovery {
     let mut queue = VecDeque::from([(root_pid, None::<String>)]);
     let mut visited = HashSet::from([root_pid]);
     let mut profiles = HashMap::<String, String>::new();
     let mut complete = true;
     while let Some((pid, known_cmdline)) = queue.pop_front() {
-        let cmdline = match known_cmdline {
-            Some(cmdline) => cmdline,
-            None => match process_info.get_cmdline(pid) {
-                Ok(cmdline) => cmdline,
-                Err(_) => {
-                    complete = false;
-                    String::new()
-                }
-            },
-        };
+        let cmdline = known_cmdline.unwrap_or_else(|| {
+            process_info.get_cmdline(pid).unwrap_or_else(|_| {
+                complete = false;
+                String::new()
+            })
+        });
         if cmdline.is_empty() {
             complete = false;
         } else if let Some(profile) = profile_directory_from_cmdline(&cmdline) {
-            profiles
-                .entry(profile.to_ascii_lowercase())
-                .or_insert(profile);
+            profiles.entry(profile.to_ascii_lowercase()).or_insert(profile);
         }
 
-        let mut children = match process_info.get_children(pid) {
-            Ok(children) => children,
-            Err(_) => {
-                complete = false;
-                continue;
-            }
+        let Ok(mut children) = process_info.get_children(pid) else {
+            complete = false;
+            continue;
         };
         children.sort_by_key(|child| child.pid);
         for child in children {
@@ -383,12 +407,12 @@ pub fn find_profile_discovery(
 
 /// Return a single profile only when the process tree provides an
 /// unambiguous identity for it.
-pub fn find_profile_directory(
-    process_info: &dyn ProcessInfoProvider,
-    root_pid: u32,
-) -> Option<String> {
+pub fn find_profile_directory(process_info: &dyn ProcessInfoProvider, root_pid: u32) -> Option<String> {
     let mut profiles = find_profile_directories(process_info, root_pid);
-    (profiles.len() == 1).then(|| profiles.pop().expect("one profile"))
+    if profiles.len() != 1 {
+        return None;
+    }
+    profiles.pop()
 }
 
 #[cfg(test)]
@@ -403,10 +427,7 @@ mod tests {
 
     impl ProcessInfoProvider for MockProcessInfo {
         fn get_cwd(&self, pid: u32) -> Result<PathBuf, ProcessError> {
-            self.cwds
-                .get(&pid)
-                .cloned()
-                .ok_or(ProcessError::NotFound(pid))
+            self.cwds.get(&pid).cloned().ok_or(ProcessError::NotFound(pid))
         }
 
         fn get_children(&self, pid: u32) -> Result<Vec<ChildProcess>, ProcessError> {
@@ -443,9 +464,7 @@ mod tests {
         assert_eq!(parent_cwd, PathBuf::from("/home/user"));
 
         // Verify get_children returns correct child data
-        let result = mock
-            .get_children(parent_pid)
-            .expect("should return children");
+        let result = mock.get_children(parent_pid).expect("should return children");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].pid, child_pid);
         assert_eq!(result[0].cwd, child_cwd);
@@ -464,7 +483,7 @@ mod tests {
 
         match result.unwrap_err() {
             ProcessError::NotFound(pid) => assert_eq!(pid, 99999),
-            other => panic!("expected NotFound, got {other}"),
+            ProcessError::IoError(error) => panic!("expected NotFound, got IO error {error}"),
         }
     }
 

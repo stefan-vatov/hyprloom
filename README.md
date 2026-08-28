@@ -123,6 +123,10 @@ keeps a safety autosnapshot named with the `autosave-` prefix.
 Replace closes every current Hyprland client, including clients excluded by
 the capture filters; use reconciliation when extras should remain untouched.
 
+The default matcher uses a global one-to-one assignment so the best overall
+set of windows is retained. For a simple highest-score-first pass, use
+`restore --reconcile --greedy`.
+
 Omarchy web apps are restored from their identity-bearing `chrome-*` window
 class and matching desktop entry. If Chromium reports a window only as the
 generic `chromium` class, Hyprland does not expose that window's URL; Hyprloom

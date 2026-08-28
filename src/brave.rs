@@ -1,17 +1,22 @@
 use crate::session::BraveProfile;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::path::PathBuf;
 
+/// Errors returned while reading Brave's profile inventory.
 #[derive(Debug, thiserror::Error)]
 pub enum BraveError {
     #[error("IO error: {0}")]
+    /// The Local State file could not be read.
     Io(#[from] std::io::Error),
     #[error("JSON parse error: {0}")]
+    /// The Local State file was not valid JSON.
     Json(#[from] serde_json::Error),
 }
 
 /// Default path to Brave's Local State file on Linux.
+#[must_use]
 pub fn local_state_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
@@ -19,6 +24,11 @@ pub fn local_state_path() -> PathBuf {
 }
 
 /// Read and parse profiles from the Local State file.
+///
+/// # Errors
+///
+/// Returns an error when the Local State file exists but cannot be read or
+/// parsed as JSON.
 pub fn read_profiles() -> Result<Vec<BraveProfile>, BraveError> {
     let path = local_state_path();
     if !path.exists() {
@@ -29,9 +39,11 @@ pub fn read_profiles() -> Result<Vec<BraveProfile>, BraveError> {
 }
 
 /// Parse profile info from Local State JSON content.
-pub fn parse_profiles_from_local_state(
-    json_str: &str,
-) -> Result<Vec<BraveProfile>, serde_json::Error> {
+///
+/// # Errors
+///
+/// Returns the JSON parser error when `json_str` is malformed.
+pub fn parse_profiles_from_local_state(json_str: &str) -> Result<Vec<BraveProfile>, serde_json::Error> {
     let value: Value = serde_json::from_str(json_str)?;
     let profiles = value
         .get("profile")
@@ -56,31 +68,29 @@ pub fn parse_profiles_from_local_state(
 }
 
 /// Filter profiles to only include those with a workspace mapping.
+///
 /// When `profile_workspaces` is `None`, the inventory is returned unchanged;
 /// callers that do not have an explicit mapping should apply
 /// [`filter_profiles_by_active_directories`] instead of restoring every
 /// profile listed in Local State.
-pub fn filter_profiles_by_config(
+#[must_use]
+pub fn filter_profiles_by_config<S: BuildHasher>(
     profiles: Vec<BraveProfile>,
-    profile_workspaces: Option<&HashMap<String, i32>>,
+    profile_workspaces: Option<&HashMap<String, i32, S>>,
 ) -> Vec<BraveProfile> {
     match profile_workspaces {
-        Some(mappings) => profiles
-            .into_iter()
-            .filter(|p| mappings.contains_key(&p.directory))
-            .collect(),
+        Some(mappings) => profiles.into_iter().filter(|p| mappings.contains_key(&p.directory)).collect(),
         None => profiles,
     }
 }
 
 /// Keep only profiles that were positively observed in the current session.
+///
 /// Local State contains profiles that may never have an open window, so using
 /// the complete inventory as a restore target would unexpectedly launch all
 /// of them when no workspace mapping was configured.
-pub fn filter_profiles_by_active_directories(
-    profiles: Vec<BraveProfile>,
-    active_directories: &[String],
-) -> Vec<BraveProfile> {
+#[must_use]
+pub fn filter_profiles_by_active_directories(profiles: Vec<BraveProfile>, active_directories: &[String]) -> Vec<BraveProfile> {
     profiles
         .into_iter()
         .filter(|profile| {
@@ -108,12 +118,8 @@ mod tests {
         }"#;
         let profiles = parse_profiles_from_local_state(json).unwrap();
         assert_eq!(profiles.len(), 3);
-        assert!(profiles
-            .iter()
-            .any(|p| p.directory == "Default" && p.name == "Credifit"));
-        assert!(profiles
-            .iter()
-            .any(|p| p.directory == "Profile 1" && p.name == "LinkPJ"));
+        assert!(profiles.iter().any(|p| p.directory == "Default" && p.name == "Credifit"));
+        assert!(profiles.iter().any(|p| p.directory == "Profile 1" && p.name == "LinkPJ"));
     }
 
     #[test]
@@ -128,10 +134,7 @@ mod tests {
         let json = r#"{"profile": {"info_cache": {"Default": {"name": ""}}}}"#;
         let profiles = parse_profiles_from_local_state(json).unwrap();
         assert_eq!(profiles.len(), 1);
-        assert_eq!(
-            profiles[0].name, "Default",
-            "empty name should fall back to directory"
-        );
+        assert_eq!(profiles[0].name, "Default", "empty name should fall back to directory");
     }
 
     #[test]
@@ -177,7 +180,7 @@ mod tests {
                 name: "LinkPJ".to_string(),
             },
         ];
-        let filtered = filter_profiles_by_config(profiles, None);
+        let filtered = filter_profiles_by_config::<std::collections::hash_map::RandomState>(profiles, None);
         assert_eq!(filtered.len(), 2);
     }
 

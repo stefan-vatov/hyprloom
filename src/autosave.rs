@@ -5,6 +5,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(unix)]
+use crate::platform::current_user_id;
+
 const SERVICE_NAME: &str = "hyprloom-autosave.service";
 const TIMER_NAME: &str = "hyprloom-autosave.timer";
 const LEGACY_SERVICE_NAME: &str = "hyprflow-autosave.service";
@@ -14,6 +17,8 @@ const SERVICE_BACKUP_NAME: &str = ".hyprloom-autosave.service.backup";
 const TIMER_BACKUP_NAME: &str = ".hyprloom-autosave.timer.backup";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[must_use]
+/// Return the per-user systemd unit directory used by Hyprloom.
 pub fn systemd_user_dir() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
@@ -117,10 +122,7 @@ fn ensure_safe_parent_directory(path: &Path) -> std::io::Result<()> {
     if metadata.permissions().mode() & 0o022 != 0 && metadata.permissions().mode() & 0o1000 == 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!(
-                "autosave parent is writable by another user: {}",
-                path.display()
-            ),
+            format!("autosave parent is writable by another user: {}", path.display()),
         ));
     }
     Ok(())
@@ -135,13 +137,10 @@ fn ensure_owned_directory(path: &Path) -> std::io::Result<()> {
         ));
     }
     #[cfg(unix)]
-    if metadata.uid() != unsafe { libc::geteuid() } || metadata.permissions().mode() & 0o022 != 0 {
+    if metadata.uid() != current_user_id() || metadata.permissions().mode() & 0o022 != 0 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!(
-                "autosave directory is not user-owned and private: {}",
-                path.display()
-            ),
+            format!("autosave directory is not user-owned and private: {}", path.display()),
         ));
     }
     Ok(())
@@ -180,21 +179,15 @@ fn ensure_private_marker(path: &Path) -> std::io::Result<()> {
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!(
-                "autosave transaction marker is not a regular file: {}",
-                path.display()
-            ),
+            format!("autosave transaction marker is not a regular file: {}", path.display()),
         ));
     }
     #[cfg(unix)]
     {
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        if metadata.uid() != current_user_id() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "autosave transaction marker is not user-owned: {}",
-                    path.display()
-                ),
+                format!("autosave transaction marker is not user-owned: {}", path.display()),
             ));
         }
         if metadata.permissions().mode() & 0o777 != 0o600 {
@@ -203,21 +196,22 @@ fn ensure_private_marker(path: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(path, permissions)?;
         }
         let verified = std::fs::symlink_metadata(path)?;
-        if verified.uid() != unsafe { libc::geteuid() }
-            || verified.permissions().mode() & 0o077 != 0
-        {
+        if verified.uid() != current_user_id() || verified.permissions().mode() & 0o077 != 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "autosave transaction marker is not private: {}",
-                    path.display()
-                ),
+                format!("autosave transaction marker is not private: {}", path.display()),
             ));
         }
     }
     Ok(())
 }
 
+/// Install or update the Hyprloom autosave service and timer.
+///
+/// # Errors
+///
+/// Returns an error when the unit directory is unsafe or the service files
+/// cannot be written atomically.
 pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     ensure_systemd_directory(systemd_dir)?;
     recover_install_transaction(systemd_dir)?;
@@ -235,13 +229,13 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     // exact previous pair instead of leaving systemd with half an install.
     write_transaction_marker(systemd_dir, "prepared")?;
     if let Err(error) = write_optional_backup(&service_backup, previous_service.as_deref())
-        .and_then(|_| write_optional_backup(&timer_backup, previous_timer.as_deref()))
-        .and_then(|_| write_transaction_marker(systemd_dir, "backed-up"))
-        .and_then(|_| atomic_write(&service_path, service_content(&binary).as_bytes()))
-        .and_then(|_| write_transaction_marker(systemd_dir, "service-written"))
-        .and_then(|_| atomic_write(&timer_path, timer_content().as_bytes()))
-        .and_then(|_| write_transaction_marker(systemd_dir, "timer-written"))
-        .and_then(|_| write_transaction_marker(systemd_dir, "committed"))
+        .and_then(|()| write_optional_backup(&timer_backup, previous_timer.as_deref()))
+        .and_then(|()| write_transaction_marker(systemd_dir, "backed-up"))
+        .and_then(|()| atomic_write(&service_path, service_content(&binary).as_bytes()))
+        .and_then(|()| write_transaction_marker(systemd_dir, "service-written"))
+        .and_then(|()| atomic_write(&timer_path, timer_content().as_bytes()))
+        .and_then(|()| write_transaction_marker(systemd_dir, "timer-written"))
+        .and_then(|()| write_transaction_marker(systemd_dir, "committed"))
     {
         // Best-effort immediate rollback keeps an ordinary write error just as
         // safe as a process crash.  If rollback itself fails, the marker and
@@ -263,7 +257,7 @@ fn read_optional_unit(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_file() => {
             #[cfg(unix)]
-            if metadata.uid() != unsafe { libc::geteuid() } {
+            if metadata.uid() != current_user_id() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!("systemd unit is not user-owned: {}", path.display()),
@@ -281,10 +275,10 @@ fn read_optional_unit(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
 }
 
 fn write_optional_backup(path: &Path, contents: Option<&[u8]>) -> std::io::Result<()> {
-    match contents {
-        Some(contents) => atomic_write(path, contents),
-        None => std::fs::remove_file(path).or_else(ignore_not_found),
-    }
+    contents.map_or_else(
+        || std::fs::remove_file(path).or_else(ignore_not_found),
+        |contents| atomic_write(path, contents),
+    )
 }
 
 fn write_transaction_marker(systemd_dir: &Path, phase: &str) -> std::io::Result<()> {
@@ -306,10 +300,7 @@ fn recover_install_transaction(systemd_dir: &Path) -> std::io::Result<()> {
         Ok(_) => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "autosave transaction marker is not a regular file: {}",
-                    marker_path.display()
-                ),
+                format!("autosave transaction marker is not a regular file: {}", marker_path.display()),
             ));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -321,9 +312,9 @@ fn recover_install_transaction(systemd_dir: &Path) -> std::io::Result<()> {
     let timer_backup = systemd_dir.join(TIMER_BACKUP_NAME);
 
     match marker.as_str() {
-        "prepared" => {}
-        "committed" => {
-            // The new pair is complete.  Only cleanup was interrupted.
+        "prepared" | "committed" => {
+            // Either phase is safe to finish by removing the marker and any
+            // backup files left by an interrupted install.
         }
         "backed-up" | "service-written" | "timer-written" => {
             restore_optional_unit(&service_path, &service_backup)?;
@@ -344,10 +335,10 @@ fn recover_install_transaction(systemd_dir: &Path) -> std::io::Result<()> {
 }
 
 fn restore_optional_unit(unit: &Path, backup: &Path) -> std::io::Result<()> {
-    match read_optional_unit(backup)? {
-        Some(contents) => atomic_write(unit, &contents),
-        None => std::fs::remove_file(unit).or_else(ignore_not_found),
-    }
+    read_optional_unit(backup)?.map_or_else(
+        || std::fs::remove_file(unit).or_else(ignore_not_found),
+        |contents| atomic_write(unit, &contents),
+    )
 }
 
 fn ignore_not_found(error: std::io::Error) -> std::io::Result<()> {
@@ -363,24 +354,14 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 }
 
 fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "systemd unit path has no parent directory",
-        )
-    })?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("unit");
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "systemd unit path has no parent directory"))?;
+    let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("unit");
 
     for _ in 0..100 {
         let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(
-            ".{file_name}.{}.{}.tmp",
-            std::process::id(),
-            sequence
-        ));
+        let temporary = parent.join(format!(".{file_name}.{}.{}.tmp", std::process::id(), sequence));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -391,7 +372,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         };
-        let write_result = file.write_all(contents).and_then(|_| file.sync_all());
+        let write_result = file.write_all(contents).and_then(|()| file.sync_all());
         drop(file);
         if let Err(error) = write_result {
             let _ = std::fs::remove_file(&temporary);
@@ -412,6 +393,12 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     ))
 }
 
+/// Remove current and legacy Hyprloom autosave units from `systemd_dir`.
+///
+/// # Errors
+///
+/// Returns an error when the directory or one of its unit files fails the
+/// ownership and regular-file safety checks.
 pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
     // If an earlier install was interrupted, settle that transaction before
     // deleting units.  This keeps backup files and the transaction marker from
@@ -424,22 +411,14 @@ pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
         disable_timer(timer);
     }
 
-    for unit in [
-        SERVICE_NAME,
-        TIMER_NAME,
-        LEGACY_SERVICE_NAME,
-        LEGACY_TIMER_NAME,
-    ] {
+    for unit in [SERVICE_NAME, TIMER_NAME, LEGACY_SERVICE_NAME, LEGACY_TIMER_NAME] {
         let path = systemd_dir.join(unit);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_file() => std::fs::remove_file(path)?,
             Ok(_) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "refusing to remove non-regular systemd unit: {}",
-                        path.display()
-                    ),
+                    format!("refusing to remove non-regular systemd unit: {}", path.display()),
                 ));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -449,46 +428,47 @@ pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[must_use]
+/// Return whether a Hyprloom autosave timer file is installed.
 pub fn is_installed(systemd_dir: &Path) -> bool {
-    [TIMER_NAME, LEGACY_TIMER_NAME].iter().any(|name| {
-        std::fs::symlink_metadata(systemd_dir.join(name))
-            .map(|metadata| metadata.file_type().is_file())
-            .unwrap_or(false)
-    })
+    [TIMER_NAME, LEGACY_TIMER_NAME]
+        .iter()
+        .any(|name| std::fs::symlink_metadata(systemd_dir.join(name)).is_ok_and(|metadata| metadata.file_type().is_file()))
 }
 
+#[must_use]
+/// Return whether the current or legacy autosave timer is active.
 pub fn is_active() -> bool {
-    [TIMER_NAME, LEGACY_TIMER_NAME]
-        .iter()
-        .any(|name| unit_state_is(name, "is-active"))
+    [TIMER_NAME, LEGACY_TIMER_NAME].iter().any(|name| unit_state_is(name, "is-active"))
 }
 
+#[must_use]
+/// Return whether the current or legacy autosave timer is enabled.
 pub fn is_enabled() -> bool {
-    [TIMER_NAME, LEGACY_TIMER_NAME]
-        .iter()
-        .any(|name| unit_state_is(name, "is-enabled"))
+    [TIMER_NAME, LEGACY_TIMER_NAME].iter().any(|name| unit_state_is(name, "is-enabled"))
 }
 
 fn unit_state_is(unit: &str, state: &str) -> bool {
     std::process::Command::new("systemctl")
         .args(["--user", state, "--quiet", unit])
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 fn disable_timer(timer: &str) {
     let result = std::process::Command::new("systemctl")
         .args(["--user", "disable", "--now", timer])
         .output();
-    if let Ok(output) = result {
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let message = stderr.trim();
-            if !message.is_empty() {
-                eprintln!("Warning: systemctl disable {timer} failed: {message}");
-            }
-        }
+    let Ok(output) = result else {
+        return;
+    };
+    if output.status.success() {
+        return;
+    }
+    let message = String::from_utf8_lossy(&output.stderr);
+    let message = message.trim();
+    if !message.is_empty() {
+        crate::output::warning(format!("Warning: systemctl disable {timer} failed: {message}"));
     }
 }
 
@@ -502,27 +482,20 @@ fn migrate_legacy_units(systemd_dir: &Path) {
     let was_enabled = unit_state_is(LEGACY_TIMER_NAME, "is-enabled");
     disable_timer(LEGACY_TIMER_NAME);
     for path in [legacy_service, legacy_timer] {
-        if let Err(error) = std::fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "Warning: could not remove legacy autosave unit '{}': {error}",
-                    path.display()
-                );
-            }
+        if let Err(error) = std::fs::remove_file(&path).or_else(ignore_not_found) {
+            crate::output::warning(format!("Warning: could not remove legacy autosave unit '{}': {error}", path.display()));
         }
     }
     if was_enabled {
         let output = std::process::Command::new("systemctl")
             .args(["--user", "enable", "--now", TIMER_NAME])
             .output();
-        if let Ok(output) = output {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!(
-                    "Warning: could not activate migrated autosave timer: {}",
-                    stderr.trim()
-                );
-            }
+        let Ok(output) = output else {
+            return;
+        };
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            crate::output::warning(format!("Warning: could not activate migrated autosave timer: {}", stderr.trim()));
         }
     }
 }
@@ -644,9 +617,6 @@ mod tests {
         symlink(outside.path(), dir.path().join(TRANSACTION_MARKER_NAME)).unwrap();
 
         assert!(recover_install_transaction(dir.path()).is_err());
-        assert_eq!(
-            std::fs::read_to_string(outside.path()).unwrap(),
-            "prepared\n"
-        );
+        assert_eq!(std::fs::read_to_string(outside.path()).unwrap(), "prepared\n");
     }
 }

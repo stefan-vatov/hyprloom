@@ -1,0 +1,12 @@
+# BEGIN cargo-thx-lint
+# VERSION 0.1.0
+edition = "2021"
+style_edition = "2021"
+max_width = 150
+use_small_heuristics = "Default"
+newline_style = "Unix"
+group_imports = "StdExternalCrate"
+imports_granularity = "Module"
+trailing_comma = "Vertical"
+trailing_semicolon = false
+# END cargo-thx-lint

@@ -6,25 +6,45 @@ use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 
+#[cfg(unix)]
+use crate::platform::current_user_id;
+
 /// Safety limits for values that control sleeps and polling loops.  They keep
 /// a damaged config from making automatic restore appear hung indefinitely.
+///
+/// The limits are public so callers that expose configuration controls can
+/// validate values using the same bounds as the restore engine.
+///
+/// The maximum delay accepted from configuration, in milliseconds.
 pub const MAX_RESTORE_DELAY_MS: u64 = 60_000;
+/// The minimum window-detection timeout accepted from configuration.
 pub const MIN_WINDOW_DETECT_TIMEOUT_MS: u64 = 500;
+/// The maximum window-detection timeout accepted from configuration.
 pub const MAX_WINDOW_DETECT_TIMEOUT_MS: u64 = 120_000;
+/// The maximum number of retained autosave snapshots.
 pub const MAX_AUTOSAVE_RETAIN: usize = 1_000;
+/// The maximum number of bytes read from the configuration file.
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
+/// The maximum number of configured applications.
 pub const MAX_CONFIG_APPS: usize = 1_024;
+/// The maximum number of ignored window classes.
 pub const MAX_CONFIG_FILTERS: usize = 4_096;
+/// The maximum number of browser profile workspace mappings.
 pub const MAX_CONFIG_PROFILE_WORKSPACES: usize = 4_096;
+/// The maximum length of a configuration string, in bytes.
 pub const MAX_CONFIG_STRING_BYTES: usize = 64 * 1024;
 
+/// Complete user configuration loaded from the current or legacy config path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    /// General timing, default-session, and autosave settings.
     pub general: GeneralConfig,
     #[serde(default)]
+    /// Window classes excluded from capture and restore.
     pub filters: FilterConfig,
     #[serde(default)]
+    /// Per-application launch and browser-profile settings, keyed by class.
     pub apps: HashMap<String, AppConfig>,
 }
 
@@ -42,26 +62,34 @@ impl Config {
     }
 }
 
+/// General restore and autosave settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneralConfig {
     #[serde(default = "default_session_name")]
+    /// Session name used when a command does not specify one explicitly.
     pub default_session: String,
     #[serde(default = "default_restore_delay")]
+    /// Delay between launch operations, in milliseconds.
     pub restore_delay_ms: u64,
     #[serde(default = "default_detect_timeout")]
+    /// Maximum time spent waiting for a launched window, in milliseconds.
     pub window_detect_timeout_ms: u64,
     #[serde(default = "default_autosave_retain")]
+    /// Number of autosave snapshots retained after rotation.
     pub autosave_retain: usize,
 }
 
+/// Window classes that capture should ignore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FilterConfig {
     #[serde(default = "default_ignore_classes")]
+    /// Case-insensitive Hyprland classes excluded from snapshots.
     pub ignore_classes: Vec<String>,
 }
 
 /// Compare compositor classes case-insensitively.  Hyprland normally reports
 /// stable casing, but app wrappers and older sessions do not always agree.
+#[must_use]
 pub fn is_ignored_class(class: &str, ignored_classes: &[String]) -> bool {
     ignored_classes
         .iter()
@@ -71,30 +99,30 @@ pub fn is_ignored_class(class: &str, ignored_classes: &[String]) -> bool {
 /// Find the most specific per-app configuration while tolerating compositor
 /// class casing and wrappers that expose a different runtime class from their
 /// initial class.
-pub fn app_config_for<'a>(
-    config: &'a Config,
-    class: &str,
-    initial_class: &str,
-) -> Option<&'a AppConfig> {
-    config
-        .apps
-        .get(class)
-        .or_else(|| config.apps.get(initial_class))
-        .or_else(|| {
-            config.apps.iter().find_map(|(name, app)| {
-                (name.eq_ignore_ascii_case(class) || name.eq_ignore_ascii_case(initial_class))
-                    .then_some(app)
-            })
-        })
+#[must_use]
+pub fn app_config_for<'a>(config: &'a Config, class: &str, initial_class: &str) -> Option<&'a AppConfig> {
+    config.apps.get(class).or_else(|| config.apps.get(initial_class)).or_else(|| {
+        config
+            .apps
+            .iter()
+            .find_map(|(name, app)| (name.eq_ignore_ascii_case(class) || name.eq_ignore_ascii_case(initial_class)).then_some(app))
+    })
 }
 
+/// Optional launch and placement overrides for one application class.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
+    /// Explicit executable used when restoring this application.
     pub binary: Option<String>,
+    /// Whether to capture and restore the terminal working directory.
     pub capture_cwd: Option<bool>,
+    /// Whether to capture and restore the terminal's last command.
     pub capture_last_command: Option<bool>,
+    /// Optional launch hint template for desktop/web-app entries.
     pub hint_template: Option<String>,
+    /// Browser profile directory to workspace mappings.
     pub profile_workspaces: Option<HashMap<String, i32>>,
+    /// Default workspace for windows of this application.
     pub default_workspace: Option<i32>,
 }
 
@@ -102,30 +130,23 @@ fn default_session_name() -> String {
     "latest".to_string()
 }
 
-fn default_restore_delay() -> u64 {
+const fn default_restore_delay() -> u64 {
     500
 }
 
-fn default_detect_timeout() -> u64 {
+const fn default_detect_timeout() -> u64 {
     5000
 }
 
-fn default_autosave_retain() -> usize {
+const fn default_autosave_retain() -> usize {
     5
 }
 
 fn default_ignore_classes() -> Vec<String> {
-    vec![
-        "waybar",
-        "wofi",
-        "mako",
-        "polkit",
-        "nm-applet",
-        "xdg-desktop-portal",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
+    vec!["waybar", "wofi", "mako", "polkit", "nm-applet", "xdg-desktop-portal"]
+        .into_iter()
+        .map(String::from)
+        .collect()
 }
 
 impl Default for GeneralConfig {
@@ -147,51 +168,46 @@ impl Default for FilterConfig {
     }
 }
 
+#[must_use]
+/// Load configuration, falling back to defaults when it is absent or invalid.
 pub fn load_config() -> Config {
     for path in [config_path(), legacy_config_path()] {
         match std::fs::symlink_metadata(&path) {
-            Ok(_) => {
-                let content = match read_config_file(&path) {
-                    Ok(content) => content,
-                    Err(error) => {
-                        eprintln!(
-                            "Warning: could not read config '{}': {error}; using defaults",
-                            path.display()
-                        );
-                        return Config::default();
-                    }
-                };
-                let mut config: Config = match toml::from_str(&content) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        eprintln!(
-                            "Warning: could not parse config '{}': {error}; using defaults",
-                            path.display()
-                        );
-                        return Config::default();
-                    }
-                };
-                if let Err(error) = validate_config_structure(&config) {
-                    eprintln!(
-                        "Warning: config '{}' exceeds safety limits: {error}; using defaults",
-                        path.display()
-                    );
-                    return Config::default();
-                }
-                config.normalize();
-                return config;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(_) => return load_config_file(&path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                eprintln!(
-                    "Warning: could not inspect config '{}': {error}; using defaults",
-                    path.display()
-                );
+                crate::output::warning(format!("Warning: could not inspect config '{}': {error}; using defaults", path.display()));
                 return Config::default();
             }
         }
     }
     Config::default()
+}
+
+fn load_config_file(path: &std::path::Path) -> Config {
+    let content = match read_config_file(path) {
+        Ok(content) => content,
+        Err(error) => {
+            crate::output::warning(format!("Warning: could not read config '{}': {error}; using defaults", path.display()));
+            return Config::default();
+        }
+    };
+    let mut config: Config = match toml::from_str(&content) {
+        Ok(config) => config,
+        Err(error) => {
+            crate::output::warning(format!("Warning: could not parse config '{}': {error}; using defaults", path.display()));
+            return Config::default();
+        }
+    };
+    if let Err(error) = validate_config_structure(&config) {
+        crate::output::warning(format!(
+            "Warning: config '{}' exceeds safety limits: {error}; using defaults",
+            path.display()
+        ));
+        return Config::default();
+    }
+    config.normalize();
+    config
 }
 
 fn read_config_file(path: &std::path::Path) -> Result<String, String> {
@@ -206,37 +222,35 @@ fn read_config_file(path: &std::path::Path) -> Result<String, String> {
     }
     #[cfg(unix)]
     {
-        let user_id = unsafe { libc::geteuid() };
-        let parent = path
-            .parent()
-            .ok_or_else(|| "config path has no parent directory".to_string())?;
-        let parent_metadata =
-            std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
+        let user_id = current_user_id();
+        let parent = path.parent().ok_or_else(|| "config path has no parent directory".to_string())?;
+        let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| error.to_string())?;
         if metadata.uid() != user_id
             || metadata.permissions().mode() & 0o022 != 0
             || !parent_metadata.is_dir()
             || parent_metadata.uid() != user_id
             || parent_metadata.permissions().mode() & 0o022 != 0
         {
-            return Err(
-                "config file or its directory is not user-owned and non-writable by others"
-                    .to_string(),
-            );
+            return Err("config file or its directory is not user-owned and non-writable by others".to_string());
         }
     }
     if metadata.len() > MAX_CONFIG_FILE_BYTES {
         return Err(format!("file is larger than {MAX_CONFIG_FILE_BYTES} bytes"));
     }
-    let mut bytes = Vec::with_capacity(metadata.len().min(MAX_CONFIG_FILE_BYTES) as usize);
+    let capacity = usize::try_from(metadata.len().min(MAX_CONFIG_FILE_BYTES)).unwrap_or(usize::MAX);
+    let mut bytes = Vec::with_capacity(capacity);
     file.take(MAX_CONFIG_FILE_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
-    if bytes.len() as u64 > MAX_CONFIG_FILE_BYTES {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CONFIG_FILE_BYTES {
         return Err(format!("file is larger than {MAX_CONFIG_FILE_BYTES} bytes"));
     }
     String::from_utf8(bytes).map_err(|error| error.to_string())
 }
 
+// Validation keeps the limits for each nested configuration section adjacent
+// to the section it protects.
+#[allow(clippy::excessive_nesting)]
 fn validate_config_structure(config: &Config) -> Result<(), String> {
     validate_config_text("default session", &config.general.default_session)?;
     if config.filters.ignore_classes.len() > MAX_CONFIG_FILTERS {
@@ -250,19 +264,14 @@ fn validate_config_structure(config: &Config) -> Result<(), String> {
     }
     for (name, app) in &config.apps {
         validate_config_text("app name", name)?;
-        for (label, value) in [
-            ("app binary", app.binary.as_deref()),
-            ("app hint template", app.hint_template.as_deref()),
-        ] {
+        for (label, value) in [("app binary", app.binary.as_deref()), ("app hint template", app.hint_template.as_deref())] {
             if let Some(value) = value {
                 validate_config_text(label, value)?;
             }
         }
         if let Some(workspaces) = &app.profile_workspaces {
             if workspaces.len() > MAX_CONFIG_PROFILE_WORKSPACES {
-                return Err(format!(
-                    "more than {MAX_CONFIG_PROFILE_WORKSPACES} profile workspace mappings"
-                ));
+                return Err(format!("more than {MAX_CONFIG_PROFILE_WORKSPACES} profile workspace mappings"));
             }
             for profile in workspaces.keys() {
                 validate_config_text("profile workspace name", profile)?;
@@ -274,13 +283,13 @@ fn validate_config_structure(config: &Config) -> Result<(), String> {
 
 fn validate_config_text(label: &str, value: &str) -> Result<(), String> {
     if value.len() > MAX_CONFIG_STRING_BYTES {
-        return Err(format!(
-            "{label} is longer than {MAX_CONFIG_STRING_BYTES} bytes"
-        ));
+        return Err(format!("{label} is longer than {MAX_CONFIG_STRING_BYTES} bytes"));
     }
     Ok(())
 }
 
+#[must_use]
+/// Return the current Hyprloom configuration file path.
 pub fn config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
@@ -288,6 +297,8 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
+#[must_use]
+/// Return the legacy Hyprflow configuration file path.
 pub fn legacy_config_path() -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from("~/.config"))
@@ -295,6 +306,8 @@ pub fn legacy_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+#[must_use]
+/// Return the current Hyprloom session directory.
 pub fn sessions_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
@@ -302,6 +315,8 @@ pub fn sessions_dir() -> PathBuf {
         .join("sessions")
 }
 
+#[must_use]
+/// Return the legacy Hyprflow session directory.
 pub fn legacy_sessions_dir() -> PathBuf {
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("~/.local/share"))
@@ -321,10 +336,7 @@ mod tests {
         assert_eq!(config.general.restore_delay_ms, 500);
         assert_eq!(config.general.window_detect_timeout_ms, 5000);
         assert!(
-            config
-                .filters
-                .ignore_classes
-                .contains(&"waybar".to_string()),
+            config.filters.ignore_classes.contains(&"waybar".to_string()),
             "ignore_classes should contain 'waybar'"
         );
         assert!(config.apps.is_empty());
@@ -355,10 +367,7 @@ hint_template = "{cwd}"
         assert_eq!(config.general.window_detect_timeout_ms, 8000);
         assert_eq!(config.filters.ignore_classes, vec!["waybar", "dunst"]);
 
-        let kitty = config
-            .apps
-            .get("kitty")
-            .expect("apps.kitty should be present");
+        let kitty = config.apps.get("kitty").expect("apps.kitty should be present");
         assert_eq!(kitty.binary.as_deref(), Some("/usr/bin/kitty"));
         assert_eq!(kitty.capture_cwd, Some(true));
         assert_eq!(kitty.capture_last_command, Some(false));
@@ -373,10 +382,7 @@ hint_template = "{cwd}"
         assert_eq!(config.general.restore_delay_ms, 500);
         assert_eq!(config.general.window_detect_timeout_ms, 5000);
         assert!(
-            config
-                .filters
-                .ignore_classes
-                .contains(&"waybar".to_string()),
+            config.filters.ignore_classes.contains(&"waybar".to_string()),
             "ignore_classes should contain 'waybar' by default"
         );
         assert!(
@@ -402,25 +408,20 @@ hint_template = "{cwd}"
         config.normalize();
 
         assert_eq!(config.general.restore_delay_ms, MAX_RESTORE_DELAY_MS);
-        assert_eq!(
-            config.general.window_detect_timeout_ms,
-            MAX_WINDOW_DETECT_TIMEOUT_MS
-        );
+        assert_eq!(config.general.window_detect_timeout_ms, MAX_WINDOW_DETECT_TIMEOUT_MS);
         assert_eq!(config.general.autosave_retain, MAX_AUTOSAVE_RETAIN);
 
         config.general.window_detect_timeout_ms = 100;
         config.normalize();
-        assert_eq!(
-            config.general.window_detect_timeout_ms,
-            MIN_WINDOW_DETECT_TIMEOUT_MS
-        );
+        assert_eq!(config.general.window_detect_timeout_ms, MIN_WINDOW_DETECT_TIMEOUT_MS);
     }
 
     #[test]
     fn test_config_file_and_structure_limits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("config.toml");
-        std::fs::write(&path, vec![b' '; MAX_CONFIG_FILE_BYTES as usize + 1]).unwrap();
+        let oversized_len = usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap_or(usize::MAX).saturating_add(1);
+        std::fs::write(&path, vec![b' '; oversized_len]).unwrap();
         assert!(read_config_file(&path).is_err());
 
         let mut config = Config::default();
@@ -457,10 +458,10 @@ hint_template = "{cwd}"
 
     #[test]
     fn test_config_autosave_retain_from_toml() {
-        let toml_str = r#"
+        let toml_str = r"
 [general]
 autosave_retain = 10
-"#;
+";
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.general.autosave_retain, 10);
     }

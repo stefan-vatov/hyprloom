@@ -1,30 +1,42 @@
+//! Hyprloom command-line application.
+
+#![allow(unused_crate_dependencies)]
+
 use clap::{Parser, Subcommand};
 use hyprloom::capture::capture_session;
-use hyprloom::config::{
-    app_config_for, config_path, legacy_sessions_dir, load_config, sessions_dir,
-};
+use hyprloom::config::{app_config_for, config_path, legacy_sessions_dir, load_config, sessions_dir};
 use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
+use hyprloom::matching::MatchingStrategy;
 use hyprloom::process::{ProcessInfoProvider, RealProcessInfo};
 use hyprloom::restore::{
-    recover_session_safely, replace_session_with_marker,
-    replacement_target_is_complete_with_backup, restore_session, validate_replacement_targets,
+    recover_session_safely, replace_session_with_marker, replacement_target_is_complete_with_backup, restore_session, validate_replacement_targets,
     validate_safety_snapshot_with_config, ReplaceMarkerContext,
 };
 use hyprloom::session::{
-    autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session,
-    migrate_legacy_sessions, replace_marker, rotate_autosaves, save_session, session_exists,
-    session_fingerprint, validate_user_session_name, OperationLock, ReplacePhase,
+    autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session, migrate_legacy_sessions, replace_marker, rotate_autosaves,
+    save_session, session_exists, session_fingerprint, validate_user_session_name, OperationLock, ReplacePhase,
 };
+use std::io::Write;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+macro_rules! cli_println {
+    ($($arg:tt)*) => {{
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, $($arg)*);
+    }};
+}
+
+macro_rules! cli_eprintln {
+    ($($arg:tt)*) => {{
+        let mut stderr = std::io::stderr().lock();
+        let _ = writeln!(stderr, $($arg)*);
+    }};
+}
+
 #[derive(Parser)]
-#[command(
-    name = "hyprloom",
-    version,
-    about = "Save, restore, and reconcile Hyprland sessions"
-)]
+#[command(name = "hyprloom", version, about = "Save, restore, and reconcile Hyprland sessions")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -54,6 +66,9 @@ enum Commands {
         /// Match existing windows, repair only mismatches, and leave extras alone
         #[arg(long)]
         reconcile: bool,
+        /// Use deterministic greedy matching instead of global assignment
+        #[arg(long, requires = "reconcile")]
+        greedy: bool,
         /// Skip restore if session is older than duration (e.g., 24h, 7d, 30m)
         #[arg(long)]
         max_age: Option<String>,
@@ -91,6 +106,11 @@ enum Commands {
     },
 }
 
+// The CLI dispatch keeps startup recovery and all subcommands in one ordered
+// transaction boundary; moving those branches apart would obscure when the
+// lock, migration, and recovery checks run.
+#[allow(clippy::excessive_nesting)]
+#[allow(clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
     let config = load_config();
@@ -98,12 +118,12 @@ fn main() {
     let _operation_lock = match OperationLock::acquire() {
         Ok(lock) => lock,
         Err(error) => {
-            eprintln!("Error acquiring hyprloom operation lock: {error}");
+            cli_eprintln!("Error acquiring hyprloom operation lock: {error}");
             std::process::exit(1);
         }
     };
     if let Err(error) = migrate_legacy_sessions(&sessions_dir, &legacy_sessions_dir()) {
-        eprintln!("Warning: could not migrate legacy hyprflow sessions: {error}");
+        cli_eprintln!("Warning: could not migrate legacy hyprflow sessions: {error}");
     }
     let requires_clean_recovery = command_requires_clean_recovery(&cli.command);
     let recovery_ready = if requires_clean_recovery {
@@ -112,9 +132,7 @@ fn main() {
         true
     };
     if !recovery_ready && requires_clean_recovery {
-        eprintln!(
-            "A previous desktop replacement still needs recovery; retry after Hyprland is available."
-        );
+        cli_eprintln!("A previous desktop replacement still needs recovery; retry after Hyprland is available.");
         std::process::exit(1);
     }
 
@@ -123,15 +141,12 @@ fn main() {
             let name = name.unwrap_or_else(|| config.general.default_session.clone());
 
             if let Err(error) = validate_user_session_name(&name) {
-                eprintln!("Error: {error}");
+                cli_eprintln!("Error: {error}");
                 std::process::exit(1);
             }
 
             if !force && session_exists(&name, &sessions_dir) && name != "latest" {
-                eprintln!(
-                    "Session '{}' already exists. Use --force to overwrite.",
-                    name
-                );
+                cli_eprintln!("Session '{}' already exists. Use --force to overwrite.", name);
                 std::process::exit(1);
             }
 
@@ -143,21 +158,21 @@ fn main() {
                     let client_count = session.clients.len();
                     match save_session(&session, &sessions_dir) {
                         Ok(()) => {
-                            println!("Saved session '{}' ({} windows)", name, client_count);
+                            cli_println!("Saved session '{}' ({} windows)", name, client_count);
                             if cli.verbose {
                                 for c in &session.clients {
-                                    println!("  ws={} {} — {}", c.workspace, c.class, c.title);
+                                    cli_println!("  ws={} {} — {}", c.workspace, c.class, c.title);
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error saving session: {}", e);
+                            cli_eprintln!("Error saving session: {}", e);
                             std::process::exit(1);
                         }
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error capturing session: {}", e);
+                    cli_eprintln!("Error capturing session: {}", e);
                     std::process::exit(1);
                 }
             }
@@ -167,16 +182,17 @@ fn main() {
             name,
             dry_run,
             reconcile,
+            greedy,
             max_age,
             on_login,
         } => {
             if on_login {
-                println!("Add this line to ~/.config/hypr/hyprland.conf:");
-                println!();
-                println!("  exec-once = hyprloom restore --reconcile --max-age 24h");
-                println!();
-                println!("This will reconcile your last saved session on login.");
-                println!("Sessions older than 24h will be skipped.");
+                cli_println!("Add this line to ~/.config/hypr/hyprland.conf:");
+                cli_println!();
+                cli_println!("  exec-once = hyprloom restore --reconcile --max-age 24h");
+                cli_println!();
+                cli_println!("This will reconcile your last saved session on login.");
+                cli_println!("Sessions older than 24h will be skipped.");
                 return;
             }
 
@@ -191,33 +207,27 @@ fn main() {
                         match hyprloom::session::list_autosave_sessions(&sessions_dir) {
                             Ok(autosaves) if !autosaves.is_empty() => {
                                 let fallback_name = &autosaves[0].name;
-                                println!(
-                                    "Session '{}' not found. Falling back to '{}'.",
-                                    name, fallback_name
-                                );
+                                cli_println!("Session '{}' not found. Falling back to '{}'.", name, fallback_name);
                                 match load_session(fallback_name, &sessions_dir) {
                                     Ok(s) => s,
                                     Err(e) => {
-                                        eprintln!("Error loading fallback session: {}", e);
+                                        cli_eprintln!("Error loading fallback session: {}", e);
                                         std::process::exit(1);
                                     }
                                 }
                             }
                             _ => {
-                                eprintln!(
-                                    "Session '{}' not found and no autosave sessions available.",
-                                    name
-                                );
+                                cli_eprintln!("Session '{}' not found and no autosave sessions available.", name);
                                 std::process::exit(1);
                             }
                         }
                     } else {
-                        eprintln!("Error: session '{}' not found", name);
+                        cli_eprintln!("Error: session '{}' not found", name);
                         std::process::exit(1);
                     }
                 }
                 Err(e) => {
-                    eprintln!("Error: {}", e);
+                    cli_eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
             };
@@ -227,26 +237,26 @@ fn main() {
                     Ok(max_duration) => {
                         let age = chrono::Utc::now() - session.created_at;
                         if age < chrono::Duration::zero() {
-                            println!(
+                            cli_println!(
                                 "Session '{}' has a future timestamp (created {}).",
                                 session.name,
                                 session.created_at.format("%Y-%m-%d %H:%M")
                             );
-                            println!("Skipping restore (max age: {}).", age_str);
+                            cli_println!("Skipping restore (max age: {}).", age_str);
                             return;
                         }
                         if age > max_duration {
-                            println!(
+                            cli_println!(
                                 "Session '{}' is too old (created {}).",
                                 session.name,
                                 session.created_at.format("%Y-%m-%d %H:%M")
                             );
-                            println!("Skipping restore (max age: {}).", age_str);
+                            cli_println!("Skipping restore (max age: {}).", age_str);
                             return;
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error: {}", e);
+                        cli_eprintln!("Error: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -255,21 +265,15 @@ fn main() {
             let hyprctl = RealHyprctl;
             if reconcile {
                 let process_info = RealProcessInfo;
-                match hyprloom::restore::reconcile_session(
-                    &session,
-                    &hyprctl,
-                    &process_info,
-                    &config,
-                    dry_run,
-                    cli.verbose,
-                ) {
+                let strategy = if greedy { MatchingStrategy::Greedy } else { MatchingStrategy::Global };
+                match hyprloom::restore::reconcile_session_with_strategy(&session, &hyprctl, &process_info, &config, dry_run, cli.verbose, strategy) {
                     Ok(report) => {
                         if dry_run {
-                            println!("Dry run for reconciliation of '{}':", session.name);
+                            cli_println!("Dry run for reconciliation of '{}':", session.name);
                         } else {
-                            println!("Reconciled session '{}':", session.name);
+                            cli_println!("Reconciled session '{}':", session.name);
                         }
-                        println!(
+                        cli_println!(
                             "  {} unchanged, {} moved, {} launched, {} extra left alone, {} skipped, {} failed",
                             report.unchanged,
                             report.moved,
@@ -279,14 +283,14 @@ fn main() {
                             report.failed
                         );
                         for detail in &report.details {
-                            println!("  {}", detail);
+                            cli_println!("  {}", detail);
                         }
                         if report.failed > 0 || report.skipped > 0 {
                             std::process::exit(1);
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error reconciling session: {}", e);
+                        cli_eprintln!("Error reconciling session: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -294,23 +298,20 @@ fn main() {
                 match restore_session(&session, &hyprctl, &config, dry_run, cli.verbose) {
                     Ok(report) => {
                         if dry_run {
-                            println!("Dry run for session '{}':", session.name);
+                            cli_println!("Dry run for session '{}':", session.name);
                         } else {
-                            println!("Restored session '{}':", session.name);
+                            cli_println!("Restored session '{}':", session.name);
                         }
-                        println!(
-                            "  {} restored, {} skipped, {} failed",
-                            report.restored, report.skipped, report.failed
-                        );
+                        cli_println!("  {} restored, {} skipped, {} failed", report.restored, report.skipped, report.failed);
                         for detail in &report.details {
-                            println!("  {}", detail);
+                            cli_println!("  {}", detail);
                         }
                         if report.failed > 0 {
                             std::process::exit(1);
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error restoring session: {}", e);
+                        cli_eprintln!("Error restoring session: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -321,14 +322,14 @@ fn main() {
             let session = match load_session(&name, &sessions_dir) {
                 Ok(session) => session,
                 Err(error) => {
-                    eprintln!("Error loading session: {error}");
+                    cli_eprintln!("Error loading session: {error}");
                     std::process::exit(1);
                 }
             };
             let target_digest = match session_fingerprint(&session) {
                 Ok(digest) => digest,
                 Err(error) => {
-                    eprintln!("Replace cancelled: could not fingerprint target session: {error}");
+                    cli_eprintln!("Replace cancelled: could not fingerprint target session: {error}");
                     std::process::exit(1);
                 }
             };
@@ -338,7 +339,7 @@ fn main() {
             // session in memory and performs the close/restore sequence in a
             // single process.
             if let Err(error) = validate_replacement_targets(&session, &config) {
-                eprintln!("Replace cancelled: {error}");
+                cli_eprintln!("Replace cancelled: {error}");
                 std::process::exit(1);
             }
 
@@ -346,33 +347,29 @@ fn main() {
             let process_info = RealProcessInfo;
             let backup_name = autosave_name_now();
             let recovery_config = safety_recovery_config(&config);
-            let backup =
-                match capture_session(&backup_name, &hyprctl, &process_info, &recovery_config) {
-                    Ok(session) => session,
-                    Err(error) => {
-                        eprintln!("Replace cancelled: safety backup failed: {error}");
-                        std::process::exit(1);
-                    }
-                };
+            let backup = match capture_session(&backup_name, &hyprctl, &process_info, &recovery_config) {
+                Ok(session) => session,
+                Err(error) => {
+                    cli_eprintln!("Replace cancelled: safety backup failed: {error}");
+                    std::process::exit(1);
+                }
+            };
             if let Err(error) = validate_safety_snapshot_with_config(&backup, &recovery_config) {
-                eprintln!("Replace cancelled: {error}");
+                cli_eprintln!("Replace cancelled: {error}");
                 std::process::exit(1);
             }
             if let Err(error) = save_session(&backup, &sessions_dir) {
-                eprintln!("Replace cancelled: safety backup could not be saved: {error}");
+                cli_eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
             }
-            if let Err(error) = hyprloom::session::mark_replace_prepared_for_target_with_digest(
-                &backup_name,
-                Some(&name),
-                Some(&target_digest),
-                &sessions_dir,
-            ) {
-                eprintln!("Replace cancelled: could not record recovery marker: {error}");
+            if let Err(error) =
+                hyprloom::session::mark_replace_prepared_for_target_with_digest(&backup_name, Some(&name), Some(&target_digest), &sessions_dir)
+            {
+                cli_eprintln!("Replace cancelled: could not record recovery marker: {error}");
                 std::process::exit(1);
             }
             if let Err(error) = rotate_autosaves(&sessions_dir, config.general.autosave_retain) {
-                eprintln!("Replace cancelled: could not rotate autosaves: {error}");
+                cli_eprintln!("Replace cancelled: could not rotate autosaves: {error}");
                 clear_recovery_marker(&sessions_dir);
                 std::process::exit(1);
             }
@@ -392,7 +389,7 @@ fn main() {
                 },
             ) {
                 Ok(report) => {
-                    println!(
+                    cli_println!(
                         "Replaced desktop with '{}' ({} unchanged, {} moved, {} launched, {} extra left alone, {} failed). Safety backup: '{}'.",
                         session.name,
                         report.unchanged,
@@ -403,49 +400,25 @@ fn main() {
                         backup_name
                     );
                     for detail in &report.details {
-                        println!("  {detail}");
+                        cli_println!("  {detail}");
                     }
                     if report.failed > 0 || report.skipped > 0 {
-                        eprintln!(
-                            "Replacement was incomplete; attempting safety recovery from '{}'.",
-                            backup_name
-                        );
-                        if report_non_destructive_safety_recovery(
-                            &backup,
-                            &hyprctl,
-                            &process_info,
-                            &config,
-                            cli.verbose,
-                        ) {
-                            clear_recovery_marker_and_rotate(
-                                &sessions_dir,
-                                config.general.autosave_retain,
-                            );
+                        cli_eprintln!("Replacement was incomplete; attempting safety recovery from '{}'.", backup_name);
+                        if report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, &config, cli.verbose) {
+                            clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain);
                         }
                         std::process::exit(1);
-                    } else {
-                        if !clear_recovery_marker_and_rotate(
-                            &sessions_dir,
-                            config.general.autosave_retain,
-                        ) {
-                            eprintln!(
-                                "Replacement completed, but its recovery marker could not be cleared; retry after checking the session store."
-                            );
-                            std::process::exit(1);
-                        }
+                    } else if !clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain) {
+                        cli_eprintln!("Replacement completed, but its recovery marker could not be cleared; retry after checking the session store.");
+                        std::process::exit(1);
                     }
                 }
                 Err(error) => {
-                    eprintln!("Error replacing desktop: {error}");
+                    cli_eprintln!("Error replacing desktop: {error}");
                     if let hyprloom::restore::RestoreError::TransactionAfterRestore(_) = &error {
-                        eprintln!(
-                            "The target desktop was restored, so safety recovery is not being replayed."
-                        );
-                        if !clear_recovery_marker_and_rotate(
-                            &sessions_dir,
-                            config.general.autosave_retain,
-                        ) {
-                            eprintln!(
+                        cli_eprintln!("The target desktop was restored, so safety recovery is not being replayed.");
+                        if !clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain) {
+                            cli_eprintln!(
                                 "The recovery marker could not be cleared; leave the desktop in place and retry cleanup after checking the session store."
                             );
                         }
@@ -453,35 +426,17 @@ fn main() {
                     }
                     match replacement_has_started(&sessions_dir, &hyprctl, &config) {
                         Some(true) => {
-                            eprintln!(
-                                "Attempting safety recovery from '{backup_name}' before giving up."
-                            );
-                            if report_non_destructive_safety_recovery(
-                                &backup,
-                                &hyprctl,
-                                &process_info,
-                                &config,
-                                cli.verbose,
-                            ) {
-                                clear_recovery_marker_and_rotate(
-                                    &sessions_dir,
-                                    config.general.autosave_retain,
-                                );
+                            cli_eprintln!("Attempting safety recovery from '{backup_name}' before giving up.");
+                            if report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, &config, cli.verbose) {
+                                clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain);
                             }
                         }
                         Some(false) => {
-                            eprintln!(
-                                "Replacement did not start closing windows; leaving the desktop unchanged."
-                            );
-                            clear_recovery_marker_and_rotate(
-                                &sessions_dir,
-                                config.general.autosave_retain,
-                            );
+                            cli_eprintln!("Replacement did not start closing windows; leaving the desktop unchanged.");
+                            clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain);
                         }
                         None => {
-                            eprintln!(
-                                "Could not determine whether replacement started; leaving the recovery marker for manual recovery."
-                            );
+                            cli_eprintln!("Could not determine whether replacement started; leaving the recovery marker for manual recovery.");
                         }
                     }
                     std::process::exit(1);
@@ -492,16 +447,12 @@ fn main() {
         Commands::List => match list_sessions(&sessions_dir) {
             Ok(sessions) => {
                 if sessions.is_empty() {
-                    println!("No saved sessions.");
+                    cli_println!("No saved sessions.");
                 } else {
-                    println!("Saved sessions:");
+                    cli_println!("Saved sessions:");
                     for s in sessions {
-                        let tag = if s.name.starts_with("autosave-") {
-                            " [auto]"
-                        } else {
-                            ""
-                        };
-                        println!(
+                        let tag = if s.name.starts_with("autosave-") { " [auto]" } else { "" };
+                        cli_println!(
                             "  {} — {} windows ({}){}",
                             s.name,
                             s.client_count,
@@ -512,81 +463,63 @@ fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("Error listing sessions: {}", e);
+                cli_eprintln!("Error listing sessions: {}", e);
                 std::process::exit(1);
             }
         },
 
         Commands::Delete { name } => match delete_session(&name, &sessions_dir) {
-            Ok(()) => println!("Deleted session '{}'", name),
+            Ok(()) => cli_println!("Deleted session '{}'", name),
             Err(e) => {
-                eprintln!("Error: {}", e);
+                cli_eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         },
 
         Commands::Config => {
-            println!("Config path: {}", config_path().display());
-            println!("Sessions dir: {}", sessions_dir.display());
-            println!("Default session: {}", config.general.default_session);
-            println!("Restore delay: {}ms", config.general.restore_delay_ms);
-            println!(
-                "Window detect timeout: {}ms",
-                config.general.window_detect_timeout_ms
-            );
-            println!("Ignored classes: {:?}", config.filters.ignore_classes);
+            cli_println!("Config path: {}", config_path().display());
+            cli_println!("Sessions dir: {}", sessions_dir.display());
+            cli_println!("Default session: {}", config.general.default_session);
+            cli_println!("Restore delay: {}ms", config.general.restore_delay_ms);
+            cli_println!("Window detect timeout: {}ms", config.general.window_detect_timeout_ms);
+            cli_println!("Ignored classes: {:?}", config.filters.ignore_classes);
             if !config.apps.is_empty() {
-                println!("App configs:");
+                cli_println!("App configs:");
                 for (name, app) in &config.apps {
-                    println!(
-                        "  {}: binary={:?} capture_cwd={:?}",
-                        name, app.binary, app.capture_cwd
-                    );
+                    cli_println!("  {}: binary={:?} capture_cwd={:?}", name, app.binary, app.capture_cwd);
                 }
             }
 
             // Show Brave profile mappings
-            println!();
+            cli_println!();
             match hyprloom::brave::read_profiles() {
                 Ok(profiles) if !profiles.is_empty() => {
-                    println!("Brave profiles detected:");
-                    let profile_ws = app_config_for(&config, "brave-browser", "")
-                        .and_then(|c| c.profile_workspaces.as_ref());
+                    cli_println!("Brave profiles detected:");
+                    let profile_ws = app_config_for(&config, "brave-browser", "").and_then(|c| c.profile_workspaces.as_ref());
                     for profile in &profiles {
                         if let Some(ws) = profile_ws.and_then(|m| m.get(&profile.directory)) {
-                            println!("  ✓ {} ({}) → ws={}", profile.directory, profile.name, ws);
+                            cli_println!("  ✓ {} ({}) → ws={}", profile.directory, profile.name, ws);
                         } else {
-                            println!(
-                                "  · {} ({}) — not mapped, will be skipped",
-                                profile.directory, profile.name
-                            );
+                            cli_println!("  · {} ({}) — not mapped, will be skipped", profile.directory, profile.name);
                         }
                     }
                     if profile_ws.is_none() {
-                        println!(
-                            "  (no profile_workspaces configured — all profiles will be captured)"
-                        );
+                        cli_println!("  (no profile_workspaces configured — all profiles will be captured)");
                     }
                 }
-                Ok(_) => println!("No Brave profiles detected."),
-                Err(e) => println!("Could not read Brave profiles: {e}"),
+                Ok(_) => cli_println!("No Brave profiles detected."),
+                Err(e) => cli_println!("Could not read Brave profiles: {e}"),
             }
         }
 
         Commands::Recover => {
-            println!("Replacement recovery check completed.");
+            cli_println!("Replacement recovery check completed.");
         }
 
-        Commands::Autosave {
-            now,
-            install,
-            uninstall,
-        } => {
+        Commands::Autosave { now, install, uninstall } => {
             let flag_count = [now, install, uninstall].iter().filter(|&&f| f).count();
             if flag_count > 1 {
-                eprintln!(
-                    "Error: only one of --now, --install, --uninstall may be specified at a time."
-                );
+                cli_eprintln!("Error: only one of --now, --install, --uninstall may be specified at a time.");
                 std::process::exit(1);
             }
 
@@ -595,27 +528,27 @@ fn main() {
             if install {
                 match hyprloom::autosave::install(&systemd_dir) {
                     Ok((service_path, timer_path)) => {
-                        println!("Created:");
-                        println!("  {}", service_path.display());
-                        println!("  {}", timer_path.display());
-                        println!();
-                        println!("To enable and start:");
-                        println!("  systemctl --user enable --now hyprloom-autosave.timer");
-                        println!();
-                        println!("To check status:");
-                        println!("  systemctl --user status hyprloom-autosave.timer");
-                        println!("  journalctl --user -u hyprloom-autosave.service");
+                        cli_println!("Created:");
+                        cli_println!("  {}", service_path.display());
+                        cli_println!("  {}", timer_path.display());
+                        cli_println!();
+                        cli_println!("To enable and start:");
+                        cli_println!("  systemctl --user enable --now hyprloom-autosave.timer");
+                        cli_println!();
+                        cli_println!("To check status:");
+                        cli_println!("  systemctl --user status hyprloom-autosave.timer");
+                        cli_println!("  journalctl --user -u hyprloom-autosave.service");
                     }
                     Err(e) => {
-                        eprintln!("Error installing autosave timer: {}", e);
+                        cli_eprintln!("Error installing autosave timer: {}", e);
                         std::process::exit(1);
                     }
                 }
             } else if uninstall {
                 match hyprloom::autosave::uninstall(&systemd_dir) {
-                    Ok(()) => println!("Autosave timer removed."),
+                    Ok(()) => cli_println!("Autosave timer removed."),
                     Err(e) => {
-                        eprintln!("Error uninstalling autosave timer: {}", e);
+                        cli_eprintln!("Error uninstalling autosave timer: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -628,36 +561,37 @@ fn main() {
                     Ok(session) => {
                         let client_count = session.clients.len();
                         if let Err(e) = save_session(&session, &sessions_dir) {
-                            eprintln!("Error saving autosave session: {}", e);
+                            cli_eprintln!("Error saving autosave session: {}", e);
                             std::process::exit(1);
                         }
 
                         let retain = config.general.autosave_retain;
-                        let total_before =
-                            match hyprloom::session::list_autosave_sessions(&sessions_dir) {
-                                Ok(sessions) => sessions.len(),
-                                Err(error) => {
-                                    eprintln!("Error listing autosaves for rotation: {error}");
-                                    std::process::exit(1);
-                                }
-                            };
-                        let pruned =
-                            match hyprloom::session::rotate_autosaves(&sessions_dir, retain) {
-                                Ok(pruned) => pruned,
-                                Err(error) => {
-                                    eprintln!("Error rotating autosaves: {error}");
-                                    std::process::exit(1);
-                                }
-                            };
+                        let total_before = match hyprloom::session::list_autosave_sessions(&sessions_dir) {
+                            Ok(sessions) => sessions.len(),
+                            Err(error) => {
+                                cli_eprintln!("Error listing autosaves for rotation: {error}");
+                                std::process::exit(1);
+                            }
+                        };
+                        let pruned = match hyprloom::session::rotate_autosaves(&sessions_dir, retain) {
+                            Ok(pruned) => pruned,
+                            Err(error) => {
+                                cli_eprintln!("Error rotating autosaves: {error}");
+                                std::process::exit(1);
+                            }
+                        };
                         let retained = total_before.saturating_sub(pruned);
 
-                        println!(
+                        cli_println!(
                             "Autosaved '{}' ({} windows). Retained {}, pruned {}.",
-                            name, client_count, retained, pruned
+                            name,
+                            client_count,
+                            retained,
+                            pruned
                         );
                     }
                     Err(e) => {
-                        eprintln!("Error capturing session: {}", e);
+                        cli_eprintln!("Error capturing session: {}", e);
                         std::process::exit(1);
                     }
                 }
@@ -667,31 +601,29 @@ fn main() {
                 let active = hyprloom::autosave::is_active();
 
                 if !installed {
-                    println!("Autosave is not configured.");
-                    println!("Run 'hyprloom autosave --install' to set up the systemd timer.");
+                    cli_println!("Autosave is not configured.");
+                    cli_println!("Run 'hyprloom autosave --install' to set up the systemd timer.");
                 } else if !active {
-                    println!("Autosave timer is installed but not active.");
-                    println!("  systemctl --user enable --now hyprloom-autosave.timer");
+                    cli_println!("Autosave timer is installed but not active.");
+                    cli_println!("  systemctl --user enable --now hyprloom-autosave.timer");
                 } else {
-                    println!("Autosave is active (every 10min).");
+                    cli_println!("Autosave is active (every 10min).");
                     match hyprloom::session::list_autosave_sessions(&sessions_dir) {
                         Ok(sessions) if !sessions.is_empty() => {
                             let latest = &sessions[0];
-                            println!(
+                            cli_println!(
                                 "Last: {} — {} windows",
                                 latest.created_at.format("%Y-%m-%d %H:%M:%S"),
                                 latest.client_count
                             );
-                            println!(
-                                "Retained: {} sessions (oldest: {})",
-                                sessions.len(),
-                                sessions.last().unwrap().name
-                            );
+                            if let Some(oldest) = sessions.last() {
+                                cli_println!("Retained: {} sessions (oldest: {})", sessions.len(), oldest.name);
+                            }
                         }
-                        Ok(_) => println!("No autosave sessions yet."),
-                        Err(e) => println!("Could not list sessions: {e}"),
+                        Ok(_) => cli_println!("No autosave sessions yet."),
+                        Err(e) => cli_println!("Could not list sessions: {e}"),
                     }
-                    println!("To disable: hyprloom autosave --uninstall");
+                    cli_println!("To disable: hyprloom autosave --uninstall");
                 }
             }
         }
@@ -700,7 +632,7 @@ fn main() {
 
 fn clear_recovery_marker(sessions_dir: &Path) -> bool {
     if let Err(error) = clear_replace_marker(sessions_dir) {
-        eprintln!("Warning: could not clear replacement recovery marker: {error}");
+        cli_eprintln!("Warning: could not clear replacement recovery marker: {error}");
         return false;
     }
     true
@@ -711,41 +643,36 @@ fn clear_recovery_marker_and_rotate(sessions_dir: &Path, retain: usize) -> bool 
         return false;
     }
     if let Err(error) = rotate_autosaves(sessions_dir, retain) {
-        eprintln!("Warning: could not rotate autosaves after replacement: {error}");
+        cli_eprintln!("Warning: could not rotate autosaves after replacement: {error}");
         return false;
     }
     true
 }
 
+// Startup recovery is a deliberately ordered state machine over the durable
+// marker phases; keeping those branches together makes crash behavior clear.
+#[allow(clippy::excessive_nesting)]
+#[allow(clippy::too_many_lines)]
 fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Config) -> bool {
     let marker = match replace_marker(sessions_dir) {
         Ok(Some(marker)) => marker,
         Ok(None) => return true,
         Err(error) => {
-            eprintln!("Warning: could not inspect replacement recovery marker: {error}");
+            cli_eprintln!("Warning: could not inspect replacement recovery marker: {error}");
             return false;
         }
     };
-    if matches!(
-        marker.phase,
-        ReplacePhase::Finalizing | ReplacePhase::Committed
-    ) {
-        eprintln!(
-            "Found a completed desktop replacement; finalizing its recovery marker without replaying the old snapshot."
-        );
+    if matches!(marker.phase, ReplacePhase::Finalizing | ReplacePhase::Committed) {
+        cli_eprintln!("Found a completed desktop replacement; finalizing its recovery marker without replaying the old snapshot.");
         return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
     if marker.phase == ReplacePhase::Prepared {
-        eprintln!(
-            "Found a replacement that was prepared but never started; leaving the current desktop unchanged."
-        );
+        cli_eprintln!("Found a replacement that was prepared but never started; leaving the current desktop unchanged.");
         return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
     if marker.phase == ReplacePhase::Closing {
         let Some(closing_address) = marker.closing_address.as_deref() else {
-            eprintln!(
-                "Warning: replacement marker is missing the window address for its closing phase."
-            );
+            cli_eprintln!("Warning: replacement marker is missing the window address for its closing phase.");
             return false;
         };
         let hyprctl = RealHyprctl;
@@ -760,16 +687,11 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             config,
         ) {
             Some(false) => {
-                eprintln!(
-                    "Found a replacement that had not confirmed its first close; leaving the current desktop unchanged."
-                );
-                return clear_recovery_marker_and_rotate(
-                    sessions_dir,
-                    config.general.autosave_retain,
-                );
+                cli_eprintln!("Found a replacement that had not confirmed its first close; leaving the current desktop unchanged.");
+                return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
             }
             None => {
-                eprintln!(
+                cli_eprintln!(
                     "Warning: could not determine whether the first replacement close was applied; leaving the recovery marker for manual recovery."
                 );
                 return false;
@@ -784,60 +706,42 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
             let backup_for_completion = load_session(&marker.backup_name, sessions_dir).ok();
             match load_session(target_name, sessions_dir) {
                 Ok(target) => {
-                    let target_matches_marker = marker.target_digest.as_deref().is_some_and(
-                        |expected_digest| {
-                            session_fingerprint(&target)
-                                .ok()
-                                .is_some_and(|actual_digest| actual_digest == expected_digest)
-                        },
-                    );
-                    if !target_matches_marker {
-                        if marker.target_digest.is_some() {
-                            eprintln!(
-                                "Warning: replacement target changed since the transaction started; attempting safety recovery instead of accepting the edited target."
-                            );
-                        }
-                    } else {
-                        match backup_for_completion.as_ref().map(|backup| {
-                            replacement_target_is_complete_with_backup(
-                                &target,
-                                Some(backup),
-                                &hyprctl,
-                                &process_info,
-                                config,
-                            )
-                        }) {
+                    let target_matches_marker = marker
+                        .target_digest
+                        .as_deref()
+                        .is_some_and(|expected_digest| session_fingerprint(&target).is_ok_and(|actual_digest| actual_digest == expected_digest));
+                    if target_matches_marker {
+                        match backup_for_completion
+                            .as_ref()
+                            .map(|backup| replacement_target_is_complete_with_backup(&target, Some(backup), &hyprctl, &process_info, config))
+                        {
                             Some(Ok(true)) => {
-                                eprintln!(
+                                cli_eprintln!(
                                     "Found a replacement whose target windows are already present; preserving the current desktop and finalizing its recovery marker."
                                 );
-                                return clear_recovery_marker_and_rotate(
-                                    sessions_dir,
-                                    config.general.autosave_retain,
-                                );
+                                return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
                             }
-                            Some(Ok(false)) => {}
-                            Some(Err(error)) => eprintln!(
-                                "Warning: could not verify the replacement target; attempting safety recovery: {error}"
-                            ),
-                            None => {}
+                            Some(Ok(false)) | None => {}
+                            Some(Err(error)) => {
+                                cli_eprintln!("Warning: could not verify the replacement target; attempting safety recovery: {error}");
+                            }
                         }
+                    } else if marker.target_digest.is_some() {
+                        cli_eprintln!(
+                            "Warning: replacement target changed since the transaction started; attempting safety recovery instead of accepting the edited target."
+                        );
                     }
                 }
-                Err(error) => eprintln!(
-                    "Warning: could not load the replacement target; attempting safety recovery: {error}"
-                ),
+                Err(error) => cli_eprintln!("Warning: could not load the replacement target; attempting safety recovery: {error}"),
             }
         }
     }
     let backup_name = marker.backup_name;
-    eprintln!(
-        "Found an interrupted desktop replacement; attempting recovery from '{backup_name}'."
-    );
+    cli_eprintln!("Found an interrupted desktop replacement; attempting recovery from '{backup_name}'.");
     let backup = match load_session(&backup_name, sessions_dir) {
         Ok(backup) => backup,
         Err(error) => {
-            eprintln!("Warning: could not load replacement recovery snapshot: {error}");
+            cli_eprintln!("Warning: could not load replacement recovery snapshot: {error}");
             return false;
         }
     };
@@ -848,19 +752,14 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
     // exact-replace path could close the current desktop before discovering
     // that the backup could not be replayed.  Leaving current windows alone
     // preserves user work and still repairs/launches only proven targets.
-    let recovered =
-        report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, config, false);
+    let recovered = report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, config, false);
     if recovered {
         return clear_recovery_marker_and_rotate(sessions_dir, config.general.autosave_retain);
     }
     false
 }
 
-fn replacement_has_started(
-    sessions_dir: &Path,
-    hyprctl: &dyn HyprctlClient,
-    config: &hyprloom::config::Config,
-) -> Option<bool> {
+fn replacement_has_started(sessions_dir: &Path, hyprctl: &dyn HyprctlClient, config: &hyprloom::config::Config) -> Option<bool> {
     match replace_marker(sessions_dir) {
         Ok(Some(marker)) => match marker.phase {
             ReplacePhase::InProgress => Some(true),
@@ -876,13 +775,11 @@ fn replacement_has_started(
                     config,
                 )
             }),
-            ReplacePhase::Prepared | ReplacePhase::Finalizing | ReplacePhase::Committed => {
-                Some(false)
-            }
+            ReplacePhase::Prepared | ReplacePhase::Finalizing | ReplacePhase::Committed => Some(false),
         },
         Ok(None) => Some(false),
         Err(error) => {
-            eprintln!("Warning: could not inspect replacement recovery marker: {error}");
+            cli_eprintln!("Warning: could not inspect replacement recovery marker: {error}");
             None
         }
     }
@@ -894,6 +791,10 @@ fn replacement_has_started(
 /// disappear before deciding whether recovery is necessary.  If it remains
 /// for the normal detection window, the close was not confirmed and it is
 /// safer to leave the user's desktop alone than to replay a full backup.
+// Close confirmation combines compositor polling with process identity; the
+// nested checks represent the available levels of evidence for one address.
+#[allow(clippy::excessive_nesting)]
+#[allow(clippy::too_many_arguments)]
 fn replacement_close_started(
     address: &str,
     expected_pid: Option<u32>,
@@ -912,9 +813,7 @@ fn replacement_close_started(
         let clients = match hyprctl.get_clients() {
             Ok(clients) => clients,
             Err(error) => {
-                eprintln!(
-                    "Warning: could not determine whether the first replacement close was applied: {error}"
-                );
+                cli_eprintln!("Warning: could not determine whether the first replacement close was applied: {error}");
                 return None;
             }
         };
@@ -925,9 +824,7 @@ fn replacement_close_started(
         let mut stable_identity_confirmed = false;
         if let Some(expected_stable_id) = expected_stable_id {
             match current.stable_id.as_deref() {
-                Some(current_stable_id)
-                    if expected_stable_id.eq_ignore_ascii_case(current_stable_id) =>
-                {
+                Some(current_stable_id) if expected_stable_id.eq_ignore_ascii_case(current_stable_id) => {
                     // Hyprland's stable ID is window-specific and proves
                     // that this is still the original client.  It still does
                     // not prove that an asynchronous close dispatch has not
@@ -979,11 +876,9 @@ fn replacement_close_started(
 fn command_requires_clean_recovery(command: &Commands) -> bool {
     match command {
         Commands::List | Commands::Config => false,
-        Commands::Restore {
-            dry_run, on_login, ..
-        } => !dry_run && !on_login,
+        Commands::Restore { dry_run, on_login, .. } => !dry_run && !on_login,
         Commands::Autosave { now, .. } => *now,
-        _ => true,
+        Commands::Save { .. } | Commands::Replace { .. } | Commands::Delete { .. } | Commands::Recover => true,
     }
 }
 
@@ -996,47 +891,44 @@ fn report_non_destructive_safety_recovery(
 ) -> bool {
     let recovery_config = safety_recovery_config(config);
     report_recovery_result(
-        recover_session_safely(
-            backup,
-            hyprctl,
-            process_info,
-            &recovery_config,
-            false,
-            verbose,
-        ),
+        recover_session_safely(backup, hyprctl, process_info, &recovery_config, false, verbose),
         "Non-destructive safety recovery",
     )
 }
 
-fn report_recovery_result(
-    result: Result<hyprloom::restore::ReconcileReport, hyprloom::restore::RestoreError>,
-    label: &str,
-) -> bool {
+fn report_recovery_result(result: Result<hyprloom::restore::ReconcileReport, hyprloom::restore::RestoreError>, label: &str) -> bool {
     match result {
         Ok(report) if report.failed == 0 && report.skipped == 0 => {
-            eprintln!(
+            cli_eprintln!(
                 "{label} pass completed: {} unchanged, {} moved, {} launched, {} skipped.",
-                report.unchanged, report.moved, report.launched, report.skipped
+                report.unchanged,
+                report.moved,
+                report.launched,
+                report.skipped
             );
             for detail in &report.details {
-                eprintln!("  recovery: {detail}");
+                cli_eprintln!("  recovery: {detail}");
             }
             true
         }
         Ok(report) => {
-            eprintln!(
+            cli_eprintln!(
                 "{label} was partial: {} unchanged, {} moved, {} launched, {} skipped, {} failed.",
-                report.unchanged, report.moved, report.launched, report.skipped, report.failed
+                report.unchanged,
+                report.moved,
+                report.launched,
+                report.skipped,
+                report.failed
             );
             for detail in &report.details {
-                eprintln!("  recovery: {detail}");
+                cli_eprintln!("  recovery: {detail}");
             }
-            eprintln!("The safety backup remains available for another retry.");
+            cli_eprintln!("The safety backup remains available for another retry.");
             false
         }
         Err(error) => {
-            eprintln!("{label} could not run: {error}");
-            eprintln!("The safety backup remains available for another retry.");
+            cli_eprintln!("{label} could not run: {error}");
+            cli_eprintln!("The safety backup remains available for another retry.");
             false
         }
     }
