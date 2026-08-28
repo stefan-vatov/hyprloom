@@ -4,12 +4,6 @@ Save and restore [Hyprland](https://hyprland.org) window sessions.
 
 When you reboot or recover from a power loss, Hyprloom restores your applications to their correct workspaces and positions.
 
-Hyprloom is an independent fork of [HyprFlow](https://github.com/iSorensen/hyprflow), originally created by [Eduardo Sorensen](https://github.com/iSorensen). It keeps the original session capture and restore workflow while adding monitor-aware reconciliation, conservative window matching, and recovery safeguards.
-
-## Fork and attribution
-
-This project builds on [HyprFlow](https://github.com/iSorensen/hyprflow) by Eduardo Sorensen. Hyprloom is a separate project with its own `hyprloom` command, configuration directory, session storage, and release history. The original project and this fork are distributed under the MIT License; see [LICENSE](LICENSE).
-
 ## Features
 
 - **Save** current session — captures all windows, positions, workspaces, and monitor layout
@@ -247,6 +241,10 @@ Unmatched current windows are never closed by reconciliation.
 ## Contributing
 
 Issues and pull requests are welcome. Please open an issue before submitting a large change so we can discuss the approach.
+
+## Attribution
+
+Hyprloom is an independent fork of [HyprFlow](https://github.com/iSorensen/hyprflow), originally created by [Eduardo Sorensen](https://github.com/iSorensen). It builds on the original session capture and restore foundation while adding reconciliation and recovery features, and remains available under the MIT License.
 
 ## License
 
