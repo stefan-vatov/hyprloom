@@ -1,4 +1,1 @@
-# Packaging metadata is maintained by the AUR release job and must not be
-# included in the source archive whose checksum it records.
-PKGBUILD export-ignore
-.SRCINFO export-ignore
+.ai/harder-to-fool/*.md whitespace=-trailing-space
