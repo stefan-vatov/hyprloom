@@ -1,6 +1,6 @@
 # Maintainer: Stefan Vatov
 pkgname=hyprloom
-pkgver=0.3.9
+pkgver=0.3.10
 pkgrel=1
 pkgdesc="Save, restore, and reconcile Hyprland window sessions"
 arch=('x86_64')
@@ -9,7 +9,7 @@ license=('MIT')
 depends=('hyprland')
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/releases/download/v$pkgver/$pkgname-$pkgver.tar.gz")
-_source_digest='403b48b52ec11264b69f01f7e32fe1a3a56cb9b0a95d6c52bb9a7e2061d6bc4d'
+_source_digest='435616e7bbed56349342459058d97179649c684d7bed8311331378c665cdcbbb'
 sha256sums=("$_source_digest")
 provides=('hyprflow')
 conflicts=('hyprflow')

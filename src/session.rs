@@ -530,8 +530,9 @@ pub fn validate_user_session_name(name: &str) -> Result<(), SessionError> {
 /// Copy legacy `HyprFlow` sessions into `Hyprloom` storage without removing or
 /// overwriting anything.
 ///
-/// This is intentionally idempotent so a user can run
-/// `Hyprloom` repeatedly while keeping the original files as a rollback path.
+/// Migration is attempted once and recorded in the current session directory.
+/// Keeping the original files as a rollback path must not cause a deliberately
+/// deleted Hyprloom snapshot to be copied back on the next command.
 ///
 /// # Errors
 ///
@@ -541,9 +542,23 @@ pub fn validate_user_session_name(name: &str) -> Result<(), SessionError> {
 // file cannot prevent healthy snapshots from being copied.
 #[allow(clippy::excessive_nesting)]
 pub fn migrate_legacy_sessions(sessions_dir: &Path, legacy_sessions_dir: &Path) -> Result<usize, SessionError> {
+    const MIGRATION_MARKER_NAME: &str = ".hyprflow-migration-complete";
+
     if sessions_dir == legacy_sessions_dir {
         return Ok(0);
     }
+
+    let migration_marker = sessions_dir.join(MIGRATION_MARKER_NAME);
+    match std::fs::symlink_metadata(&migration_marker) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            ensure_private_file(&migration_marker, MIGRATION_MARKER_NAME)?;
+            return Ok(0);
+        }
+        Ok(_) => return Err(SessionError::UnsafePath(migration_marker.display().to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(SessionError::Io(error)),
+    }
+
     match std::fs::symlink_metadata(legacy_sessions_dir) {
         Ok(metadata) if metadata.is_dir() => {}
         Ok(_) => return Ok(0),
@@ -591,6 +606,7 @@ pub fn migrate_legacy_sessions(sessions_dir: &Path, legacy_sessions_dir: &Path) 
             copied += 1;
         }
     }
+    atomic_write(&migration_marker, b"complete\n")?;
     Ok(copied)
 }
 
@@ -1730,6 +1746,19 @@ mod tests {
         save_session(&existing, current.path()).unwrap();
         assert_eq!(migrate_legacy_sessions(current.path(), legacy.path()).unwrap(), 0);
         assert_eq!(load_session("work", current.path()).unwrap().name, "work");
+    }
+
+    #[test]
+    fn test_migrate_legacy_sessions_does_not_resurrect_deleted_sessions() {
+        let legacy = tempfile::tempdir().unwrap();
+        let current = tempfile::tempdir().unwrap();
+        save_session(&make_test_session("work"), legacy.path()).unwrap();
+
+        assert_eq!(migrate_legacy_sessions(current.path(), legacy.path()).unwrap(), 1);
+        delete_session("work", current.path()).unwrap();
+
+        assert_eq!(migrate_legacy_sessions(current.path(), legacy.path()).unwrap(), 0);
+        assert!(!current.path().join("work.json").exists());
     }
 
     #[test]

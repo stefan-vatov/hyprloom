@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.3.10] - 2026-08-29
+
+### Fixed
+
+- Record HyprFlow migration completion so deleting a migrated snapshot does not resurrect it on the next command
+
 ## [0.3.9] - 2026-08-28
 
 ### Fixed
