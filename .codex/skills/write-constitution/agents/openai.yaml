@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Constitution"
+  short_description: "Generate CONSTITUTION.md capturing project soul, principles,..."
+  default_prompt: "Use $write-constitution for this request: Generate CONSTITUTION.md capturing project soul, principles,."

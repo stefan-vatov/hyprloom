@@ -1,0 +1,4 @@
+interface:
+  display_name: "Constitution Decide"
+  short_description: "Partition effects, refuse only forbidden ones, and complete the lawful request."
+  default_prompt: "Use $constitution-decide for this request: classify every requested and transient effect before action, discard only unavailable effects, complete every lawful survivor, and produce the cited decision record."

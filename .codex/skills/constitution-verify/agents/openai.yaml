@@ -1,0 +1,4 @@
+interface:
+  display_name: "Constitution Verify"
+  short_description: "Produce per-effect findings and a cited constitutional PASS/FAIL verdict."
+  default_prompt: "Use $constitution-verify for this request: inventory every requested and transient effect, build the four-outcome ledger from artifacts and traces, then render the cited PASS/FAIL gate report."
