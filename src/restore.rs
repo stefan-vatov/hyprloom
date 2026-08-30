@@ -6254,7 +6254,8 @@ mod tests {
             },
         );
 
-        let report = restore_session(&session, &mock, &config, false, true).unwrap();
+        // Fixture PIDs must not pick up metadata from unrelated host processes.
+        let report = restore_session_with_process_info(&session, &mock, &EmptyProcessInfo, &config, RestoreMode::new(false, true)).unwrap();
 
         // 2 skipped as duplicates, 1 failed as binary-not-found.
         assert_eq!(report.skipped, 2, "expected 2 skipped; got {}", report.skipped);
