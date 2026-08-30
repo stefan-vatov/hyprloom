@@ -74,6 +74,14 @@ hyprloom autosave --install    # set up systemd timer
 hyprloom autosave --uninstall  # remove systemd timer
 ```
 
+## Structured restore reports
+
+For machine-readable per-window outcomes, use
+`hyprloom restore NAME --reconcile --report-json` or
+`hyprloom replace NAME --report-json`. See [Structured restore reports](docs/restore-reporting.md)
+for the versioned schema, dry-run semantics, and handling partial or unavailable
+reports. The flag is optional; existing text output is unchanged.
+
 ## Configuration
 
 Config file: `~/.config/hyprloom/config.toml`

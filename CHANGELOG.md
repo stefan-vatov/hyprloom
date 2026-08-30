@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## Unreleased
+
+### Added
+
+- Added `--report-json` to reconciliation and replacement so scripts and UIs
+  can distinguish existing, adjusted, restored, skipped, failed, and extra
+  windows by workspace. Existing CLI text output and exit codes are unchanged.
+- Added explicit dry-run and replacement-recovery context to structured reports.
+
+### Fixed
+
+- Fixed restore launching a duplicate terminal when saved terminals shared a
+  generic application signature but both original windows were still open.
+
+### Compatibility
+
+- CLI flags and snapshot formats remain compatible. Rust consumers constructing
+  `ReconcileReport` with a struct literal must initialize its new `windows`
+  field, or use `..ReconcileReport::default()`; existing report fields remain.
+- This work is a local development build, not a published release.
+
+## 0.4.0-dev.2 (local) - 2026-08-30
+
+### Fixed
+
+- Fixed reopened Omarchy web apps such as X being treated as missing despite
+  an existing window with the same site/profile identity. Unique candidates
+  are reused; multiple candidates are skipped without launching another copy.
+- Saved snapshots remain compatible; no recapture is needed.
+
 ## [0.3.10] - 2026-08-29
 
 ### Fixed

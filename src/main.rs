@@ -66,6 +66,9 @@ enum Commands {
         /// Match existing windows, repair only mismatches, and leave extras alone
         #[arg(long)]
         reconcile: bool,
+        /// Emit a versioned per-window JSON report instead of human-readable results
+        #[arg(long, requires = "reconcile", conflicts_with = "on_login")]
+        report_json: bool,
         /// Use deterministic greedy matching instead of global assignment
         #[arg(long, requires = "reconcile")]
         greedy: bool,
@@ -80,6 +83,9 @@ enum Commands {
     Replace {
         /// Session name to replace the current desktop with
         name: String,
+        /// Emit a versioned per-window JSON report after replacement and recovery
+        #[arg(long)]
+        report_json: bool,
     },
     /// List saved sessions
     List,
@@ -182,6 +188,7 @@ fn main() {
             name,
             dry_run,
             reconcile,
+            report_json,
             greedy,
             max_age,
             on_login,
@@ -207,7 +214,7 @@ fn main() {
                         match hyprloom::session::list_autosave_sessions(&sessions_dir) {
                             Ok(autosaves) if !autosaves.is_empty() => {
                                 let fallback_name = &autosaves[0].name;
-                                cli_println!("Session '{}' not found. Falling back to '{}'.", name, fallback_name);
+                                restore_notice(report_json, &format!("Session '{name}' not found. Falling back to '{fallback_name}'."));
                                 match load_session(fallback_name, &sessions_dir) {
                                     Ok(s) => s,
                                     Err(e) => {
@@ -237,21 +244,27 @@ fn main() {
                     Ok(max_duration) => {
                         let age = chrono::Utc::now() - session.created_at;
                         if age < chrono::Duration::zero() {
-                            cli_println!(
-                                "Session '{}' has a future timestamp (created {}).",
-                                session.name,
-                                session.created_at.format("%Y-%m-%d %H:%M")
+                            restore_notice(
+                                report_json,
+                                &format!(
+                                    "Session '{}' has a future timestamp (created {}).",
+                                    session.name,
+                                    session.created_at.format("%Y-%m-%d %H:%M")
+                                ),
                             );
-                            cli_println!("Skipping restore (max age: {}).", age_str);
+                            restore_notice(report_json, &format!("Skipping restore (max age: {age_str})."));
                             return;
                         }
                         if age > max_duration {
-                            cli_println!(
-                                "Session '{}' is too old (created {}).",
-                                session.name,
-                                session.created_at.format("%Y-%m-%d %H:%M")
+                            restore_notice(
+                                report_json,
+                                &format!(
+                                    "Session '{}' is too old (created {}).",
+                                    session.name,
+                                    session.created_at.format("%Y-%m-%d %H:%M")
+                                ),
                             );
-                            cli_println!("Skipping restore (max age: {}).", age_str);
+                            restore_notice(report_json, &format!("Skipping restore (max age: {age_str})."));
                             return;
                         }
                     }
@@ -268,22 +281,26 @@ fn main() {
                 let strategy = if greedy { MatchingStrategy::Greedy } else { MatchingStrategy::Global };
                 match hyprloom::restore::reconcile_session_with_strategy(&session, &hyprctl, &process_info, &config, dry_run, cli.verbose, strategy) {
                     Ok(report) => {
-                        if dry_run {
-                            cli_println!("Dry run for reconciliation of '{}':", session.name);
+                        if report_json {
+                            print_json_report(&session.name, "reconcile", dry_run, &report, None);
                         } else {
-                            cli_println!("Reconciled session '{}':", session.name);
-                        }
-                        cli_println!(
-                            "  {} unchanged, {} moved, {} launched, {} extra left alone, {} skipped, {} failed",
-                            report.unchanged,
-                            report.moved,
-                            report.launched,
-                            report.extras,
-                            report.skipped,
-                            report.failed
-                        );
-                        for detail in &report.details {
-                            cli_println!("  {}", detail);
+                            if dry_run {
+                                cli_println!("Dry run for reconciliation of '{}':", session.name);
+                            } else {
+                                cli_println!("Reconciled session '{}':", session.name);
+                            }
+                            cli_println!(
+                                "  {} unchanged, {} moved, {} launched, {} extra left alone, {} skipped, {} failed",
+                                report.unchanged,
+                                report.moved,
+                                report.launched,
+                                report.extras,
+                                report.skipped,
+                                report.failed
+                            );
+                            for detail in &report.details {
+                                cli_println!("  {}", detail);
+                            }
                         }
                         if report.failed > 0 || report.skipped > 0 {
                             std::process::exit(1);
@@ -318,7 +335,7 @@ fn main() {
             }
         }
 
-        Commands::Replace { name } => {
+        Commands::Replace { name, report_json } => {
             let session = match load_session(&name, &sessions_dir) {
                 Ok(session) => session,
                 Err(error) => {
@@ -389,28 +406,46 @@ fn main() {
                 },
             ) {
                 Ok(report) => {
-                    cli_println!(
-                        "Replaced desktop with '{}' ({} unchanged, {} moved, {} launched, {} extra left alone, {} failed). Safety backup: '{}'.",
-                        session.name,
-                        report.unchanged,
-                        report.moved,
-                        report.launched,
-                        report.extras,
-                        report.failed,
-                        backup_name
-                    );
-                    for detail in &report.details {
-                        cli_println!("  {detail}");
+                    if !report_json {
+                        cli_println!(
+                            "Replaced desktop with '{}' ({} unchanged, {} moved, {} launched, {} extra left alone, {} failed). Safety backup: '{}'.",
+                            session.name,
+                            report.unchanged,
+                            report.moved,
+                            report.launched,
+                            report.extras,
+                            report.failed,
+                            backup_name
+                        );
+                        for detail in &report.details {
+                            cli_println!("  {detail}");
+                        }
                     }
                     if report.failed > 0 || report.skipped > 0 {
                         cli_eprintln!("Replacement was incomplete; attempting safety recovery from '{}'.", backup_name);
-                        if report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, &config, cli.verbose) {
+                        let recovered = report_non_destructive_safety_recovery(&backup, &hyprctl, &process_info, &config, cli.verbose);
+                        if recovered {
                             clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain);
+                        }
+                        if report_json {
+                            print_json_report(
+                                &session.name,
+                                "replace",
+                                false,
+                                &report,
+                                Some(if recovered { "succeeded" } else { "failed" }),
+                            );
                         }
                         std::process::exit(1);
                     } else if !clear_recovery_marker_and_rotate(&sessions_dir, config.general.autosave_retain) {
                         cli_eprintln!("Replacement completed, but its recovery marker could not be cleared; retry after checking the session store.");
+                        if report_json {
+                            print_json_report(&session.name, "replace", false, &report, None);
+                        }
                         std::process::exit(1);
+                    }
+                    if report_json {
+                        print_json_report(&session.name, "replace", false, &report, None);
                     }
                 }
                 Err(error) => {
@@ -870,6 +905,30 @@ fn replacement_close_started(
             return None;
         }
         thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn restore_notice(report_json: bool, message: &str) {
+    if report_json {
+        cli_eprintln!("{message}");
+    } else {
+        cli_println!("{message}");
+    }
+}
+
+fn print_json_report(name: &str, operation: &str, dry_run: bool, report: &hyprloom::restore::ReconcileReport, recovery: Option<&str>) {
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "operation": operation,
+        "session": name,
+        "dry_run": dry_run,
+        "report": report,
+        "recovery": recovery,
+    });
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = serde_json::to_writer(&mut stdout, &document).and_then(|()| writeln!(stdout).map_err(serde_json::Error::io)) {
+        cli_eprintln!("Error writing restore report: {error}");
+        std::process::exit(1);
     }
 }
 
