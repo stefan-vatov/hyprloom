@@ -3971,9 +3971,27 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
         return webapp_launch_is_trusted(client, &command);
     }
 
+    // Identity equality alone must not authorize executing a path: a
+    // client can self-report a path-like class, so identity-derived
+    // commands must be safe single basenames.
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
-        .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command))
+        .any(|identity| {
+            !identity.is_empty()
+                && identity.eq_ignore_ascii_case(&command)
+                && is_safe_launch_basename(&command)
+        })
+}
+
+/// Whether a command is a single safe path component (no directory
+/// separators, no dot components), so an identity-derived executable can
+/// only resolve through PATH.
+fn is_safe_launch_basename(command: &str) -> bool {
+    !command.is_empty()
+        && !command.contains('/')
+        && !command.contains('\\')
+        && command != "."
+        && command != ".."
 }
 
 /// The nested shell a kitty hint launch will execute, when one was captured.
@@ -6678,6 +6696,28 @@ mod tests {
             "the plan must be described: {:?}",
             report.details
         );
+    }
+
+    #[test]
+    fn untrusted_launch_rejects_path_like_identity_commands() {
+        // A client can self-report a path-like class; identity equality must
+        // not authorize executing an arbitrary path (gqg.35/sk0 boundary).
+        let client = make_client("/tmp/evil", 1, [0, 0], [800, 600], false, 0, "/tmp/evil", vec![], None);
+        assert!(!launch_command_is_trusted(&client, &Config::default()));
+    }
+
+    #[test]
+    fn untrusted_launch_rejects_dot_component_identities() {
+        for identity in [".", ".."] {
+            let client = make_client(identity, 1, [0, 0], [800, 600], false, 0, identity, vec![], None);
+            assert!(!launch_command_is_trusted(&client, &Config::default()), "identity {identity:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn trusted_launch_keeps_safe_basename_identity() {
+        let client = make_client("kitty", 1, [0, 0], [800, 600], false, 0, "kitty", vec![], None);
+        assert!(launch_command_is_trusted(&client, &Config::default()));
     }
 
     #[test]
