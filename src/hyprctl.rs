@@ -201,7 +201,10 @@ impl HyprctlClient for RealHyprctl {
         if !output.status.success() {
             return Err(HyprctlError::CommandFailed(String::from_utf8_lossy(&output.stderr).to_string()));
         }
-        Ok(())
+        // Hyprland's batch CLI exits zero after a completed request even
+        // when individual dispatchers rejected their command: process
+        // success and per-command success are separate signals.
+        validate_batch_replies(&output.stdout, commands)
     }
 
     fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
@@ -239,6 +242,46 @@ pub fn build_batch_command(commands: &[String]) -> Result<String, HyprctlError> 
         batch.push_str(&escape_batch_command(command));
     }
     Ok(batch)
+}
+
+/// Validate a batch reply document against the logical batch commands.
+///
+/// The compositor answers each batch command with a reply (`ok`, `Invalid
+/// dispatcher`, or a dispatcher-specific error) joined by three newlines.
+/// Process exit status alone cannot express per-command failure, so the
+/// reply count must match the command count and every reply must be the
+/// protocol success token.
+fn validate_batch_replies(stdout: &[u8], commands: &[String]) -> Result<(), HyprctlError> {
+    let text = String::from_utf8_lossy(stdout);
+    let replies: Vec<&str> = text.split("\n\n\n").map(str::trim).filter(|reply| !reply.is_empty()).collect();
+    if replies.len() != commands.len() {
+        return Err(HyprctlError::CommandFailed(format!(
+            "batch reply count mismatch: {} replies for {} commands: {}",
+            replies.len(),
+            commands.len(),
+            bounded_reply(&text)
+        )));
+    }
+    for (index, reply) in replies.iter().enumerate() {
+        if *reply != "ok" {
+            let command = commands.get(index).map_or("?", String::as_str);
+            return Err(HyprctlError::CommandFailed(format!(
+                "batch command {index} ('{}') was rejected by the compositor: {}",
+                command,
+                bounded_reply(reply)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn bounded_reply(text: &str) -> String {
+    const LIMIT: usize = 200;
+    let mut bounded: String = text.chars().take(LIMIT).collect();
+    if text.chars().count() > LIMIT {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn escape_batch_command(command: &str) -> String {
@@ -445,6 +488,37 @@ mod tests {
 
         assert_eq!(monitor.x, None);
         assert_eq!(monitor.y, None);
+    }
+
+    #[test]
+    fn test_batch_reply_validation_accepts_all_success() {
+        let commands = ["workspace 2".to_owned(), "dispatch x".to_owned()];
+        assert!(validate_batch_replies(b"ok\n\n\nok\n", &commands).is_ok());
+    }
+
+    #[test]
+    fn test_batch_reply_validation_rejects_semantic_error_with_exit_zero() {
+        let commands = ["workspace 2".to_owned(), "movetoworkspacesilent 4,address:0x1".to_owned()];
+        let error = validate_batch_replies(b"ok\n\n\nInvalid dispatcher\n", &commands).expect_err("a semantic rejection must not pass as success");
+        let message = error.to_string();
+        assert!(message.contains("command 1"), "error must carry the command index: {message}");
+        assert!(message.contains("Invalid dispatcher"), "error must carry the reply: {message}");
+    }
+
+    #[test]
+    fn test_batch_reply_validation_rejects_count_mismatch() {
+        let commands = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        let error = validate_batch_replies(b"ok\n\n\nok\n", &commands).expect_err("too few replies must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("3 commands"), "error must state the expectation: {message}");
+    }
+
+    #[test]
+    fn test_batch_reply_validation_rejects_malformed_output() {
+        let commands = ["workspace 2".to_owned()];
+        let error =
+            validate_batch_replies(b"compositor poetry without protocol replies\n", &commands).expect_err("malformed output must be rejected");
+        assert!(!error.to_string().is_empty());
     }
 
     #[test]

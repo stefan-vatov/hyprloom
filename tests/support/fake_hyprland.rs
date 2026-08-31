@@ -257,42 +257,54 @@ impl Compositor {
     fn answer_batch(&mut self, payload: &str) -> Reply {
         let commands = split_batch(payload);
         self.pending_operations = commands.iter().map(|command| logical_operation(command)).collect();
-        if let Some(rejection) = commands.iter().find_map(|command| self.step_batch(command)) {
-            return rejection;
+        let mut replies: Vec<String> = Vec::new();
+        let rejected_at = commands.iter().position(|command| {
+            let reply = self.step_batch(command);
+            let rejected = reply != "ok";
+            replies.push(reply);
+            rejected
+        });
+        if rejected_at.is_some() {
+            return self.finish_batch_rejection(replies);
         }
-        Reply::ok("ok\n")
+        Reply::ok(&format!("{}\n", replies.join("\n\n\n")))
     }
 
-    /// Apply one batch operation; `Some` carries the scripted rejection.
-    fn step_batch(&mut self, command: &str) -> Option<Reply> {
+    /// Apply one batch operation and return the reply text: `ok` on
+    /// success, otherwise the semantic error the compositor would answer
+    /// that command with.
+    fn step_batch(&mut self, command: &str) -> String {
         let trimmed = command.trim();
         self.dispatch_count += 1;
         if let Some(fault) = self.matching_fault(trimmed) {
-            return Some(self.reject_batch(&fault.stderr, fault.exit_code));
+            return fault.stderr;
         }
         let Some(logical) = trimmed.strip_prefix("dispatch ") else {
-            return Some(self.reject_batch(&format!("fake-hyprctl: invalid dispatch: {trimmed}\n"), 1));
+            return format!("fake-hyprctl: invalid dispatch: {trimmed}");
         };
         match parse_dispatch_args(logical) {
             Ok(args) => {
                 self.apply(&args);
                 self.apply_mapping_events();
-                None
+                "ok".to_owned()
             }
-            Err(error) => Some(self.reject_batch(&format!("fake-hyprctl: invalid dispatch syntax: {error}\n"), 1)),
+            Err(error) => format!("fake-hyprctl: invalid dispatch syntax: {error}"),
         }
     }
 
-    fn reject_batch(&self, stderr: &str, code: i32) -> Reply {
+    /// A rejected batch stops replying there: the audit dialects separate a
+    /// semantic rejection (exit zero, error reply) from a transport failure
+    /// (nonzero exit, stderr carrying the final reply).
+    fn finish_batch_rejection(&self, mut replies: Vec<String>) -> Reply {
         match self.scenario.batch_rejection {
             BatchRejection::ExitNonzero => Reply {
-                code: Some(code),
+                code: Some(1),
                 stdout: String::new(),
-                stderr: stderr.to_owned(),
+                stderr: format!("{}\n", replies.pop().unwrap_or_default()),
             },
             BatchRejection::ExitZeroText => Reply {
                 code: Some(0),
-                stdout: "Invalid dispatcher\n".to_owned(),
+                stdout: format!("{}\n", replies.join("\n\n\n")),
                 stderr: String::new(),
             },
         }

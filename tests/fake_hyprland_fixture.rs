@@ -192,7 +192,7 @@ fn batch_rejection_dialects_separate_exit_from_text() {
     let mut scenario = base_scenario(vec![client_json("0xone", "stable-one", 3, 1)]);
     scenario.faults.push(Fault {
         matches: "focuswindow".to_owned(),
-        stderr: "fake rejected focus\n".to_owned(),
+        stderr: "Invalid dispatcher\n".to_owned(),
         exit_code: 1,
     });
     let batch = "dispatch movetoworkspacesilent 4,address:0xone ; dispatch focuswindow address:0xone";
@@ -201,7 +201,7 @@ fn batch_rejection_dialects_separate_exit_from_text() {
     let fake = FakeHyprland::spawn(&mut case, scenario.clone());
     let reply = fake.call(&["--batch", batch]);
     assert_eq!(reply.code, Some(1), "default dialect must fail the batch");
-    assert!(reply.stderr_str().contains("fake rejected focus"));
+    assert!(reply.stderr_str().contains("Invalid dispatcher"));
     assert_eq!(fake.topology().clients[0]["workspace"]["id"], 4, "ops before the failure stay applied");
 
     scenario.batch_rejection = BatchRejection::ExitZeroText;
@@ -316,6 +316,38 @@ fn workspace_repair_uses_batch_and_second_pass_converges() {
         "second pass is idempotent",
         fake.dispatch_count() == after_first,
         "converged topology must not dispatch again",
+    );
+}
+
+#[test]
+fn exit_zero_batch_semantic_error_fails_the_repair() {
+    // Hyprland's batch CLI exits zero after a completed request even when a
+    // dispatcher rejected its command: the reply text is the only
+    // per-command signal. The repair must fail closed instead of reporting
+    // a successful move.
+    let mut scenario = base_scenario(vec![client_json("0xone", "stable-one", 3, 1)]);
+    scenario.batch_rejection = BatchRejection::ExitZeroText;
+    scenario.faults.push(Fault {
+        matches: "movetoworkspacesilent".to_owned(),
+        stderr: "Invalid dispatcher".to_owned(),
+        exit_code: 1,
+    });
+    let session = session_json(4);
+    let (mut case, fake) = cli_case("batch-exit-zero-e2e", scenario, &session);
+
+    let run = case.run("restore", &["restore", "fake-fixture", "--reconcile", "--report-json"]);
+    let report = case.assert_single_json_document("exit-zero semantic error still reports", &run);
+    case.assert("exit is nonzero", run.code() == Some(1), "an unconfirmed repair must fail");
+    case.assert("failure is per window", report["report"]["failed"] == 1, &format!("{report}"));
+    case.assert(
+        "diagnostic carries the compositor reply",
+        report["report"]["windows"][0]["message"].as_str().unwrap().contains("Invalid dispatcher"),
+        &format!("{report}"),
+    );
+    case.assert(
+        "topology is preserved on the failed repair",
+        fake.topology().clients[0]["workspace"]["id"] == 3,
+        "no mutation may survive the rejected batch",
     );
 }
 
