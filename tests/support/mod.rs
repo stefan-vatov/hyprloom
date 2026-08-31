@@ -12,7 +12,13 @@
 //! keeps the fixture surface explicit, and avoids `assert_cmd`'s deprecated
 //! `cargo_bin!` lookup. `tempfile` owns the isolated roots.
 
-#![allow(clippy::missing_panics_doc, clippy::must_use_candidate, clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    dead_code,
+    clippy::missing_panics_doc,
+    clippy::must_use_candidate,
+    clippy::unwrap_used,
+    clippy::expect_used
+)]
 
 use hyprloom::session::{save_session, Session};
 use serde_json::{json, Value};
@@ -53,6 +59,11 @@ impl Invocation {
     /// Whether the CLI exited with status 0.
     pub fn success(&self) -> bool {
         self.code == Some(0)
+    }
+
+    /// The CLI exit status, when it exited normally.
+    pub const fn code(&self) -> Option<i32> {
+        self.code
     }
 
     /// Captured stdout as lossy UTF-8.
