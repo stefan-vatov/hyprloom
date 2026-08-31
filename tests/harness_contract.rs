@@ -70,11 +70,17 @@ fn harness_runs_real_binary_in_isolated_roots_and_cleans_up_on_success() {
             run.stdout_str() == "No saved sessions.\n",
             &format!("stdout was: {:?}", run.stdout_str()),
         );
+        // The helper's dispatch start marker is machine-consumable stderr
+        // emitted on every operation that acquires the operation lock; no
+        // other stderr noise is allowed on success.
+        let stderr = run.stderr_str();
+        let beyond_marker = !stderr.lines().any(|line| !line.starts_with("dispatch: started "));
         case.assert(
-            "no stderr on success",
-            run.stderr_str().is_empty(),
-            &format!("stderr was: {:?}", run.stderr_str()),
+            "dispatch marker announces the operation start",
+            stderr == "dispatch: started list -\n",
+            &format!("stderr was: {stderr:?}"),
         );
+        case.assert("no stderr beyond the dispatch marker", beyond_marker, &format!("stderr was: {stderr:?}"));
 
         let events = case.read_trace();
         let cli_runs = events.iter().filter(|event| event["component"] == "cli").count();

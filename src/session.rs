@@ -1140,6 +1140,48 @@ pub fn session_fingerprint(session: &Session) -> Result<String, SessionError> {
     Ok(fingerprint)
 }
 
+/// Length in hex characters of a content revision (the first 8 digest bytes).
+pub const SESSION_REVISION_HEX_LEN: usize = 16;
+
+/// Report whether `revision` is shaped like a content revision token.
+#[must_use]
+pub fn is_revision_format(revision: &str) -> bool {
+    revision.len() == SESSION_REVISION_HEX_LEN && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Compute the content revision of a stored session file.
+///
+/// The revision is the first 16 hexadecimal characters of the SHA-256 digest
+/// over the raw session file bytes.  It is content-addressed and opaque: it
+/// is recomputed from the bytes on disk at every read and never persisted, so
+/// it always reflects exactly what a reader would load.
+///
+/// # Errors
+///
+/// Returns an error when the name is invalid, the snapshot is missing or
+/// unsafe, or its bytes cannot be read within the storage safety limits.
+pub fn session_revision(name: &str, sessions_dir: &Path) -> Result<String, SessionError> {
+    validate_session_name(name)?;
+    if !existing_sessions_dir(sessions_dir)? {
+        return Err(SessionError::NotFound(name.to_string()));
+    }
+    let path = sessions_dir.join(format!("{name}.json"));
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => return Err(SessionError::UnsafePath(name.to_string())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Err(SessionError::NotFound(name.to_string())),
+        Err(error) => return Err(SessionError::Io(error)),
+    }
+    ensure_private_file(&path, name)?;
+    let bytes = read_limited_file(&path, name)?;
+    let digest = Sha256::digest(&bytes);
+    let mut revision = String::with_capacity(SESSION_REVISION_HEX_LEN);
+    for byte in &digest[..8] {
+        let _ = write!(revision, "{byte:02x}");
+    }
+    Ok(revision)
+}
+
 fn existing_target_digest(backup_name: &str, target_name: Option<&str>, sessions_dir: &Path) -> Result<Option<String>, SessionError> {
     let Some(marker) = replace_marker(sessions_dir)? else {
         return Ok(None);
@@ -1735,6 +1777,49 @@ mod tests {
         let loaded = load_session("work", dir.path()).unwrap();
         assert_eq!(loaded.name, "work");
         assert_eq!(loaded.clients.len(), 1);
+    }
+
+    #[test]
+    fn test_session_revision_is_first_16_hex_of_sha256_over_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        save_session(&make_test_session("work"), dir.path()).unwrap();
+        let bytes = std::fs::read(dir.path().join("work.json")).unwrap();
+        let digest = Sha256::digest(&bytes);
+        let mut expected = String::new();
+        for byte in &digest[..8] {
+            let _ = write!(expected, "{byte:02x}");
+        }
+
+        let revision = session_revision("work", dir.path()).unwrap();
+
+        assert_eq!(revision.len(), 16);
+        assert_eq!(revision, expected);
+    }
+
+    #[test]
+    fn test_session_revision_is_stable_and_tracks_file_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        save_session(&make_test_session("work"), dir.path()).unwrap();
+        let first = session_revision("work", dir.path()).unwrap();
+        assert_eq!(first, session_revision("work", dir.path()).unwrap());
+
+        let mut edited = make_test_session("work");
+        edited.clients.push(make_test_session("other").clients.pop().unwrap());
+        save_session(&edited, dir.path()).unwrap();
+
+        assert_ne!(session_revision("work", dir.path()).unwrap(), first);
+    }
+
+    #[test]
+    fn test_session_revision_missing_session_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(session_revision("work", dir.path()), Err(SessionError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_session_revision_rejects_invalid_names() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(session_revision("../escape", dir.path()), Err(SessionError::InvalidName(_))));
     }
 
     #[test]

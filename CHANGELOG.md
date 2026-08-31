@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Added `list --json`, a versioned machine inventory (`deskloom.inventory`,
+  schema version 1) reporting each session's name, content revision (first 16
+  hex characters of the SHA-256 over the session file bytes, recomputed at
+  read time), window count, creation time (RFC 3339), and autosave flag.
+  Human `list` output is unchanged.
+- Added `--if-revision <rev>` to `save --force`, `replace`, and `delete`: the
+  operation runs only if the stored session still has the given content
+  revision. A stale revision or a missing session exits with status 3,
+  printing a `revision-conflict` JSON document on stdout and a plain-text
+  explanation on stderr, and modifies nothing.
+- Added a `dispatch: started <operation> <name>` stderr line, emitted when an
+  operation actually acquires the shared hyprloom operation lock and starts,
+  so consumers that queue on the helper can measure true start times.
 - Added `--report-json` to reconciliation and replacement so scripts and UIs
   can distinguish existing, adjusted, restored, skipped, failed, and extra
   windows by workspace. Existing CLI text output and exit codes are unchanged.
@@ -20,6 +33,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Compatibility
 
+- Every hyprloom invocation now writes one `dispatch: started ...` line to
+  stderr once the operation lock is acquired. Scripts asserting empty stderr
+  on success must allow this single marker line.
 - CLI flags and snapshot formats remain compatible. Rust consumers constructing
   `ReconcileReport` with a struct literal must initialize its new `windows`
   field, or use `..ReconcileReport::default()`; existing report fields remain.

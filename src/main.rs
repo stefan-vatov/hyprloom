@@ -13,8 +13,9 @@ use hyprloom::restore::{
     validate_safety_snapshot_with_config, ReplaceMarkerContext,
 };
 use hyprloom::session::{
-    autosave_name_now, clear_replace_marker, delete_session, list_sessions, load_session, migrate_legacy_sessions, replace_marker, rotate_autosaves,
-    save_session, session_exists, session_fingerprint, validate_user_session_name, OperationLock, ReplacePhase,
+    autosave_name_now, clear_replace_marker, delete_session, is_revision_format, list_sessions, load_session, migrate_legacy_sessions,
+    replace_marker, rotate_autosaves, save_session, session_exists, session_fingerprint, session_revision, validate_user_session_name, OperationLock,
+    ReplacePhase,
 };
 use std::io::Write;
 use std::path::Path;
@@ -55,6 +56,10 @@ enum Commands {
         /// Overwrite without prompt
         #[arg(short, long)]
         force: bool,
+        /// Overwrite only if the stored session still has this content revision
+        /// (16 hex characters, as reported by `list --json`)
+        #[arg(long)]
+        if_revision: Option<String>,
     },
     /// Restore a saved session
     Restore {
@@ -86,13 +91,25 @@ enum Commands {
         /// Emit a versioned per-window JSON report after replacement and recovery
         #[arg(long)]
         report_json: bool,
+        /// Proceed only if the stored session still has this content revision
+        /// (16 hex characters, as reported by `list --json`)
+        #[arg(long)]
+        if_revision: Option<String>,
     },
     /// List saved sessions
-    List,
+    List {
+        /// Emit a versioned machine-readable session inventory
+        #[arg(long)]
+        json: bool,
+    },
     /// Delete a saved session
     Delete {
         /// Session name to delete
         name: String,
+        /// Delete only if the stored session still has this content revision
+        /// (16 hex characters, as reported by `list --json`)
+        #[arg(long)]
+        if_revision: Option<String>,
     },
     /// Show config info
     Config,
@@ -141,6 +158,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // Machine-visible start marker for consumers that queue on this helper:
+    // it fires exactly when this process acquired the shared operation lock
+    // and begins its operation, so deadline logic can measure true start.
+    let (operation, operation_name) = dispatch_target(&cli.command, &config);
+    cli_eprintln!("dispatch: started {operation} {operation_name}");
     if let Err(error) = migrate_legacy_sessions(&sessions_dir, &legacy_sessions_dir()) {
         cli_eprintln!("Warning: could not migrate legacy HyprFlow sessions: {error}");
     }
@@ -156,13 +178,14 @@ fn main() {
     }
 
     match cli.command {
-        Commands::Save { name, force } => {
+        Commands::Save { name, force, if_revision } => {
             let name = name.unwrap_or_else(|| config.general.default_session.clone());
 
             if let Err(error) = validate_user_session_name(&name) {
                 cli_eprintln!("Error: {error}");
                 std::process::exit(1);
             }
+            guard_if_revision(&name, &sessions_dir, if_revision.as_deref());
 
             if !force && session_exists(&name, &sessions_dir) && name != "latest" {
                 cli_eprintln!("Session '{}' already exists. Use --force to overwrite.", name);
@@ -348,7 +371,14 @@ fn main() {
             }
         }
 
-        Commands::Replace { name, report_json } => {
+        Commands::Replace {
+            name,
+            report_json,
+            if_revision,
+        } => {
+            // The revision guard runs before loading or capturing anything so
+            // a stale consumer mutates nothing, not even a safety backup.
+            guard_if_revision(&name, &sessions_dir, if_revision.as_deref());
             let session = match load_session(&name, &sessions_dir) {
                 Ok(session) => session,
                 Err(error) => {
@@ -492,9 +522,11 @@ fn main() {
             }
         }
 
-        Commands::List => match list_sessions(&sessions_dir) {
+        Commands::List { json } => match list_sessions(&sessions_dir) {
             Ok(sessions) => {
-                if sessions.is_empty() {
+                if json {
+                    print_session_inventory(&sessions, &sessions_dir);
+                } else if sessions.is_empty() {
                     cli_println!("No saved sessions.");
                 } else {
                     cli_println!("Saved sessions:");
@@ -516,13 +548,16 @@ fn main() {
             }
         },
 
-        Commands::Delete { name } => match delete_session(&name, &sessions_dir) {
-            Ok(()) => cli_println!("Deleted session '{}'", name),
-            Err(e) => {
-                cli_eprintln!("Error: {}", e);
-                std::process::exit(1);
+        Commands::Delete { name, if_revision } => {
+            guard_if_revision(&name, &sessions_dir, if_revision.as_deref());
+            match delete_session(&name, &sessions_dir) {
+                Ok(()) => cli_println!("Deleted session '{}'", name),
+                Err(e) => {
+                    cli_eprintln!("Error: {}", e);
+                    std::process::exit(1);
+                }
             }
-        },
+        }
 
         Commands::Config => {
             cli_println!("Config path: {}", config_path().display());
@@ -945,9 +980,104 @@ fn print_json_report(name: &str, operation: &str, dry_run: bool, report: &hyprlo
     }
 }
 
+/// Resolve the operation label and target name reported by the dispatch
+/// start marker.  Operations without a session target report `-` so every
+/// marker keeps the same `dispatch: started <operation> <name>` shape.
+fn dispatch_target(command: &Commands, config: &hyprloom::config::Config) -> (&'static str, String) {
+    match command {
+        Commands::Save { name, .. } => ("save", name.clone().unwrap_or_else(|| config.general.default_session.clone())),
+        Commands::Restore { name, .. } => ("restore", name.clone().unwrap_or_else(|| config.general.default_session.clone())),
+        Commands::Replace { name, .. } => ("replace", name.clone()),
+        Commands::Delete { name, .. } => ("delete", name.clone()),
+        Commands::Autosave { .. } => ("autosave", "autosave".to_string()),
+        Commands::List { .. } => ("list", "-".to_string()),
+        Commands::Config => ("config", "-".to_string()),
+        Commands::Recover => ("recover", "-".to_string()),
+    }
+}
+
+/// Enforce an optional `--if-revision` content guard before any mutation.
+///
+/// A malformed revision token is a usage error (exit 1).  A missing session
+/// or a stale revision is a machine-readable conflict: the versioned JSON
+/// document goes to stdout, the full plain-text explanation to stderr, and
+/// the process exits with status 3 without touching anything.
+fn guard_if_revision(name: &str, sessions_dir: &Path, expected: Option<&str>) {
+    let Some(expected) = expected else {
+        return;
+    };
+    if !is_revision_format(expected) {
+        let required = hyprloom::session::SESSION_REVISION_HEX_LEN;
+        cli_eprintln!("Error: --if-revision must be {required} hexadecimal characters (got '{expected}').");
+        std::process::exit(1);
+    }
+    match session_revision(name, sessions_dir) {
+        Ok(actual) if actual.eq_ignore_ascii_case(expected) => {}
+        Ok(actual) => exit_revision_conflict(name, expected, Some(&actual)),
+        Err(hyprloom::session::SessionError::NotFound(_)) => exit_revision_conflict(name, expected, None),
+        Err(error) => {
+            cli_eprintln!("Error: could not read session '{name}' for its revision: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Print the revision-conflict machine document and plain-text explanation,
+/// then exit with the protocol's conflict status.
+fn exit_revision_conflict(name: &str, expected: &str, actual: Option<&str>) -> ! {
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "error": "revision-conflict",
+        "expected": expected,
+        "actual": actual,
+    });
+    {
+        let mut stdout = std::io::stdout().lock();
+        let _ = serde_json::to_writer(&mut stdout, &document).and_then(|()| writeln!(stdout).map_err(serde_json::Error::io));
+    }
+    let current = actual.map_or_else(
+        || "the session is missing".to_string(),
+        |revision| format!("current revision is {revision}"),
+    );
+    cli_eprintln!("Session '{name}' changed since it was read: expected revision {expected}, but the {current}. Nothing was modified.");
+    std::process::exit(3);
+}
+
+/// Emit the versioned machine inventory for `list --json`.  Diagnostics stay
+/// on stderr so the stdout document is always parseable.
+fn print_session_inventory(sessions: &[hyprloom::session::SessionSummary], sessions_dir: &Path) {
+    let mut entries = Vec::with_capacity(sessions.len());
+    for summary in sessions {
+        let revision = match session_revision(&summary.name, sessions_dir) {
+            Ok(revision) => revision,
+            Err(error) => {
+                cli_eprintln!("Error: could not read session '{}' for its revision: {error}", summary.name);
+                std::process::exit(1);
+            }
+        };
+        entries.push(serde_json::json!({
+            "name": summary.name,
+            "revision": revision,
+            "windows": summary.client_count,
+            "created": summary.created_at.to_rfc3339(),
+            "automatic": summary.name.starts_with(hyprloom::session::AUTOSAVE_PREFIX),
+        }));
+    }
+    let document = serde_json::json!({
+        "schema_version": 1,
+        "protocol": "deskloom.inventory",
+        "sessions": entries,
+    });
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = serde_json::to_writer(&mut stdout, &document).and_then(|()| writeln!(stdout).map_err(serde_json::Error::io)) {
+        cli_eprintln!("Error writing session inventory: {error}");
+        std::process::exit(1);
+    }
+}
+
 const fn command_requires_valid_config(command: &Commands) -> bool {
     match command {
-        Commands::List | Commands::Config => false,
+        Commands::List { .. } | Commands::Config => false,
         Commands::Restore { dry_run, .. } => !*dry_run,
         Commands::Autosave { now, install, uninstall } => *now || *install || *uninstall,
         Commands::Save { .. } | Commands::Replace { .. } | Commands::Delete { .. } | Commands::Recover => true,
@@ -956,7 +1086,7 @@ const fn command_requires_valid_config(command: &Commands) -> bool {
 
 fn command_requires_clean_recovery(command: &Commands) -> bool {
     match command {
-        Commands::List | Commands::Config => false,
+        Commands::List { .. } | Commands::Config => false,
         Commands::Restore { dry_run, on_login, .. } => !dry_run && !on_login,
         Commands::Autosave { now, .. } => *now,
         Commands::Save { .. } | Commands::Replace { .. } | Commands::Delete { .. } | Commands::Recover => true,
