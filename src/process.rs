@@ -747,7 +747,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let argv = loop {
             let candidate = real.get_cmdline_argv(pid).unwrap_or_default();
-            if !candidate.is_empty() {
+            // Wait for the exec'd signature, not merely a populated cmdline:
+            // the pre-exec shell state is a different argv.
+            let settled = candidate.first().map(String::as_str) == Some("brave");
+            if settled {
                 break candidate;
             }
             assert!(std::time::Instant::now() < deadline, "the staged process must expose its argv");

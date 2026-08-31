@@ -608,3 +608,129 @@ mod tests {
         assert_eq!(parse_active_window_address(br"{}").unwrap(), None);
     }
 }
+
+/// The compositor dispatch dialect a capability probe negotiated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchProvider {
+    /// Classic hyprctl dispatcher tokens (Hyprland <= 0.55 style).
+    Legacy,
+    /// The Lua provider mode, where legacy tokens are not valid dispatcher
+    /// objects and a dedicated serializer is required.
+    Lua,
+}
+
+/// Classify a provider from its version probe answer.
+#[must_use]
+pub fn detect_dispatch_provider(version: &str) -> DispatchProvider {
+    if version.to_ascii_lowercase().contains("lua") {
+        DispatchProvider::Lua
+    } else {
+        DispatchProvider::Legacy
+    }
+}
+
+#[test]
+fn detect_dispatch_provider_classifies_dialects() {
+    assert_eq!(detect_dispatch_provider("Hyprland 0.54.1"), DispatchProvider::Legacy);
+    assert_eq!(detect_dispatch_provider("Hyprland 0.56.2 (Lua provider)"), DispatchProvider::Lua);
+    assert_eq!(detect_dispatch_provider(""), DispatchProvider::Legacy);
+}
+
+#[test]
+fn dispatch_ops_serialize_for_the_legacy_grammar() {
+    let ops = [
+        DispatchOp::CloseWindow { address: "0x1".to_owned() },
+        DispatchOp::FocusWindow { address: "0x1".to_owned() },
+        DispatchOp::MoveToWorkspaceSilent {
+            workspace: "4".to_owned(),
+            address: "0x1".to_owned(),
+        },
+        DispatchOp::Pin { address: "0x1".to_owned() },
+        DispatchOp::ResizePixel {
+            width: 640,
+            height: 480,
+            address: "0x1".to_owned(),
+        },
+        DispatchOp::MovePixel {
+            x: 10,
+            y: 20,
+            address: "0x1".to_owned(),
+        },
+    ];
+    let serialized: Vec<String> = ops.iter().map(DispatchOp::to_legacy_command).collect();
+    assert_eq!(
+        serialized,
+        vec![
+            "closewindow address:0x1".to_owned(),
+            "focuswindow address:0x1".to_owned(),
+            "movetoworkspacesilent 4,address:0x1".to_owned(),
+            "pin address:0x1".to_owned(),
+            "resizewindowpixel exact 640 480,address:0x1".to_owned(),
+            "movewindowpixel exact 10 20,address:0x1".to_owned(),
+        ]
+    );
+}
+
+/// One logical dispatcher operation, independent of the wire dialect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchOp {
+    /// `closewindow address:<address>`
+    CloseWindow {
+        /// Window address to close.
+        address: String,
+    },
+    /// `focuswindow address:<address>`
+    FocusWindow {
+        /// Window address to focus.
+        address: String,
+    },
+    /// `movetoworkspacesilent <workspace>,address:<address>`
+    MoveToWorkspaceSilent {
+        /// Workspace selector for the destination.
+        workspace: String,
+        /// Address of the window to move.
+        address: String,
+    },
+    /// `pin address:<address>`
+    Pin {
+        /// Address of the window to pin.
+        address: String,
+    },
+    /// `resizewindowpixel exact <width> <height>,address:<address>`
+    ResizePixel {
+        /// Target width in pixels.
+        width: i32,
+        /// Target height in pixels.
+        height: i32,
+        /// Address of the window to resize.
+        address: String,
+    },
+    /// `movewindowpixel exact <x> <y>,address:<address>`
+    MovePixel {
+        /// Target x position in pixels.
+        x: i32,
+        /// Target y position in pixels.
+        y: i32,
+        /// Address of the window to move.
+        address: String,
+    },
+}
+
+impl DispatchOp {
+    /// Serialize for the legacy hyprctl token grammar.
+    #[must_use]
+    pub fn to_legacy_command(&self) -> String {
+        match self {
+            Self::CloseWindow { address } => format!("closewindow address:{address}"),
+            Self::FocusWindow { address } => format!("focuswindow address:{address}"),
+            Self::MoveToWorkspaceSilent { workspace, address } => {
+                format!("movetoworkspacesilent {workspace},address:{address}")
+            }
+            Self::Pin { address } => format!("pin address:{address}"),
+            Self::ResizePixel { width, height, address } => {
+                format!("resizewindowpixel exact {width} {height},address:{address}")
+            }
+            Self::MovePixel { x, y, address } => format!("movewindowpixel exact {x} {y},address:{address}"),
+        }
+    }
+}

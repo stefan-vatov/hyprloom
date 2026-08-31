@@ -1,5 +1,5 @@
 use crate::config::{app_config_for, is_ignored_class, Config};
-use crate::hyprctl::{HyprClient, HyprMonitor, HyprctlClient, HyprctlError};
+use crate::hyprctl::{detect_dispatch_provider, DispatchProvider, HyprClient, HyprMonitor, HyprctlClient, HyprctlError};
 use crate::matching::assign;
 use crate::placement::{
     adapt_client_geometry, build_reconcile_dispatch_commands_with_geometry, find_monitor_by_name, monitor_move_commands, quote_dispatch_token,
@@ -26,6 +26,15 @@ pub enum RestoreError {
     /// A compositor query or dispatch failed.
     #[error("hyprctl error: {0}")]
     Hyprctl(#[from] HyprctlError),
+    /// The compositor dispatch provider cannot be serialized for; dispatch
+    /// operations would be misinterpreted, so mutation must not proceed.
+    #[error("compositor dispatch provider '{provider}' is not supported for '{operation}'; refusing to mutate")]
+    UnsupportedDispatchProvider {
+        /// The detected provider label.
+        provider: String,
+        /// The logical operation that was refused.
+        operation: String,
+    },
     /// The requested session could not be found.
     #[error("no session found")]
     NoSession,
@@ -1286,6 +1295,15 @@ fn restore_session_with_process_info(
     mode: RestoreMode,
 ) -> Result<RestoreReport, RestoreError> {
     let RestoreMode { dry_run, verbose } = mode;
+    if !dry_run {
+        let provider = detect_dispatch_provider(&hyprctl.get_hyprland_version()?);
+        if provider == DispatchProvider::Lua {
+            return Err(RestoreError::UnsupportedDispatchProvider {
+                provider: "Lua".to_owned(),
+                operation: "restore placement".to_owned(),
+            });
+        }
+    }
     let target_count = build_reconcile_targets(session, config).len();
     if target_count > MAX_RECONCILIATION_WINDOWS {
         return Err(RestoreError::TooManyWindows {
@@ -2235,6 +2253,17 @@ fn replace_session_inner(
     config: &Config,
     options: ReplaceOptions<'_>,
 ) -> Result<ReconcileReport, RestoreError> {
+    if !options.dry_run {
+        // Preflight the dispatch provider before any close: a Lua-provider
+        // compositor would misinterpret every legacy dispatcher token.
+        let provider = detect_dispatch_provider(&hyprctl.get_hyprland_version()?);
+        if provider == DispatchProvider::Lua {
+            return Err(RestoreError::UnsupportedDispatchProvider {
+                provider: "Lua".to_owned(),
+                operation: "replacement close and placement".to_owned(),
+            });
+        }
+    }
     let validated_launch_binaries = options
         .validate_targets
         .then(|| validate_replacement_targets_with_binaries(session, config))
@@ -3976,22 +4005,14 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
     // commands must be safe single basenames.
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
-        .any(|identity| {
-            !identity.is_empty()
-                && identity.eq_ignore_ascii_case(&command)
-                && is_safe_launch_basename(&command)
-        })
+        .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command) && is_safe_launch_basename(&command))
 }
 
 /// Whether a command is a single safe path component (no directory
 /// separators, no dot components), so an identity-derived executable can
 /// only resolve through PATH.
 fn is_safe_launch_basename(command: &str) -> bool {
-    !command.is_empty()
-        && !command.contains('/')
-        && !command.contains('\\')
-        && command != "."
-        && command != ".."
+    !command.is_empty() && !command.contains('/') && !command.contains('\\') && command != "." && command != ".."
 }
 
 /// The nested shell a kitty hint launch will execute, when one was captured.
@@ -6710,7 +6731,10 @@ mod tests {
     fn untrusted_launch_rejects_dot_component_identities() {
         for identity in [".", ".."] {
             let client = make_client(identity, 1, [0, 0], [800, 600], false, 0, identity, vec![], None);
-            assert!(!launch_command_is_trusted(&client, &Config::default()), "identity {identity:?} must be rejected");
+            assert!(
+                !launch_command_is_trusted(&client, &Config::default()),
+                "identity {identity:?} must be rejected"
+            );
         }
     }
 
@@ -6718,6 +6742,50 @@ mod tests {
     fn trusted_launch_keeps_safe_basename_identity() {
         let client = make_client("kitty", 1, [0, 0], [800, 600], false, 0, "kitty", vec![], None);
         assert!(launch_command_is_trusted(&client, &Config::default()));
+    }
+
+    /// A compositor whose version probe reports the Lua provider mode.
+    struct LuaProviderMock {
+        inner: MockHyprctl,
+    }
+
+    impl HyprctlClient for LuaProviderMock {
+        fn get_clients(&self) -> Result<Vec<HyprClient>, HyprctlError> {
+            self.inner.get_clients()
+        }
+
+        fn get_monitors(&self) -> Result<Vec<HyprMonitor>, HyprctlError> {
+            self.inner.get_monitors()
+        }
+
+        fn dispatch(&self, args: &str) -> Result<(), HyprctlError> {
+            self.inner.dispatch(args)
+        }
+
+        fn dispatch_batch(&self, commands: &[String]) -> Result<(), HyprctlError> {
+            self.inner.dispatch_batch(commands)
+        }
+
+        fn get_hyprland_version(&self) -> Result<String, HyprctlError> {
+            Ok("Hyprland 0.56.2 (Lua provider)".to_string())
+        }
+    }
+
+    #[test]
+    fn lua_provider_fails_closed_before_any_dispatch_or_close() {
+        let mut current = make_reconcile_window("0xold", "kitty", "kitty", 1, 0, [0, 0], [800, 600]);
+        current.stable_id = Some("stable-old".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        mark_replace_prepared("autosave-recovery", dir.path()).unwrap();
+        let inner = MockHyprctl::new(vec![vec![current]]);
+        let mock = LuaProviderMock { inner };
+
+        let target = make_client("kitty", 1, [0, 0], [800, 600], false, 0, "kitty", vec![], None);
+        let error = replace_session(&make_session(vec![target]), &mock, &EmptyProcessInfo, &Config::default(), false, true)
+            .expect_err("a Lua provider must fail closed before close");
+
+        assert!(matches!(error, RestoreError::UnsupportedDispatchProvider { .. }));
+        assert!(mock.inner.dispatches.borrow().is_empty(), "no close may be dispatched");
     }
 
     #[test]
