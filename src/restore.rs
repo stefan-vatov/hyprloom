@@ -2000,7 +2000,10 @@ fn validate_replacement_targets_with_binaries(session: &Session, config: &Config
         });
     }
     let targets = build_reconcile_targets(session, config);
-    if !session.clients.is_empty() && targets.is_empty() {
+    if targets.is_empty() {
+        // Replacement must always have something restorable: a raw-empty or
+        // fully filtered session would otherwise clear the live desktop and
+        // restore nothing (session-operations canon).
         return Err(RestoreError::NoRestorableTargets);
     }
     if targets.len() > MAX_RECONCILIATION_WINDOWS {
@@ -2586,10 +2589,10 @@ pub fn replacement_target_is_complete_with_backup(
     }
     let target_count = build_reconcile_targets(session, config).len();
     if target_count == 0 {
-        // An intentionally empty replacement is complete once the desktop is
-        // empty.  Treating it as incomplete would restore the old safety
-        // snapshot after a crash even though the requested target was reached.
-        return Ok(hyprctl.get_clients()?.is_empty());
+        // A target with nothing restorable is not a completed replacement:
+        // no validation could have confirmed it, so conservative recovery
+        // (replaying the safety snapshot) is the only safe path.
+        return Ok(false);
     }
     if target_count > MAX_RECONCILIATION_WINDOWS {
         return Ok(false);
@@ -5303,10 +5306,10 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_replacement_target_is_complete_when_desktop_is_empty() {
+    fn test_empty_replacement_target_is_never_classified_complete() {
         let mock = MockHyprctl::new(vec![vec![]]);
 
-        assert!(replacement_target_is_complete_with_backup(&make_session(vec![]), None, &mock, &EmptyProcessInfo, &Config::default(),).unwrap());
+        assert!(!replacement_target_is_complete_with_backup(&make_session(vec![]), None, &mock, &EmptyProcessInfo, &Config::default(),).unwrap());
     }
 
     // ── MockHyprctl ───────────────────────────────────────────────────────────
@@ -7385,14 +7388,14 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_closes_existing_windows_before_reconciling() {
+    fn test_replace_rejects_a_raw_empty_session_before_any_close() {
         let current = make_reconcile_window("0xold", "kitty", "kitty", 1, 0, [0, 0], [800, 600]);
         let mock = ClosingMockHyprctl::new(vec![current]);
-        let report = replace_session(&make_session(vec![]), &mock, &EmptyProcessInfo, &Config::default(), false, true).unwrap();
+        let error = replace_session(&make_session(vec![]), &mock, &EmptyProcessInfo, &Config::default(), false, true)
+            .expect_err("an empty session has nothing restorable and must not clear the desktop");
 
-        assert_eq!(report.launched, 0);
-        assert_eq!(report.failed, 0);
-        assert_eq!(mock.dispatches.borrow().as_slice(), &["closewindow address:0xold"]);
+        assert!(matches!(error, RestoreError::NoRestorableTargets));
+        assert!(mock.dispatches.borrow().is_empty(), "no close may be dispatched for an empty target");
     }
 
     #[test]
@@ -7416,28 +7419,34 @@ mod tests {
 
     #[test]
     fn test_replace_does_not_wait_for_a_new_window_at_a_reused_address() {
-        let mut old_window = make_reconcile_window("0xreused", "kitty", "Old", 1, 0, [0, 0], [800, 600]);
+        let mut old_window = make_reconcile_window("0xreused", "true", "Old", 1, 0, [0, 0], [800, 600]);
         old_window.stable_id = Some("stable-old".to_string());
         let mut replacement = old_window.clone();
         replacement.title = "New".to_string();
         replacement.initial_title = "New".to_string();
         replacement.stable_id = Some("stable-new".to_string());
+        let target = make_client("true", 1, [0, 0], [800, 600], false, 0, "true", vec![], None);
         let mock = MockHyprctl::new(vec![vec![old_window.clone()], vec![old_window], vec![replacement]]);
 
-        let report = replace_session(&make_session(vec![]), &mock, &EmptyProcessInfo, &Config::default(), false, true)
+        let report = replace_session(&make_session(vec![target]), &mock, &EmptyProcessInfo, &Config::default(), false, true)
             .expect("a new client at the old address must not stall close completion");
 
-        assert_eq!(report.extras, 1);
+        assert_eq!(
+            report.matched + report.extras,
+            1,
+            "the new client at the reused address must be accounted exactly once"
+        );
         assert_eq!(mock.dispatches(), vec!["closewindow address:0xreused".to_string()]);
     }
 
     #[test]
     fn test_replace_does_not_close_ambiguous_same_process_windows() {
-        let first = make_reconcile_window("0xfirst", "kitty", "First", 1, 0, [0, 0], [800, 600]);
-        let second = make_reconcile_window("0xsecond", "kitty", "Second", 1, 0, [900, 0], [800, 600]);
+        let first = make_reconcile_window("0xfirst", "true", "First", 1, 0, [0, 0], [800, 600]);
+        let second = make_reconcile_window("0xsecond", "true", "Second", 1, 0, [900, 0], [800, 600]);
         let mock = MockHyprctl::new(vec![vec![first, second]]);
+        let target = make_client("true", 1, [0, 0], [800, 600], false, 0, "true", vec![], None);
 
-        let error = replace_session(&make_session(vec![]), &mock, &EmptyProcessInfo, &Config::default(), false, true)
+        let error = replace_session(&make_session(vec![target]), &mock, &EmptyProcessInfo, &Config::default(), false, true)
             .expect_err("replace must not close an ambiguous same-process window");
 
         assert!(matches!(
@@ -7458,15 +7467,16 @@ mod tests {
         safety_client.pid = Some(captured.pid);
         safety_client.stable_id = captured.stable_id.clone();
 
-        let mut opened_late = make_reconcile_window("0xopened-late", "kitty", "Opened after snapshot", 1, 0, [900, 0], [800, 600]);
+        let mut opened_late = make_reconcile_window("0xopened-late", "true", "Opened after snapshot", 1, 0, [900, 0], [800, 600]);
         opened_late.stable_id = Some("stable-late".to_string());
         let mock = SelectiveClosingMockHyprctl::new(vec![captured, opened_late]);
         let safety_snapshot = make_session(vec![safety_client]);
         let dir = tempfile::tempdir().unwrap();
         mark_replace_prepared("autosave-recovery", dir.path()).unwrap();
 
+        let target = make_client("true", 1, [0, 0], [800, 600], false, 0, "true", vec![], None);
         let report = replace_session_with_marker(
-            &make_session(vec![]),
+            &make_session(vec![target]),
             &mock,
             &EmptyProcessInfo,
             &Config::default(),
@@ -7481,7 +7491,11 @@ mod tests {
         )
         .expect("late windows should not make replacement fail");
 
-        assert_eq!(report.extras, 1);
+        assert_eq!(
+            report.matched + report.extras,
+            1,
+            "the late window must be accounted exactly once without being closed"
+        );
         assert_eq!(mock.dispatches(), vec!["closewindow address:0xcaptured".to_string()]);
     }
 
@@ -7521,8 +7535,9 @@ mod tests {
         safety_snapshot.pid = Some(current.pid);
         safety_snapshot.stable_id = current.stable_id.clone();
         let safety_snapshot = make_session(vec![safety_snapshot]);
+        let target = make_client("true", 1, [0, 0], [800, 600], false, 0, "true", vec![], None);
         let error = replace_session_with_marker(
-            &make_session(vec![]),
+            &make_session(vec![target]),
             &FailingCloseHyprctl { client: current },
             &EmptyProcessInfo,
             &Config::default(),
