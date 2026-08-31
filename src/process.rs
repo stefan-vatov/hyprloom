@@ -100,6 +100,15 @@ pub trait ProcessInfoProvider {
         Err(ProcessError::NotFound(pid))
     }
 
+    /// Return the raw NUL-delimited argv of `pid`, when the provider can
+    /// preserve argument boundaries.  Providers that only model a flattened
+    /// command line return `None`, and consumers fall back to the lossy
+    /// string form.
+    fn get_cmdline_argv(&self, pid: u32) -> Option<Vec<String>> {
+        let _ = pid;
+        None
+    }
+
     /// Return whether a failed start-time read is meaningful for this
     /// provider.  Real `/proc` inspection is reliable enough to fail closed;
     /// small test doubles and integrations that do not model timestamps can
@@ -182,6 +191,18 @@ impl ProcessInfoProvider for RealProcessInfo {
         } else {
             Ok(cmdline)
         }
+    }
+
+    fn get_cmdline_argv(&self, pid: u32) -> Option<Vec<String>> {
+        let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            bytes
+                .split(|&byte| byte == 0)
+                .filter_map(|part| std::str::from_utf8(part).ok())
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
     }
 
     fn get_start_time(&self, pid: u32) -> Result<u64, ProcessError> {
@@ -352,6 +373,26 @@ pub fn select_terminal_process(process_info: &dyn ProcessInfoProvider, terminal_
 
 #[must_use]
 /// Extract a Chromium `--profile-directory` value from a command line.
+/// Extract the `--profile-directory` value from raw argv.
+///
+/// Argument boundaries are authoritative: both the equals form and the
+/// separated form keep values containing spaces verbatim, and parsing stops
+/// at the value instead of consuming later positional arguments.
+pub fn profile_directory_from_argv(argv: &[String]) -> Option<String> {
+    for (index, token) in argv.iter().enumerate() {
+        if let Some(value) = token.strip_prefix("--profile-directory=") {
+            return (!value.is_empty()).then(|| value.to_owned());
+        }
+        if token == "--profile-directory" {
+            let value = argv.get(index + 1)?;
+            return (!value.is_empty() && !value.starts_with('-')).then(|| value.clone());
+        }
+    }
+    None
+}
+
+/// Extract the profile directory from a flattened command line string.
+#[must_use]
 pub fn profile_directory_from_cmdline(cmdline: &str) -> Option<String> {
     let marker = "--profile-directory=";
     let start = cmdline.find(marker)? + marker.len();
@@ -384,7 +425,7 @@ pub fn find_profile_discovery(process_info: &dyn ProcessInfoProvider, root_pid: 
     let mut profiles = HashMap::<String, String>::new();
     let mut complete = true;
     while let Some((pid, known_cmdline)) = queue.pop_front() {
-        let cmdline = known_cmdline.unwrap_or_else(|| {
+        let cmdline = known_cmdline.clone().unwrap_or_else(|| {
             process_info.get_cmdline(pid).unwrap_or_else(|_| {
                 complete = false;
                 String::new()
@@ -392,7 +433,12 @@ pub fn find_profile_discovery(process_info: &dyn ProcessInfoProvider, root_pid: 
         });
         if cmdline.is_empty() {
             complete = false;
-        } else if let Some(profile) = profile_directory_from_cmdline(&cmdline) {
+        } else if let Some(profile) = process_info
+            .get_cmdline_argv(pid)
+            .as_deref()
+            .and_then(profile_directory_from_argv)
+            .or_else(|| profile_directory_from_cmdline(&cmdline))
+        {
             profiles.entry(profile.to_ascii_lowercase()).or_insert(profile);
         }
 
@@ -656,5 +702,59 @@ mod tests {
 
         assert!(discovery.profiles.is_empty());
         assert!(!discovery.complete);
+    }
+
+    #[test]
+    fn profile_directory_from_argv_keeps_values_with_spaces_verbatim() {
+        // The production trigger: [brave, --profile-directory=Profile 1,
+        // https://example] must yield exactly "Profile 1".
+        let argv = [
+            "brave".to_string(),
+            "--profile-directory=Profile 1".to_string(),
+            "https://example".to_string(),
+        ];
+        assert_eq!(profile_directory_from_argv(&argv).as_deref(), Some("Profile 1"));
+    }
+
+    #[test]
+    fn profile_directory_from_argv_handles_separated_form_and_flags() {
+        let separated = ["brave".to_string(), "--profile-directory".to_string(), "Profile 1".to_string()];
+        assert_eq!(profile_directory_from_argv(&separated).as_deref(), Some("Profile 1"));
+
+        let flag_after = ["brave".to_string(), "--profile-directory".to_string(), "--new-window".to_string()];
+        assert_eq!(profile_directory_from_argv(&flag_after), None);
+
+        let absent = ["kitty".to_string(), "--directory".to_string(), "/tmp".to_string()];
+        assert_eq!(profile_directory_from_argv(&absent), None);
+    }
+
+    // The bounded retry loop and its readiness branches form one explicit
+    // state machine for the fork/exec race.
+    #[test]
+    #[allow(clippy::excessive_nesting)]
+    fn real_process_info_reads_exact_argv_boundaries() {
+        // The lossy joined form cannot distinguish these argv shapes; the
+        // argv reader must preserve boundaries.
+        let mut staged = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec -a brave sleep 30")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = staged.id();
+        let real = RealProcessInfo;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let argv = loop {
+            let candidate = real.get_cmdline_argv(pid).unwrap_or_default();
+            if !candidate.is_empty() {
+                break candidate;
+            }
+            assert!(std::time::Instant::now() < deadline, "the staged process must expose its argv");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_eq!(argv.first().map(String::as_str), Some("brave"));
+        assert_eq!(argv.last().map(String::as_str), Some("30"));
+        let _ = staged.kill();
+        let _ = staged.wait();
     }
 }
