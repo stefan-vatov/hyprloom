@@ -98,12 +98,12 @@ pub fn is_ignored_class(class: &str, ignored_classes: &[String]) -> bool {
 /// initial class.
 #[must_use]
 pub fn app_config_for<'a>(config: &'a Config, class: &str, initial_class: &str) -> Option<&'a AppConfig> {
-    config.apps.get(class).or_else(|| config.apps.get(initial_class)).or_else(|| {
-        config
-            .apps
-            .iter()
-            .find_map(|(name, app)| (name.eq_ignore_ascii_case(class) || name.eq_ignore_ascii_case(initial_class)).then_some(app))
-    })
+    let exact = |name: &str| config.apps.get(name);
+    let fold = |name: &str| config.apps.iter().find(|(key, _)| key.eq_ignore_ascii_case(name)).map(|(_, app)| app);
+    exact(class)
+        .or_else(|| exact(initial_class))
+        .or_else(|| fold(class))
+        .or_else(|| fold(initial_class))
 }
 
 /// Optional launch and placement overrides for one application class.
@@ -282,6 +282,29 @@ fn validate_config_structure(config: &Config) -> Result<(), String> {
     if config.apps.len() > MAX_CONFIG_APPS {
         return Err(format!("more than {MAX_CONFIG_APPS} app configurations"));
     }
+    // App keys are matched case-insensitively as a fallback for compositor
+    // class casing, so two keys that fold to the same ASCII case would make
+    // that fallback nondeterministic. Reject the ambiguous namespace with
+    // the conflicting spellings in sorted order.
+    let mut by_fold: HashMap<String, Vec<String>> = HashMap::new();
+    for name in config.apps.keys() {
+        let fold = name.to_ascii_lowercase();
+        by_fold.entry(fold).or_default().push(name.clone());
+    }
+    let mut collisions: Vec<Vec<String>> = by_fold
+        .into_values()
+        .filter(|spellings| spellings.len() > 1)
+        .map(|mut spellings| {
+            spellings.sort();
+            spellings
+        })
+        .collect();
+    collisions.sort();
+    if let Some(spellings) = collisions.first() {
+        let listed = spellings.iter().map(|spelling| format!("'{spelling}'")).collect::<Vec<_>>().join(", ");
+        return Err(format!("ambiguous app names that differ only by ASCII case: {listed}"));
+    }
+
     for (name, app) in &config.apps {
         validate_config_text("app name", name)?;
         for (label, value) in [("app binary", app.binary.as_deref()), ("app hint template", app.hint_template.as_deref())] {
@@ -347,6 +370,57 @@ pub fn legacy_sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_with_apps(names: &[&str]) -> Config {
+        let apps: HashMap<String, AppConfig> = names
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    AppConfig {
+                        binary: None,
+                        capture_cwd: None,
+                        capture_last_command: None,
+                        hint_template: None,
+                        profile_workspaces: None,
+                        default_workspace: None,
+                    },
+                )
+            })
+            .collect();
+        Config { apps, ..Config::default() }
+    }
+
+    #[test]
+    fn validation_rejects_case_fold_collisions_with_sorted_names() {
+        let config = config_with_apps(&["Foo", "foo"]);
+        let error = validate_config_structure(&config).expect_err("case-fold collision must be rejected");
+        assert!(error.contains("'Foo'"), "error must name the conflicting spellings: {error}");
+        assert!(error.contains("'foo'"), "error must name the conflicting spellings: {error}");
+    }
+
+    #[test]
+    fn validation_rejects_three_way_collisions_deterministically() {
+        let config = config_with_apps(&["foo", "FOO", "Foo"]);
+        let error = validate_config_structure(&config).expect_err("three-way collision must be rejected");
+        assert!(error.contains("'FOO', 'Foo', 'foo'"), "names must be sorted: {error}");
+    }
+
+    #[test]
+    fn validation_allows_unique_and_non_ascii_keys() {
+        let config = config_with_apps(&["foot", "kitty", "Émile"]);
+        validate_config_structure(&config).expect("unique keys and non-ASCII folds must stay valid");
+    }
+
+    #[test]
+    fn app_lookup_falls_back_deterministically_for_unique_folds() {
+        // Insertion order in a HashMap is randomized per process: the
+        // case-insensitive fallback must resolve to the single spelling.
+        let config = config_with_apps(&["foot"]);
+        for class in ["FOOT", "Foot", "foot"] {
+            assert!(app_config_for(&config, class, class).is_some(), "fallback must find {class}");
+        }
+    }
 
     #[test]
     fn load_config_file_state_accepts_valid_and_preserves_policy() {

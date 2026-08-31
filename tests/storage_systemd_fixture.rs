@@ -590,3 +590,52 @@ fn legacy_migration_enable_failure_retains_the_legacy_schedule() {
         &format!("{verbs:?}"),
     );
 }
+
+#[test]
+fn case_fold_colliding_app_names_refuse_mutating_commands() {
+    let mut case = Case::new("case-fold-collision");
+    install_systemctl(&mut case);
+    let _fake = FakeHyprland::spawn(&mut case, empty_desktop_scenario());
+    let manifest_before = seed_autosave_store(&case, 3);
+    case.write_file(
+        "config/hyprloom/config.toml",
+        b"[apps.Foo]\nbinary = '/bin/one'\n\n[apps.foo]\nbinary = '/bin/two'\n",
+    );
+
+    let run = case.run("autosave", &["autosave", "--now"]);
+    case.assert(
+        "ambiguous app namespace is refused",
+        run.code() == Some(1),
+        &format!("stdout: {:?}", run.stdout_str()),
+    );
+    case.assert("stdout stays empty", run.stdout_str().is_empty(), &run.stdout_str());
+    case.assert(
+        "the conflict is named in sorted order",
+        run.stderr_str()
+            .contains("ambiguous app names that differ only by ASCII case: 'Foo', 'foo'"),
+        &run.stderr_str(),
+    );
+    case.assert(
+        "no capture or rotation happened",
+        store_manifest(&case) == manifest_before,
+        "the manifest must be unchanged",
+    );
+
+    // Second run refuses identically: the refusal is deterministic.
+    let again = case.run("autosave", &["autosave", "--now"]);
+    case.assert(
+        "refusal is deterministic across runs",
+        again.code() == Some(1) && again.stderr_str() == run.stderr_str(),
+        &again.stderr_str(),
+    );
+
+    // Correcting the namespace restores normal operation.
+    case.write_file("config/hyprloom/config.toml", b"[apps.Foo]\nbinary = '/bin/one'\n");
+    let fixed = case.run("autosave", &["autosave", "--now"]);
+    case.assert("valid config proceeds", fixed.success(), &fixed.stderr_str());
+    case.assert(
+        "the capture landed",
+        store_manifest(&case).len() == manifest_before.len() + 1,
+        "one new autosave must be captured",
+    );
+}
