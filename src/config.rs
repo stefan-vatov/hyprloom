@@ -34,6 +34,7 @@ pub const MAX_CONFIG_STRING_BYTES: usize = 64 * 1024;
 
 /// Complete user configuration loaded from the current or legacy config path.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     /// General timing, default-session, and autosave settings.
@@ -61,6 +62,7 @@ impl Config {
 
 /// General restore and autosave settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneralConfig {
     #[serde(default = "default_session_name")]
     /// Session name used when a command does not specify one explicitly.
@@ -78,6 +80,7 @@ pub struct GeneralConfig {
 
 /// Window classes that capture should ignore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterConfig {
     #[serde(default = "default_ignore_classes")]
     /// Case-insensitive Hyprland classes excluded from snapshots.
@@ -108,6 +111,7 @@ pub fn app_config_for<'a>(config: &'a Config, class: &str, initial_class: &str) 
 
 /// Optional launch and placement overrides for one application class.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AppConfig {
     /// Explicit executable used when restoring this application.
     pub binary: Option<String>,
@@ -419,6 +423,48 @@ mod tests {
         let config = config_with_apps(&["foot"]);
         for class in ["FOOT", "Foot", "foot"] {
             assert!(app_config_for(&config, class, class).is_some(), "fallback must find {class}");
+        }
+    }
+
+    fn assert_unknown_field_rejected(path: &std::path::Path, content: &str) {
+        let LoadedConfig::Invalid(diagnostic) = load_config_file_state(path) else {
+            panic!("unknown field must be Invalid for {content:?}");
+        };
+        assert!(diagnostic.contains("unknown field"), "case {content:?}: {diagnostic}");
+        assert!(diagnostic.contains(path.to_string_lossy().as_ref()), "case {content:?}: {diagnostic}");
+    }
+
+    #[test]
+    fn load_config_file_state_rejects_unknown_fields_with_path_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            "[autosaave]\nretain = 10\n".to_owned(),
+            "[general]\nautosave_reten = 10\n".to_owned(),
+            "[filters]\nignored_classses = []\n".to_owned(),
+            "[apps.foot]\ncapture_last_comand = true\n".to_owned(),
+        ];
+        for content in cases {
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, &content).unwrap();
+            assert_unknown_field_rejected(&path, &content);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn load_config_file_state_keeps_dynamic_profile_names_and_omitted_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[apps.brave-browser]\nprofile_workspaces = { \"Some Profile\" = 3 }\n").unwrap();
+
+        match load_config_file_state(&path) {
+            LoadedConfig::Valid(config) => {
+                let app = config.apps.get("brave-browser").expect("dynamic app entry must parse");
+                assert_eq!(app.profile_workspaces.as_ref().unwrap().get("Some Profile"), Some(&3));
+            }
+            LoadedConfig::Absent(_) | LoadedConfig::Invalid(_) => {
+                panic!("dynamic profile names must stay valid")
+            }
         }
     }
 

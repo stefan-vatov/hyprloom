@@ -639,3 +639,49 @@ fn case_fold_colliding_app_names_refuse_mutating_commands() {
         "one new autosave must be captured",
     );
 }
+
+#[test]
+fn unknown_config_fields_stop_destructive_rotation_with_diagnostics() {
+    let mut case = Case::new("unknown-key");
+    install_systemctl(&mut case);
+    let _fake = FakeHyprland::spawn(&mut case, empty_desktop_scenario());
+    let manifest_before = seed_autosave_store(&case, 6);
+    // A misspelled retention key parses as unknown and must not authorize
+    // rotation with the default retention.
+    case.write_file("config/hyprloom/config.toml", b"[general]\nautosave_reten = 20\n");
+
+    let run = case.run("autosave", &["autosave", "--now"]);
+    case.assert("mutating autosave is refused on unknown keys", run.code() == Some(1), &run.stdout_str());
+    case.assert("stdout stays empty", run.stdout_str().is_empty(), &run.stdout_str());
+    case.assert(
+        "the unknown field is named on stderr",
+        run.stderr_str().contains("unknown field") && run.stderr_str().contains("autosave_reten"),
+        &run.stderr_str(),
+    );
+    case.assert(
+        "no snapshot was captured and nothing was rotated",
+        store_manifest(&case) == manifest_before,
+        "the manifest must be unchanged",
+    );
+
+    // Correcting the spelling applies the intended policy.
+    retain_config(&mut case, 6);
+    let retry = case.run("autosave", &["autosave", "--now"]);
+    case.assert("retry with the corrected key succeeds", retry.success(), &retry.stderr_str());
+    let manifest_after = store_manifest(&case);
+    case.assert(
+        "corrected retention keeps exactly the configured count",
+        manifest_after.len() == 6,
+        &format!("{}", manifest_after.len()),
+    );
+    case.assert(
+        "the new capture exists",
+        manifest_after.keys().any(|name| !manifest_before.contains_key(name)),
+        "the capture must be stored",
+    );
+    case.assert(
+        "the oldest seed was rotated out under the corrected policy",
+        !manifest_after.contains_key("autosave-20260101T000000000-0001-000001.json"),
+        "retain=6 over 7 snapshots must prune the oldest",
+    );
+}
