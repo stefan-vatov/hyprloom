@@ -2037,6 +2037,15 @@ fn validate_replacement_targets_with_binaries(session: &Session, config: &Config
             command: launch_command[0].clone(),
         })?;
         binaries.push(binary);
+        if let Some(shell) = nested_hint_shell(&target.client) {
+            // The kitty hint adapter executes the captured shell as a nested
+            // program: validate it with the outer binary so destructive
+            // replacement never proceeds without it.
+            resolve_launch_binary(&shell, &target.label).map_err(|_| RestoreError::MissingLaunchBinary {
+                target: target.label.clone(),
+                command: shell,
+            })?;
+        }
     }
     Ok(binaries)
 }
@@ -3965,6 +3974,18 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
         .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command))
+}
+
+/// The nested shell a kitty hint launch will execute, when one was captured.
+///
+/// The kitty hint adapter spawns `<shell> -c "<hint>; exec <shell>"`, so the
+/// captured shell is a runtime executable dependency of the outer terminal.
+#[must_use]
+pub fn nested_hint_shell(client: &SessionClient) -> Option<String> {
+    if !client.class.eq_ignore_ascii_case("kitty") || client.launch.hint.is_none() {
+        return None;
+    }
+    client.launch.terminal_shell.clone()
 }
 
 fn resolve_launch_binary(command: &str, target: &str) -> Result<PathBuf, RestoreError> {
@@ -6525,6 +6546,22 @@ mod tests {
         let targets = build_reconcile_targets(&session, &config);
 
         assert_eq!(targets.len(), 1, "without ignore rules the profile target stays");
+    }
+
+    #[test]
+    fn nested_hint_shell_requires_kitty_hint_and_captured_shell() {
+        let mut client = make_client("kitty", 1, [0, 0], [800, 600], false, 0, "kitty", vec![], Some("hint".to_string()));
+        assert_eq!(nested_hint_shell(&client), None, "no captured shell: nothing to validate");
+
+        client.launch.terminal_shell = Some("bash".to_string());
+        assert_eq!(nested_hint_shell(&client).as_deref(), Some("bash"));
+
+        client.class = "foot".to_string();
+        assert_eq!(nested_hint_shell(&client), None, "non-kitty terminals have no hint adapter");
+
+        client.class = "kitty".to_string();
+        client.launch.hint = None;
+        assert_eq!(nested_hint_shell(&client), None, "no hint: no nested shell dependency");
     }
 
     #[test]

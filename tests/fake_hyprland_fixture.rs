@@ -422,3 +422,151 @@ fn faulted_repair_reports_failure_and_preserves_topology() {
         "no mutation may survive a failed repair",
     );
 }
+
+/// The kitty logging fixture: records its exact argv, then blocks so the
+/// correlation timeout governs the run duration.
+const KITTY_LOG_SH: &str = r#"#!/bin/sh
+set -u
+log=${KITTY_LOG:?kitty fixture requires KITTY_LOG}
+{
+  printf 'ARGV %s\n' "$#"
+  for arg do
+    printf '%s\n' "$arg"
+  done
+} >>"$log"
+sleep 30
+"#;
+
+fn install_kitty_logger(case: &mut Case) {
+    case.install_fake("kitty", KITTY_LOG_SH);
+    let log = case.root().join("artifacts/kitty-log").display().to_string();
+    case.set_env("KITTY_LOG", &log);
+}
+
+fn read_kitty_argv(case: &Case) -> Vec<Vec<String>> {
+    let raw = std::fs::read_to_string(case.root().join("artifacts/kitty-log")).unwrap_or_default();
+    let mut runs = Vec::new();
+    let mut lines = raw.lines();
+    while let Some(line) = lines.next() {
+        let Ok(argc) = line.strip_prefix("ARGV ").unwrap_or("").parse::<usize>() else {
+            continue;
+        };
+        runs.push(lines.by_ref().take(argc).map(str::to_owned).collect());
+    }
+    runs
+}
+
+fn kitty_session(with_shell: bool) -> Value {
+    let mut session = json!({
+        "name": "kitty-hint",
+        "created_at": "2026-01-01T00:00:00Z",
+        "hyprland_version": "fixture",
+        "monitors": [],
+        "clients": [{
+            "class": "kitty", "title": "sentinel-title",
+            "address": "0xgone", "stable_id": "stable-gone",
+            "initial_class": "kitty", "initial_title": "sentinel-title",
+            "workspace": 1, "workspace_name": "1", "monitor": "DP-1",
+            "at": [10, 20], "size": [800, 600], "floating": false,
+            "fullscreen": 0, "focus_history_id": 0,
+            "launch": {"command": "kitty", "args": [], "hint": "claude --continue"}
+        }]
+    });
+    if with_shell {
+        session["clients"][0]["launch"]["terminal_shell"] = json!("bash");
+    }
+    session
+}
+
+#[test]
+fn kitty_hint_launch_uses_the_captured_shell_argv() {
+    let mut case = Case::new("kitty-shell");
+    install_kitty_logger(&mut case);
+    let scenario = HyprlandScenario {
+        clients: vec![],
+        monitors: vec![json!({"id": 0, "name": "DP-1", "width": 1920, "height": 1080, "transform": 0})],
+        workspaces: vec![],
+        focused_address: None,
+        version: "0.56.2-fake".to_owned(),
+        batch_rejection: fake_hyprland::BatchRejection::ExitNonzero,
+        mapping_events: vec![],
+        faults: vec![],
+        request_gate: None,
+    };
+    let _fake = FakeHyprland::spawn(&mut case, scenario);
+    let session = kitty_session(true);
+    case.save_session("kitty-hint", &session);
+    let mut config = json!({});
+    let _ = &mut config;
+    retain_config(&mut case, 5);
+
+    let run = case.run("restore", &["restore", "kitty-hint"]);
+    case.assert(
+        "restore fails closed on the correlation timeout",
+        run.code() == Some(1),
+        &run.stderr_str(),
+    );
+
+    let runs = read_kitty_argv(&case);
+    case.assert(
+        "kitty was spawned once",
+        runs.len() == 1,
+        &format!(
+            "{:?}",
+            std::fs::read_to_string(case.root().join("artifacts/kitty-log")).unwrap_or_default()
+        ),
+    );
+    let argv = &runs[0];
+    case.assert(
+        "the captured shell drives the hint block",
+        argv.contains(&"-e".to_owned()) && argv.contains(&"bash".to_owned()),
+        &format!("{argv:?}"),
+    );
+    case.assert(
+        "the hint rides the shell command",
+        argv.windows(2).any(|pair| pair[0] == "-c" && pair[1].contains("claude --continue")),
+        &format!("{argv:?}"),
+    );
+    case.assert(
+        "the shell drop-in reuses the captured shell",
+        argv.iter().any(|argument| argument.contains("exec bash")),
+        &format!("{argv:?}"),
+    );
+}
+
+#[test]
+fn legacy_kitty_session_launches_without_the_hint_block() {
+    let mut case = Case::new("kitty-legacy");
+    install_kitty_logger(&mut case);
+    let scenario = HyprlandScenario {
+        clients: vec![],
+        monitors: vec![json!({"id": 0, "name": "DP-1", "width": 1920, "height": 1080, "transform": 0})],
+        workspaces: vec![],
+        focused_address: None,
+        version: "0.56.2-fake".to_owned(),
+        batch_rejection: fake_hyprland::BatchRejection::ExitNonzero,
+        mapping_events: vec![],
+        faults: vec![],
+        request_gate: None,
+    };
+    let _fake = FakeHyprland::spawn(&mut case, scenario);
+    let session = kitty_session(false);
+    case.save_session("kitty-hint", &session);
+    retain_config(&mut case, 5);
+
+    let run = case.run("restore", &["restore", "kitty-hint"]);
+    case.assert("restore completes the timeout flow", run.code() == Some(1), &run.stdout_str());
+
+    let runs = read_kitty_argv(&case);
+    case.assert("kitty was spawned", runs.len() == 1, "the terminal must still launch");
+    case.assert(
+        "no hint block is invented",
+        !runs[0].contains(&"-e".to_owned()),
+        &format!("{:?}", runs[0]),
+    );
+}
+
+fn retain_config(case: &mut Case, retain: usize) {
+    let config = format!("[general]\nautosave_retain = {retain}\n");
+    case.write_file("config/hyprloom/config.toml", config.as_bytes());
+}
