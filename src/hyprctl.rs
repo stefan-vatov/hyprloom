@@ -234,14 +234,34 @@ pub fn build_batch_command(commands: &[String]) -> Result<String, HyprctlError> 
     }
     let mut batch = String::new();
     for (index, command) in commands.iter().enumerate() {
-        parse_dispatch_args(command).map_err(HyprctlError::CommandFailed)?;
+        // Hyprland's batch transport does not process shell quoting: the
+        // payload after the dispatcher name is passed to the dispatcher
+        // verbatim. Serialize the parsed logical tokens, never the original
+        // possibly-quoted bytes.
+        let parsed = parse_dispatch_args(command).map_err(HyprctlError::CommandFailed)?;
+        let serialized = serialize_batch_tokens(&parsed)?;
         if index > 0 {
             batch.push_str(" ; ");
         }
         batch.push_str("dispatch ");
-        batch.push_str(&escape_batch_command(command));
+        batch.push_str(&serialized);
     }
     Ok(batch)
+}
+
+/// Serialize parsed logical tokens into one raw batch command.
+///
+/// Hyprland splits batch requests before unescaping, so a raw `;` inside a
+/// value would create a second operation and silently change the target.
+/// Such a value is unrepresentable in this transport and must fail before
+/// any mutation instead of attempting ineffective backslash escaping.
+fn serialize_batch_tokens(parsed: &[String]) -> Result<String, HyprctlError> {
+    if let Some(token) = parsed.iter().find(|token| token.contains(';')) {
+        return Err(HyprctlError::CommandFailed(format!(
+            "dispatch value '{token}' contains ';' which cannot be represented safely in a batch; use single dispatch"
+        )));
+    }
+    Ok(parsed.join(" "))
 }
 
 /// Validate a batch reply document against the logical batch commands.
@@ -282,10 +302,6 @@ fn bounded_reply(text: &str) -> String {
         bounded.push('…');
     }
     bounded
-}
-
-fn escape_batch_command(command: &str) -> String {
-    command.replace('\\', "\\\\").replace(';', "\\;")
 }
 
 fn parse_active_window_address(payload: &[u8]) -> Result<Option<String>, serde_json::Error> {
@@ -519,6 +535,66 @@ mod tests {
         let error =
             validate_batch_replies(b"compositor poetry without protocol replies\n", &commands).expect_err("malformed output must be rejected");
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn build_batch_serializes_parsed_tokens_without_shell_quotes() {
+        let commands = [
+            "movetoworkspacesilent 'name:Writing Desk',address:0x1".to_owned(),
+            "focuswindow address:0x1".to_owned(),
+        ];
+        let batch = build_batch_command(&commands).unwrap();
+        assert_eq!(
+            batch,
+            "dispatch movetoworkspacesilent name:Writing Desk,address:0x1 ; dispatch focuswindow address:0x1"
+        );
+    }
+
+    #[test]
+    fn build_batch_preserves_apostrophes_and_quotes_verbatim() {
+        // The logical command is built exactly the way placement builds it:
+        // shell-quoted by quote_dispatch_token, then serialized for the
+        // batch transport without the quote delimiters.
+        let value = "name:It's \"fine\"";
+        let logical = format!("pin {}", crate::placement::quote_dispatch_token(value));
+        let batch = build_batch_command(&[logical]).unwrap();
+        assert_eq!(batch, format!("dispatch pin {value}"));
+    }
+
+    #[test]
+    fn build_batch_rejects_semicolon_values_before_mutation() {
+        let commands = ["workspace 'name:a ; b'".to_owned()];
+        let error = build_batch_command(&commands).expect_err("a raw semicolon cannot be batch-represented");
+        assert!(
+            error.to_string().contains("';'"),
+            "the error must explain the unrepresentable delimiter: {error}"
+        );
+    }
+
+    #[test]
+    fn build_batch_round_trips_logical_tokens_for_selectors() {
+        // The serialized remainder must be the logical command with quote
+        // delimiters removed: numeric, name, and special selectors all keep
+        // their inner spacing verbatim for the dispatcher.
+        for (logical, expected_remainder) in [
+            ("movetoworkspacesilent 4,address:0x1", "movetoworkspacesilent 4,address:0x1"),
+            (
+                "movetoworkspacesilent 'name:Writing Desk',address:0x1",
+                "movetoworkspacesilent name:Writing Desk,address:0x1",
+            ),
+            (
+                "movetoworkspacesilent 'special:scratch,upper',address:0x1",
+                "movetoworkspacesilent special:scratch,upper,address:0x1",
+            ),
+            ("focuswindow address:0x1", "focuswindow address:0x1"),
+        ] {
+            let batch = build_batch_command(&[logical.to_owned()]).unwrap();
+            assert_eq!(
+                batch,
+                format!("dispatch {expected_remainder}"),
+                "batch serialization must keep the remainder verbatim: {logical}"
+            );
+        }
     }
 
     #[test]

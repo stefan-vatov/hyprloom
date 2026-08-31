@@ -18,7 +18,6 @@
 
 #![allow(dead_code, clippy::missing_panics_doc, clippy::unwrap_used, clippy::expect_used)]
 
-use hyprloom::hyprctl::parse_dispatch_args;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fmt;
@@ -282,14 +281,22 @@ impl Compositor {
         let Some(logical) = trimmed.strip_prefix("dispatch ") else {
             return format!("fake-hyprctl: invalid dispatch: {trimmed}");
         };
-        match parse_dispatch_args(logical) {
-            Ok(args) => {
-                self.apply(&args);
-                self.apply_mapping_events();
-                "ok".to_owned()
-            }
-            Err(error) => format!("fake-hyprctl: invalid dispatch syntax: {error}"),
+        // Hyprland passes the payload after the dispatcher name verbatim;
+        // each dispatcher owns its argument grammar. Named-workspace
+        // arguments keep their inner spaces.
+        let (dispatcher, remainder) = match logical.split_once(' ') {
+            Some((name, remainder)) => (name.to_owned(), remainder.to_owned()),
+            None => (logical.to_owned(), String::new()),
+        };
+        let mut args = vec![dispatcher.clone()];
+        if dispatcher == "movetoworkspacesilent" {
+            args.push(remainder);
+        } else {
+            args.extend(remainder.split_whitespace().map(str::to_owned));
         }
+        self.apply(&args);
+        self.apply_mapping_events();
+        "ok".to_owned()
     }
 
     /// A rejected batch stops replying there: the audit dialects separate a

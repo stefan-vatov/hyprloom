@@ -352,6 +352,56 @@ fn exit_zero_batch_semantic_error_fails_the_repair() {
 }
 
 #[test]
+fn named_workspace_with_spaces_round_trips_through_batch() {
+    // A named workspace containing a space must reach the dispatcher without
+    // the shell quote delimiters that only Hyprloom's single-dispatch parser
+    // understands (gqg.15).
+    let scenario = base_scenario(vec![client_json("0xone", "stable-one", 3, 1)]);
+    let mut session = session_json(4);
+    session["clients"][0]["workspace"] = json!(4);
+    session["clients"][0]["workspace_name"] = json!("Writing Desk");
+    let (mut case, fake) = cli_case("batch-named-ws", scenario, &session);
+
+    let run = case.run("restore", &["restore", "fake-fixture", "--reconcile", "--report-json"]);
+    let report = case.assert_single_json_document("named-ws report parses", &run);
+    case.assert("named-ws repair succeeds", run.success(), &run.stderr_str());
+    case.assert("window was moved", report["report"]["moved"] == 1, &format!("{report}"));
+
+    let trace = fake.fixture_trace();
+    let batch = trace.iter().find(|event| event["kind"] == "batch").expect("repair must be batched");
+    let operations = batch["operations"].as_array().unwrap();
+    let move_operation = operations
+        .iter()
+        .find(|operation| operation.as_str().unwrap_or("").starts_with("movetoworkspacesilent"))
+        .expect("the workspace move must be in the batch");
+    case.assert(
+        "selector is raw batch grammar without quote delimiters",
+        move_operation.as_str() == Some("movetoworkspacesilent name:Writing Desk,address:0xone"),
+        &format!("{move_operation}"),
+    );
+    let topology = fake.topology();
+    case.assert(
+        "window landed on the named workspace",
+        topology.clients[0]["workspace"]["name"] == json!("Writing Desk"),
+        &format!("{:?}", topology.clients),
+    );
+
+    let dispatches_after_first = fake.dispatch_count();
+    let second = case.run("restore", &["restore", "fake-fixture", "--reconcile", "--report-json"]);
+    let second_report = case.assert_single_json_document("second pass parses", &second);
+    case.assert(
+        "second pass is unchanged",
+        second_report["report"]["unchanged"] == 1,
+        &format!("{second_report}"),
+    );
+    case.assert(
+        "mutation-free second pass",
+        fake.dispatch_count() == dispatches_after_first,
+        "a satisfied named-workspace target must not dispatch again",
+    );
+}
+
+#[test]
 fn faulted_repair_reports_failure_and_preserves_topology() {
     let mut scenario = base_scenario(vec![client_json("0xone", "stable-one", 3, 1)]);
     scenario.faults.push(Fault {
