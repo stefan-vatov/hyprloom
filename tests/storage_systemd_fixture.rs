@@ -446,3 +446,79 @@ fn cli_autosave_honors_retain_above_the_legacy_cap() {
         &format!("{survivors_verified}"),
     );
 }
+
+#[test]
+fn invalid_config_refuses_mutating_autosave_and_allows_retry() {
+    let mut case = Case::new("invalid-config");
+    install_systemctl(&mut case);
+    let _fake = FakeHyprland::spawn(&mut case, empty_desktop_scenario());
+    let manifest_before = seed_autosave_store(&case, 6);
+    case.write_file("config/hyprloom/config.toml", b"not [valid toml ===");
+
+    let run = case.run("autosave", &["autosave", "--now"]);
+    case.assert(
+        "mutating autosave is refused on invalid config",
+        run.code() == Some(1),
+        &format!("stdout: {:?}", run.stdout_str()),
+    );
+    case.assert("stdout stays empty for the early refusal", run.stdout_str().is_empty(), &run.stdout_str());
+    case.assert(
+        "the refusal is actionable on stderr",
+        run.stderr_str().contains("configuration file is present but invalid"),
+        &run.stderr_str(),
+    );
+    case.assert(
+        "no snapshot was captured and nothing was rotated",
+        store_manifest(&case) == manifest_before,
+        "the byte/name manifest must be unchanged",
+    );
+    case.assert(
+        "no manager operations ran",
+        read_systemctl_log(&case).is_empty(),
+        "unit state must be untouched",
+    );
+
+    // Retry after the operator corrects the configuration.
+    retain_config(&mut case, 3);
+    let retry = case.run("autosave", &["autosave", "--now"]);
+    case.assert("retry after correction succeeds", retry.success(), &retry.stderr_str());
+    let manifest_after = store_manifest(&case);
+    case.assert(
+        "corrected policy retains exactly three",
+        manifest_after.len() == 3,
+        &format!("{:?}", manifest_after.keys()),
+    );
+}
+
+#[test]
+fn absent_config_selects_defaults_for_mutating_autosave() {
+    let mut case = Case::new("absent-config");
+    install_systemctl(&mut case);
+    let _fake = FakeHyprland::spawn(&mut case, empty_desktop_scenario());
+    let manifest_before = seed_autosave_store(&case, 4);
+
+    // No configuration file exists anywhere under the isolated XDG roots.
+    let run = case.run("autosave", &["autosave", "--now"]);
+    case.assert("absent config proceeds with defaults", run.success(), &run.stderr_str());
+    let manifest_after = store_manifest(&case);
+    case.assert(
+        "default retention (5) keeps every seeded autosave plus the capture",
+        manifest_after.len() == manifest_before.len() + 1,
+        &format!("{}", manifest_after.len()),
+    );
+}
+
+#[test]
+fn read_only_commands_report_config_fallback_honestly() {
+    let mut case = Case::new("readonly-fallback");
+    install_systemctl(&mut case);
+    case.write_file("config/hyprloom/config.toml", b"not [valid toml ===");
+
+    let run = case.run("config", &["config"]);
+    case.assert("read-only command still works", run.success(), &run.stderr_str());
+    case.assert(
+        "fallback is reported honestly on stderr",
+        run.stderr_str().contains("using defaults for this read-only operation"),
+        &run.stderr_str(),
+    );
+}

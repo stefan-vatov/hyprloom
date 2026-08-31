@@ -165,46 +165,69 @@ impl Default for FilterConfig {
     }
 }
 
+/// The outcome of configuration discovery.
+///
+/// Only a genuinely absent configuration file selects defaults, because then
+/// defaults are the operator's authoritative choice. A present-but-invalid
+/// file means the retention and safety policy is unknown, so mutating
+/// callers must refuse instead of proceeding with fallback values.
+#[derive(Debug, Clone)]
+pub enum LoadedConfig {
+    /// No configuration file exists; defaults are authoritative.
+    Absent(Config),
+    /// The configuration file was read, parsed, and validated.
+    Valid(Config),
+    /// A configuration file exists but could not be loaded. The context is
+    /// actionable and never contains file contents.
+    Invalid(String),
+}
+
+/// Load configuration as an explicit tri-state for callers that must
+/// distinguish absent defaults from present-but-invalid policy.
 #[must_use]
-/// Load configuration, falling back to defaults when it is absent or invalid.
-pub fn load_config() -> Config {
+pub fn load_config_state() -> LoadedConfig {
     for path in [config_path(), legacy_config_path()] {
         match std::fs::symlink_metadata(&path) {
-            Ok(_) => return load_config_file(&path),
+            Ok(_) => return load_config_file_state(&path),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
-                crate::output::warning(format!("Warning: could not inspect config '{}': {error}; using defaults", path.display()));
-                return Config::default();
+                return LoadedConfig::Invalid(format!("could not inspect config '{}': {error}", path.display()));
             }
         }
     }
-    Config::default()
+    LoadedConfig::Absent(Config::default())
 }
 
-fn load_config_file(path: &std::path::Path) -> Config {
+#[must_use]
+/// Load configuration, falling back to defaults when it is absent or invalid.
+pub fn load_config() -> Config {
+    match load_config_state() {
+        LoadedConfig::Valid(config) | LoadedConfig::Absent(config) => config,
+        LoadedConfig::Invalid(context) => {
+            crate::output::warning(format!("Warning: {context}; using defaults"));
+            Config::default()
+        }
+    }
+}
+
+fn load_config_file_state(path: &std::path::Path) -> LoadedConfig {
     let content = match read_config_file(path) {
         Ok(content) => content,
         Err(error) => {
-            crate::output::warning(format!("Warning: could not read config '{}': {error}; using defaults", path.display()));
-            return Config::default();
+            return LoadedConfig::Invalid(format!("could not read config '{}': {error}", path.display()));
         }
     };
     let mut config: Config = match toml::from_str(&content) {
         Ok(config) => config,
         Err(error) => {
-            crate::output::warning(format!("Warning: could not parse config '{}': {error}; using defaults", path.display()));
-            return Config::default();
+            return LoadedConfig::Invalid(format!("could not parse config '{}': {error}", path.display()));
         }
     };
     if let Err(error) = validate_config_structure(&config) {
-        crate::output::warning(format!(
-            "Warning: config '{}' exceeds safety limits: {error}; using defaults",
-            path.display()
-        ));
-        return Config::default();
+        return LoadedConfig::Invalid(format!("config '{}' exceeds safety limits: {error}", path.display()));
     }
     config.normalize();
-    config
+    LoadedConfig::Valid(config)
 }
 
 fn read_config_file(path: &std::path::Path) -> Result<String, String> {
@@ -324,6 +347,76 @@ pub fn legacy_sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_config_file_state_accepts_valid_and_preserves_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\nautosave_retain = 1001\n").unwrap();
+
+        match load_config_file_state(&path) {
+            LoadedConfig::Valid(config) => assert_eq!(config.general.autosave_retain, 1001),
+            LoadedConfig::Absent(_) | LoadedConfig::Invalid(_) => panic!("valid config must load"),
+        }
+    }
+
+    #[test]
+    fn load_config_file_state_reports_malformed_toml_as_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "not [valid toml ===").unwrap();
+
+        match load_config_file_state(&path) {
+            LoadedConfig::Invalid(context) => {
+                assert!(context.contains("could not parse config"), "context: {context}");
+                assert!(context.contains(path.to_string_lossy().as_ref()), "context: {context}");
+            }
+            LoadedConfig::Absent(_) | LoadedConfig::Valid(_) => panic!("malformed toml must be Invalid"),
+        }
+    }
+
+    #[test]
+    fn load_config_file_state_reports_non_regular_paths_as_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(matches!(load_config_file_state(&path), LoadedConfig::Invalid(_)));
+    }
+
+    #[test]
+    fn load_config_file_state_reports_oversized_files_as_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let padding = usize::try_from(MAX_CONFIG_FILE_BYTES).unwrap_or(0) / 6 + 8;
+        let body = "# pad\n".repeat(padding);
+        std::fs::write(&path, body).unwrap();
+
+        assert!(matches!(load_config_file_state(&path), LoadedConfig::Invalid(_)));
+    }
+
+    #[test]
+    fn load_config_file_state_reports_non_utf8_files_as_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+
+        assert!(matches!(load_config_file_state(&path), LoadedConfig::Invalid(_)));
+    }
+
+    #[test]
+    fn load_config_file_state_normalizes_valid_configs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[general]\nwindow_detect_timeout_ms = 999_999\n").unwrap();
+
+        match load_config_file_state(&path) {
+            LoadedConfig::Valid(config) => {
+                assert_eq!(config.general.window_detect_timeout_ms, MAX_WINDOW_DETECT_TIMEOUT_MS);
+            }
+            LoadedConfig::Absent(_) | LoadedConfig::Invalid(_) => panic!("valid config must load"),
+        }
+    }
 
     #[test]
     fn test_default_config() {

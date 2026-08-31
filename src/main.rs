@@ -4,7 +4,7 @@
 
 use clap::{Parser, Subcommand};
 use hyprloom::capture::capture_session;
-use hyprloom::config::{app_config_for, config_path, legacy_sessions_dir, load_config, sessions_dir};
+use hyprloom::config::{app_config_for, config_path, legacy_sessions_dir, load_config_state, sessions_dir, LoadedConfig};
 use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::matching::MatchingStrategy;
 use hyprloom::process::{ProcessInfoProvider, RealProcessInfo};
@@ -119,7 +119,20 @@ enum Commands {
 #[allow(clippy::too_many_lines)]
 fn main() {
     let cli = Cli::parse();
-    let config = load_config();
+    let config = match load_config_state() {
+        LoadedConfig::Valid(config) | LoadedConfig::Absent(config) => config,
+        LoadedConfig::Invalid(context) => {
+            if command_requires_valid_config(&cli.command) {
+                // An invalid configuration means the retention and safety
+                // policy is unknown; destructive work must not guess (and
+                // rotation permanently deletes snapshots).
+                cli_eprintln!("Error: the configuration file is present but invalid; refusing to mutate sessions or units: {context}");
+                std::process::exit(1);
+            }
+            cli_eprintln!("Warning: the configuration file is present but invalid; using defaults for this read-only operation: {context}");
+            hyprloom::config::Config::default()
+        }
+    };
     let sessions_dir = sessions_dir();
     let _operation_lock = match OperationLock::acquire() {
         Ok(lock) => lock,
@@ -929,6 +942,15 @@ fn print_json_report(name: &str, operation: &str, dry_run: bool, report: &hyprlo
     if let Err(error) = serde_json::to_writer(&mut stdout, &document).and_then(|()| writeln!(stdout).map_err(serde_json::Error::io)) {
         cli_eprintln!("Error writing restore report: {error}");
         std::process::exit(1);
+    }
+}
+
+const fn command_requires_valid_config(command: &Commands) -> bool {
+    match command {
+        Commands::List | Commands::Config => false,
+        Commands::Restore { dry_run, .. } => !*dry_run,
+        Commands::Autosave { now, install, uninstall } => *now || *install || *uninstall,
+        Commands::Save { .. } | Commands::Replace { .. } | Commands::Delete { .. } | Commands::Recover => true,
     }
 }
 
