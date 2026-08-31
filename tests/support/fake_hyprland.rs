@@ -65,11 +65,22 @@ pub struct Fault {
     pub exit_code: i32,
 }
 
-/// A client that appears only after the Nth dispatch attempt (delayed mapping).
+/// A client that appears only after a scripted trigger (delayed mapping).
+///
+/// The trigger is either the Nth dispatch attempt or the Nth `clients`
+/// query. An optional gate names a case-relative readiness file: the event
+/// stays pending until that file exists, which couples compositor state to
+/// helper-process state without sleeps. A client `pid` may be a
+/// `{"pid_file": "<case-relative path>"}` reference; the fake resolves it at
+/// mapping time so correlations run against genuine live pids.
 #[derive(Debug, Clone)]
 pub struct MappingEvent {
-    /// Number of dispatch attempts after which the client maps.
-    pub after_dispatch: usize,
+    /// Dispatch-attempt count after which the client maps.
+    pub after_dispatch: Option<usize>,
+    /// `clients` query count after which the client maps.
+    pub after_query: Option<usize>,
+    /// Case-relative readiness file that must exist before mapping.
+    pub gated_on: Option<String>,
     /// Full Hyprland client JSON for the newly mapped window.
     pub client: Value,
 }
@@ -155,27 +166,34 @@ struct Request {
 
 struct Compositor {
     case_id: String,
+    case_root: PathBuf,
     scenario: HyprlandScenario,
     clients: Vec<Value>,
     monitors: Vec<Value>,
     workspaces: Vec<Value>,
     focused: Option<String>,
     dispatch_count: usize,
+    clients_queries: usize,
+    pending_events: Vec<MappingEvent>,
     pending_operations: Vec<String>,
     seq: u32,
     events: Vec<Value>,
 }
 
 impl Compositor {
-    fn new(case_id: String, scenario: HyprlandScenario) -> Self {
+    fn new(case_id: String, case_root: PathBuf, scenario: HyprlandScenario) -> Self {
+        let pending_events = scenario.mapping_events.clone();
         Self {
             clients: scenario.clients.clone(),
             monitors: scenario.monitors.clone(),
             workspaces: scenario.workspaces.clone(),
             focused: scenario.focused_address.clone(),
             case_id,
+            case_root,
             scenario,
             dispatch_count: 0,
+            clients_queries: 0,
+            pending_events,
             pending_operations: Vec::new(),
             seq: 0,
             events: Vec::new(),
@@ -195,7 +213,11 @@ impl Compositor {
 
     fn answer(&mut self, argv: &[String]) -> Reply {
         match argv.first().map(String::as_str) {
-            Some("clients") => Reply::ok(&format_json(&self.clients)),
+            Some("clients") => {
+                self.clients_queries += 1;
+                self.apply_mapping_events();
+                Reply::ok(&format_json(&self.clients))
+            }
             Some("monitors") => Reply::ok(&format_json(&self.monitors)),
             Some("workspaces") => Reply::ok(&format_json(&self.workspaces)),
             Some("activewindow") => {
@@ -274,16 +296,35 @@ impl Compositor {
     }
 
     fn apply_mapping_events(&mut self) {
-        let due: Vec<Value> = self
-            .scenario
-            .mapping_events
-            .iter()
-            .filter(|event| event.after_dispatch == self.dispatch_count)
-            .map(|event| event.client.clone())
-            .collect();
-        for client in due {
+        let pending = std::mem::take(&mut self.pending_events);
+        let (fired, remaining): (Vec<MappingEvent>, Vec<MappingEvent>) = pending.into_iter().partition(|event| self.mapping_event_is_due(event));
+        self.pending_events = remaining;
+        for event in fired {
+            let client = self.resolve_client(event.client.clone());
             self.clients.push(client);
         }
+    }
+
+    /// An event is due once its trigger count is reached (or passed, so a
+    /// gate can hold it open across later queries) and its gate file exists.
+    fn mapping_event_is_due(&self, event: &MappingEvent) -> bool {
+        let dispatch_reached = event.after_dispatch.is_some_and(|n| self.dispatch_count >= n);
+        let query_reached = event.after_query.is_some_and(|n| self.clients_queries >= n);
+        if !dispatch_reached && !query_reached {
+            return false;
+        }
+        event.gated_on.as_ref().is_none_or(|gate| self.case_root.join(gate).exists())
+    }
+
+    /// Substitute `{"pid_file": ...}` pid references with the live pid the
+    /// helper recorded, so correlations see genuine process identity.
+    fn resolve_client(&self, mut client: Value) -> Value {
+        let Some(reference) = client["pid"].get("pid_file").and_then(Value::as_str) else {
+            return client;
+        };
+        let raw = fs::read_to_string(self.case_root.join(reference)).unwrap_or_default();
+        client["pid"] = json!(raw.trim().parse::<u32>().unwrap_or(0));
+        client
     }
 
     fn apply(&mut self, args: &[String]) {
@@ -531,7 +572,7 @@ impl FakeHyprland {
         case.install_fake("hyprctl", RELAY_SH);
         let dir_display = dir.display().to_string();
         case.set_env("FAKE_HYPRCTL_DIR", &dir_display);
-        let shared = Arc::new(Mutex::new(Compositor::new(case_id, scenario)));
+        let shared = Arc::new(Mutex::new(Compositor::new(case_id, root.clone(), scenario)));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_dir = dir.clone();
         let thread_shared = Arc::clone(&shared);

@@ -61,6 +61,20 @@ case "${1:-}" in
     printf '%s\n' "$$" >"$ready"
     exit "${2:-0}"
     ;;
+  window)
+    record "$@"
+    child_pid=${FAKE_APP_CHILD_PID:?fake-app window requires FAKE_APP_CHILD_PID}
+    sh -c 'printf "%s\n" "$$" >"$1"; exec 3<"$2"; read -r line <&3' sh "$child_pid" "$stop" </dev/null >/dev/null 2>&1 &
+    tries=0
+    while [ ! -s "$child_pid" ] && [ "$tries" -lt 500 ]; do
+      tries=$((tries + 1))
+      sleep 0.01
+    done
+    printf '%s\n' "$$" >"$ready"
+    exec 3<"$stop"
+    read -r line <&3
+    exit 0
+    ;;
   daemon)
     record "$@"
     setsid sh -c '
@@ -109,7 +123,12 @@ pub fn install_fake_app(case: &mut Case) {
     case.set_env("FAKE_APP_STOP", &stop);
     let ready = proc_dir.join("ready").display().to_string();
     case.set_env("FAKE_APP_READY", &ready);
+    let child_pid = proc_dir.join("child.pid").display().to_string();
+    case.set_env("FAKE_APP_CHILD_PID", &child_pid);
 }
+
+/// The case-relative child pid file written by `window` mode helpers.
+pub const CHILD_PID_FILE: &str = "artifacts/proc/child.pid";
 
 /// Run the helper synchronously for one-shot lifecycles.
 pub fn run_once(case: &Case, args: &[&str]) -> Output {
@@ -173,10 +192,11 @@ fn parse_runs(log: &str) -> Vec<ProcessRun> {
 }
 
 fn release_fifo(fifo: &Path) {
-    let Ok(stream) = fs::OpenOptions::new().write(true).open(fifo) else {
-        return; // no reader yet or the FIFO is gone; nothing to release
-    };
-    drop(stream);
+    use std::os::unix::fs::OpenOptionsExt;
+    // O_NONBLOCK: a FIFO write-open without a reader would otherwise block
+    // forever. ENXIO simply means there is nothing left to release.
+    let opened = fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(fifo);
+    let _ = opened;
 }
 
 fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
@@ -213,6 +233,7 @@ impl HelperHandle {
             .env("FAKE_APP_LOG", root.join(PROC_DIR).join("log"))
             .env("FAKE_APP_STOP", root.join(PROC_DIR).join("stop.fifo"))
             .env("FAKE_APP_READY", root.join(PROC_DIR).join("ready"))
+            .env("FAKE_APP_CHILD_PID", root.join(PROC_DIR).join("child.pid"))
             .spawn()
             .expect("spawn fake-app");
         Self {

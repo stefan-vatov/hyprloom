@@ -217,7 +217,9 @@ fn batch_rejection_dialects_separate_exit_from_text() {
 fn mapping_events_inject_delayed_windows_after_a_dispatch() {
     let mut scenario = base_scenario(vec![client_json("0xone", "stable-one", 3, 1)]);
     scenario.mapping_events.push(MappingEvent {
-        after_dispatch: 1,
+        after_dispatch: Some(1),
+        after_query: None,
+        gated_on: None,
         client: client_json("0xlate", "stable-late", 5, 2),
     });
     let mut case = Case::new("mapping");
