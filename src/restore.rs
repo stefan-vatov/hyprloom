@@ -5814,7 +5814,7 @@ mod tests {
         assert!(!legacy_joined.contains("-e "), "legacy hint must be dropped: {legacy_joined}");
         assert!(!legacy_joined.contains("zsh"), "legacy must not invent zsh: {legacy_joined}");
         assert!(
-            legacy_joined.contains("claude --continue") == false,
+            !legacy_joined.contains("claude --continue"),
             "legacy hint cannot be executed safely: {legacy_joined}"
         );
     }

@@ -249,7 +249,7 @@ pub fn install(systemd_dir: &Path) -> std::io::Result<(PathBuf, PathBuf)> {
     std::fs::remove_file(systemd_dir.join(TRANSACTION_MARKER_NAME)).or_else(ignore_not_found)?;
     sync_directory(systemd_dir)?;
 
-    migrate_legacy_units(systemd_dir);
+    migrate_legacy_units(systemd_dir)?;
     Ok((service_path, timer_path))
 }
 
@@ -409,6 +409,10 @@ pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
 pub struct SystemctlOutcome {
     /// Whether the command spawned and exited successfully.
     pub success: bool,
+    /// The process exit status, when it exited (None on spawn failure).
+    /// State queries distinguish outcomes by code: `0` enabled/active, `1`
+    /// disabled/inactive, anything else is a query error.
+    pub code: Option<i32>,
     /// Bounded stderr text from the command, for stage-and-unit errors.
     pub stderr: String,
 }
@@ -430,10 +434,12 @@ impl SystemctlRunner for RealSystemctl {
         match std::process::Command::new("systemctl").args(args).output() {
             Ok(output) => SystemctlOutcome {
                 success: output.status.success(),
+                code: output.status.code(),
                 stderr: bounded_stderr(&output.stderr),
             },
             Err(error) => SystemctlOutcome {
                 success: false,
+                code: None,
                 stderr: bounded_stderr(error.to_string().as_bytes()),
             },
         }
@@ -531,49 +537,79 @@ fn unit_state_is(unit: &str, state: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn disable_timer(timer: &str) {
-    let result = std::process::Command::new("systemctl")
-        .args(["--user", "disable", "--now", timer])
-        .output();
-    let Ok(output) = result else {
-        return;
-    };
-    if output.status.success() {
-        return;
-    }
-    let message = String::from_utf8_lossy(&output.stderr);
-    let message = message.trim();
-    if !message.is_empty() {
-        crate::output::warning(format!("Warning: systemctl disable {timer} failed: {message}"));
+fn migrate_legacy_units(systemd_dir: &Path) -> std::io::Result<()> {
+    migrate_legacy_units_with(systemd_dir, &RealSystemctl)
+}
+
+/// Whether a legacy `HyprFlow` timer still carries the autosave schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyTimerState {
+    /// `is-enabled` exited zero: the legacy timer preserves a schedule.
+    Enabled,
+    /// `is-enabled` exited one: the legacy timer is disabled.
+    Disabled,
+    /// Spawn failure or an unexpected status: the state is unknown.
+    QueryError,
+}
+
+const fn classify_legacy_state(outcome: &SystemctlOutcome) -> LegacyTimerState {
+    match outcome.code {
+        Some(0) => LegacyTimerState::Enabled,
+        Some(1) => LegacyTimerState::Disabled,
+        _ => LegacyTimerState::QueryError,
     }
 }
 
-fn migrate_legacy_units(systemd_dir: &Path) {
+fn migrate_legacy_units_with(systemd_dir: &Path, systemctl: &dyn SystemctlRunner) -> std::io::Result<()> {
     let legacy_service = systemd_dir.join(LEGACY_SERVICE_NAME);
     let legacy_timer = systemd_dir.join(LEGACY_TIMER_NAME);
     if !legacy_service.exists() && !legacy_timer.exists() {
-        return;
+        return Ok(());
     }
 
-    let was_enabled = unit_state_is(LEGACY_TIMER_NAME, "is-enabled");
-    disable_timer(LEGACY_TIMER_NAME);
+    let legacy_state = classify_legacy_state(&systemctl.run(&["--user", "is-enabled", "--quiet", LEGACY_TIMER_NAME]));
+    if legacy_state == LegacyTimerState::QueryError {
+        return Err(std::io::Error::other(
+            "could not query the legacy autosave timer state (legacy units retained)",
+        ));
+    }
+    let was_enabled = legacy_state == LegacyTimerState::Enabled;
+
+    // An enabled legacy schedule must live on in the replacement timer
+    // before the legacy units are touched: establish and verify first.
+    if was_enabled {
+        let enabled = systemctl.run(&["--user", "enable", "--now", TIMER_NAME]);
+        if !enabled.success {
+            return Err(std::io::Error::other(format!(
+                "could not enable the Hyprloom autosave timer during migration (legacy units retained): {}",
+                enabled.stderr
+            )));
+        }
+        let verified = systemctl.run(&["--user", "is-enabled", "--quiet", TIMER_NAME]);
+        if !verified.success {
+            return Err(std::io::Error::other(format!(
+                "could not verify the Hyprloom autosave timer during migration (legacy units retained): {}",
+                verified.stderr
+            )));
+        }
+    }
+
+    let disabled = systemctl.run(&["--user", "disable", "--now", LEGACY_TIMER_NAME]);
+    if !disabled.success {
+        return Err(std::io::Error::other(format!(
+            "could not disable the legacy autosave timer (legacy units retained): {}",
+            disabled.stderr
+        )));
+    }
     for path in [legacy_service, legacy_timer] {
         if let Err(error) = std::fs::remove_file(&path).or_else(ignore_not_found) {
-            crate::output::warning(format!("Warning: could not remove legacy autosave unit '{}': {error}", path.display()));
+            return Err(std::io::Error::other(format!(
+                "could not remove legacy autosave unit '{}': {error}",
+                path.display()
+            )));
         }
     }
-    if was_enabled {
-        let output = std::process::Command::new("systemctl")
-            .args(["--user", "enable", "--now", TIMER_NAME])
-            .output();
-        let Ok(output) = output else {
-            return;
-        };
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            crate::output::warning(format!("Warning: could not activate migrated autosave timer: {}", stderr.trim()));
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -581,16 +617,23 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// Scripted systemctl runner: fails specific (verb, ordinal) calls.
+    /// Scripted systemctl runner: fails specific (verb, ordinal) calls
+    /// with a configurable exit status.
     struct ScriptedSystemctl {
         failures: Vec<(String, usize)>,
+        fail_code: i32,
         calls: RefCell<Vec<Vec<String>>>,
     }
 
     impl ScriptedSystemctl {
         fn failing(verb: &str, ordinal: usize) -> Self {
+            Self::failing_with_code(verb, ordinal, 1)
+        }
+
+        fn failing_with_code(verb: &str, ordinal: usize, code: i32) -> Self {
             Self {
                 failures: vec![(verb.to_owned(), ordinal)],
+                fail_code: code,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -598,6 +641,7 @@ mod tests {
         fn always_succeeding() -> Self {
             Self {
                 failures: Vec::new(),
+                fail_code: 1,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -619,10 +663,12 @@ mod tests {
             match self.first_failure(&verb) {
                 Some((_, target)) if target == ordinal => SystemctlOutcome {
                     success: false,
+                    code: Some(self.fail_code),
                     stderr: format!("fake systemctl: {verb} refused"),
                 },
                 _ => SystemctlOutcome {
                     success: true,
+                    code: Some(0),
                     stderr: String::new(),
                 },
             }
@@ -654,6 +700,101 @@ mod tests {
             .iter()
             .map(|name| dir.join(name))
             .collect()
+    }
+
+    fn seed_legacy_units_only(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [LEGACY_SERVICE_NAME, LEGACY_TIMER_NAME] {
+            std::fs::write(dir.join(name), "[Unit]\nDescription=legacy\n").unwrap();
+        }
+    }
+
+    #[test]
+    fn migration_of_enabled_legacy_establishes_then_verifies_then_disables() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_legacy_units_only(dir.path());
+        let systemctl = ScriptedSystemctl::always_succeeding();
+
+        migrate_legacy_units_with(dir.path(), &systemctl).expect("enabled migration must succeed");
+
+        let verbs: Vec<String> = systemctl.recorded_commands().iter().map(|call| scripted_call_verb(call)).collect();
+        assert_eq!(
+            verbs,
+            vec![
+                "is-enabled".to_owned(),
+                "enable".to_owned(),
+                "is-enabled".to_owned(),
+                "disable".to_owned()
+            ],
+            "query, establish, verify, then retire the legacy timer"
+        );
+        assert!(!dir.path().join(LEGACY_TIMER_NAME).exists(), "legacy units are removed last");
+    }
+
+    #[test]
+    fn migration_of_disabled_legacy_never_enables_the_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_legacy_units_only(dir.path());
+        // is-enabled exits one: the legacy timer is disabled.
+        let systemctl = ScriptedSystemctl::failing_with_code("is-enabled", 1, 1);
+
+        migrate_legacy_units_with(dir.path(), &systemctl).expect("disabled migration must succeed");
+
+        let verbs: Vec<String> = systemctl.recorded_commands().iter().map(|call| scripted_call_verb(call)).collect();
+        assert_eq!(
+            verbs,
+            vec!["is-enabled".to_owned(), "disable".to_owned()],
+            "a disabled legacy timer must not activate the replacement"
+        );
+        assert!(!dir.path().join(LEGACY_TIMER_NAME).exists());
+    }
+
+    #[test]
+    fn migration_query_error_fails_and_retains_legacy_units() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_legacy_units_only(dir.path());
+        // Exit two is a query error, not a disabled answer.
+        let systemctl = ScriptedSystemctl::failing_with_code("is-enabled", 1, 2);
+
+        let error = migrate_legacy_units_with(dir.path(), &systemctl).expect_err("query error must refuse migration");
+
+        assert!(error.to_string().contains("could not query"), "{error}");
+        assert!(dir.path().join(LEGACY_TIMER_NAME).exists(), "legacy units are retained");
+        assert_eq!(systemctl.recorded_commands().len(), 1, "no transitions may follow an unknown state");
+    }
+
+    #[test]
+    fn migration_enable_failure_retains_the_legacy_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_legacy_units_only(dir.path());
+        let systemctl = ScriptedSystemctl::failing("enable", 1);
+
+        let error = migrate_legacy_units_with(dir.path(), &systemctl).expect_err("enable failure must refuse migration");
+
+        assert!(error.to_string().contains("legacy units retained"), "{error}");
+        assert!(dir.path().join(LEGACY_TIMER_NAME).exists(), "the legacy schedule survives");
+        let legacy_retired = systemctl.recorded_commands().iter().any(|call| scripted_call_verb(call) == "disable");
+        assert!(!legacy_retired, "the legacy timer is retired only after success");
+    }
+
+    #[test]
+    fn migration_legacy_disable_failure_retains_the_legacy_schedule() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_legacy_units_only(dir.path());
+        let systemctl = ScriptedSystemctl::failing("disable", 1);
+
+        let error = migrate_legacy_units_with(dir.path(), &systemctl).expect_err("legacy disable failure must refuse");
+
+        assert!(error.to_string().contains("legacy units retained"), "{error}");
+        assert!(dir.path().join(LEGACY_TIMER_NAME).exists(), "the legacy timer file survives");
+    }
+
+    #[test]
+    fn migration_without_legacy_units_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = ScriptedSystemctl::always_succeeding();
+        migrate_legacy_units_with(dir.path(), &systemctl).expect("no legacy units: no-op");
+        assert!(systemctl.recorded_commands().is_empty());
     }
 
     #[test]

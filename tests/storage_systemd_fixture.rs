@@ -522,3 +522,71 @@ fn read_only_commands_report_config_fallback_honestly() {
         &run.stderr_str(),
     );
 }
+
+#[test]
+fn legacy_migration_preserves_an_enabled_schedule_through_the_fake_manager() {
+    let mut case = Case::new("legacy-enabled");
+    install_systemctl(&mut case);
+    seed_legacy_units(&case);
+    script_state(&mut case, 0);
+
+    let run = case.run("autosave", &["autosave", "--install"]);
+    case.assert("install with migration succeeds", run.success(), &run.stderr_str());
+    case.assert(
+        "success announces the created units",
+        run.stdout_str().contains("Created:"),
+        &run.stdout_str(),
+    );
+
+    let verbs: Vec<String> = read_systemctl_log(&case).into_iter().map(|call| call.verb).collect();
+    case.assert(
+        "query, establish, verify, retire - in that order",
+        verbs
+            == vec![
+                "is-enabled".to_owned(),
+                "enable".to_owned(),
+                "is-enabled".to_owned(),
+                "disable".to_owned(),
+            ],
+        &format!("{verbs:?}"),
+    );
+    case.assert(
+        "legacy units are gone after confirmed migration",
+        !case.root().join("config/systemd/user/hyprflow-autosave.timer").exists(),
+        "confirmed migration removes the legacy units",
+    );
+    case.assert(
+        "hyprloom units are installed",
+        case.root().join("config/systemd/user/hyprloom-autosave.timer").exists(),
+        "the replacement schedule must exist",
+    );
+}
+
+#[test]
+fn legacy_migration_enable_failure_retains_the_legacy_schedule() {
+    let mut case = Case::new("legacy-enable-failure");
+    install_systemctl(&mut case);
+    seed_legacy_units(&case);
+    script_state(&mut case, 0);
+    script_failure(&mut case, "enable");
+
+    let run = case.run("autosave", &["autosave", "--install"]);
+    case.assert("install is refused on enable failure", run.code() == Some(1), &run.stdout_str());
+    case.assert("no false Created message", !run.stdout_str().contains("Created:"), &run.stdout_str());
+    case.assert(
+        "the error names the failed transition",
+        run.stderr_str().contains("could not enable the Hyprloom autosave timer"),
+        &run.stderr_str(),
+    );
+    case.assert(
+        "legacy units are retained for recovery",
+        case.root().join("config/systemd/user/hyprflow-autosave.timer").exists(),
+        "the legacy schedule must survive a failed migration",
+    );
+    let verbs: Vec<String> = read_systemctl_log(&case).into_iter().map(|call| call.verb).collect();
+    case.assert(
+        "the legacy timer is retired only after success",
+        !verbs.contains(&"disable".to_owned()),
+        &format!("{verbs:?}"),
+    );
+}

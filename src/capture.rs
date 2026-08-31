@@ -208,7 +208,12 @@ fn build_launch_info(client: &crate::hyprctl::HyprClient, app_config: Option<&Ap
         }
     }
 
-    LaunchInfo { command: binary, args, hint, terminal_shell }
+    LaunchInfo {
+        command: binary,
+        args,
+        hint,
+        terminal_shell,
+    }
 }
 
 fn capture_brave_profiles(
@@ -359,7 +364,7 @@ fn find_webapp_launch_info_in_directories(class: &str, initial_class: &str, dire
     }
     let launch = unique.pop()?;
     Some(LaunchInfo {
-                terminal_shell: None,
+        terminal_shell: None,
         command: launch.command,
         args: launch.args,
         hint: None,

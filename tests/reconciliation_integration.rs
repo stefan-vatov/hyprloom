@@ -100,6 +100,7 @@ fn target_client() -> SessionClient {
             command: "kitty".to_string(),
             args: vec![],
             hint: None,
+            terminal_shell: None,
         },
     }
 }
