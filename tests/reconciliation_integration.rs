@@ -50,6 +50,7 @@ impl FixtureHyprctl {
                 transform: 0,
                 x: Some(0),
                 y: Some(0),
+                scale: None,
             }],
             dispatches: RefCell::new(Vec::new()),
         }
@@ -140,6 +141,7 @@ fn session_with_target(target: SessionClient) -> Session {
             transform: 0,
             x: Some(0),
             y: Some(0),
+            scale: None,
         }],
         clients: vec![target],
         brave_profiles: vec![],

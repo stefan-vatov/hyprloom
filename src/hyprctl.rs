@@ -78,6 +78,10 @@ pub struct HyprMonitor {
     #[serde(default)]
     /// Global Y origin, when provided by Hyprland.
     pub y: Option<i32>,
+    #[serde(default)]
+    /// Monitor scale factor: mode dimensions are physical, client geometry
+    /// is logical. Absent on providers that do not report it.
+    pub scale: Option<f64>,
 }
 
 // ── Error type ─────────────────────────────────────────────────────────────

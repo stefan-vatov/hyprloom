@@ -18,6 +18,29 @@ pub fn target_monitor_is_available(monitors: &[HyprMonitor], name: &str) -> bool
     name.is_empty() || find_monitor_by_name(monitors, name).is_some()
 }
 
+/// Sanitize a monitor scale into a usable positive finite factor.
+pub fn usable_scale(scale: Option<f64>) -> Option<f64> {
+    scale.filter(|value| value.is_finite() && *value > 0.0)
+}
+
+/// Convert physical mode dimensions into the logical coordinate space the
+/// compositor uses for client geometry.
+fn logical_dimensions(width: u32, height: u32, scale: f64) -> (u32, u32) {
+    // The scale is handled as thousandths so the conversion stays in the
+    // same exact integer-ratio domain as the rest of the adaptation.
+    let scale_milli = str::parse::<u64>(&format!("{:.0}", (scale * 1_000.0).round().max(1.0))).unwrap_or(1_000);
+    (logical_dimension(width, scale_milli), logical_dimension(height, scale_milli))
+}
+
+fn logical_dimension(physical: u32, scale_milli: u64) -> u32 {
+    if scale_milli == 0 {
+        return physical;
+    }
+    let product = u128::from(physical) * 1_000;
+    let rounded = (product + u128::from(scale_milli) / 2) / u128::from(scale_milli);
+    u32::try_from(rounded).unwrap_or(physical)
+}
+
 /// Adapt captured absolute coordinates to a monitor whose origin or
 /// resolution changed since the snapshot. Older sessions have `None` for
 /// monitor origins and deliberately keep their original geometry.
@@ -37,6 +60,16 @@ pub fn adapt_client_geometry(target: &SessionClient, saved_monitors: &[Monitor],
     if saved_monitor.width == 0 || saved_monitor.height == 0 || current_monitor.width == 0 || current_monitor.height == 0 {
         return target.clone();
     }
+    // Mode dimensions are physical pixels while client geometry is logical:
+    // proportional adaptation is only sound between comparable logical
+    // extents. Unknown, zero, negative, or non-finite scale means the saved
+    // snapshot cannot claim a conversion, so its captured logical
+    // coordinates are preserved conservatively instead.
+    let (Some(saved_scale), Some(current_scale)) = (usable_scale(saved_monitor.scale), usable_scale(current_monitor.scale)) else {
+        return target.clone();
+    };
+    let saved_logical = logical_dimensions(saved_monitor.width, saved_monitor.height, saved_scale);
+    let current_logical = logical_dimensions(current_monitor.width, current_monitor.height, current_scale);
 
     let (relative_at, relative_size) = if supported_rotation(saved_monitor.transform) && supported_rotation(current_monitor.transform) {
         let saved_relative_at = [i64::from(target.at[0]) - i64::from(saved_x), i64::from(target.at[1]) - i64::from(saved_y)];
@@ -48,29 +81,23 @@ pub fn adapt_client_geometry(target: &SessionClient, saved_monitors: &[Monitor],
             saved_monitor.transform,
         );
         let scaled_at = [
-            scale_coordinate(canonical_at[0], current_monitor.width, saved_monitor.width),
-            scale_coordinate(canonical_at[1], current_monitor.height, saved_monitor.height),
+            scale_coordinate(canonical_at[0], current_logical.0, saved_logical.0),
+            scale_coordinate(canonical_at[1], current_logical.1, saved_logical.1),
         ];
         let scaled_size = [
-            scaled_extent(canonical_size[0], current_monitor.width, saved_monitor.width, current_monitor.width),
-            scaled_extent(canonical_size[1], current_monitor.height, saved_monitor.height, current_monitor.height),
+            scaled_extent(canonical_size[0], current_logical.0, saved_logical.0, current_logical.0),
+            scaled_extent(canonical_size[1], current_logical.1, saved_logical.1, current_logical.1),
         ];
-        rotate_rect_from_canonical(
-            scaled_at,
-            scaled_size,
-            current_monitor.width,
-            current_monitor.height,
-            current_monitor.transform,
-        )
+        rotate_rect_from_canonical(scaled_at, scaled_size, current_logical.0, current_logical.1, current_monitor.transform)
     } else {
         (
             [
-                scale_coordinate(i64::from(target.at[0]) - i64::from(saved_x), current_monitor.width, saved_monitor.width),
-                scale_coordinate(i64::from(target.at[1]) - i64::from(saved_y), current_monitor.height, saved_monitor.height),
+                scale_coordinate(i64::from(target.at[0]) - i64::from(saved_x), current_logical.0, saved_logical.0),
+                scale_coordinate(i64::from(target.at[1]) - i64::from(saved_y), current_logical.1, saved_logical.1),
             ],
             [
-                scaled_extent(target.size[0], current_monitor.width, saved_monitor.width, current_monitor.width),
-                scaled_extent(target.size[1], current_monitor.height, saved_monitor.height, current_monitor.height),
+                scaled_extent(target.size[0], current_logical.0, saved_logical.0, current_logical.0),
+                scaled_extent(target.size[1], current_logical.1, saved_logical.1, current_logical.1),
             ],
         )
     };

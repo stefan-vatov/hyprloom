@@ -56,6 +56,7 @@ pub fn capture_session(
             transform: m.transform,
             x: m.x,
             y: m.y,
+            scale: crate::placement::usable_scale(m.scale),
         })
         .collect();
 
@@ -729,6 +730,7 @@ mod tests {
             transform: 0,
             x: Some(0),
             y: Some(0),
+            scale: None,
         }
     }
 

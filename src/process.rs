@@ -735,7 +735,8 @@ mod tests {
     fn real_process_info_reads_exact_argv_boundaries() {
         // The lossy joined form cannot distinguish these argv shapes; the
         // argv reader must preserve boundaries.
-        let mut staged = std::process::Command::new("sh")
+        // bash's exec supports -a (argv-zero rewriting), dash's does not.
+        let mut staged = std::process::Command::new("bash")
             .arg("-c")
             .arg("exec -a brave sleep 30")
             .stdin(std::process::Stdio::piped())

@@ -4763,6 +4763,7 @@ mod tests {
             transform: 0,
             x: Some(0),
             y: Some(0),
+            scale: None,
         };
         let current_monitor = HyprMonitor {
             id: 0,
@@ -4772,12 +4773,16 @@ mod tests {
             transform: 0,
             x: Some(1920),
             y: Some(0),
+            scale: None,
         };
 
         let adapted = adapt_client_geometry(&target, &[saved_monitor], Some(&current_monitor));
 
-        assert_eq!(adapted.at, [2053, 67]);
-        assert_eq!(adapted.size, [1280, 720]);
+        // Unknown monitor scales must not claim a physical->logical
+        // conversion: the captured logical coordinates are preserved
+        // conservatively instead of proportionally rescaled.
+        assert_eq!(adapted.at, [100, 50]);
+        assert_eq!(adapted.size, [960, 540]);
     }
 
     #[test]
@@ -4790,6 +4795,7 @@ mod tests {
             transform: 0,
             x: Some(0),
             y: Some(0),
+            scale: None,
         };
         let current_monitor = HyprMonitor {
             id: 0,
@@ -4799,12 +4805,15 @@ mod tests {
             transform: 1,
             x: Some(0),
             y: Some(0),
+            scale: None,
         };
 
         let adapted = adapt_client_geometry(&target, &[saved_monitor], Some(&current_monitor));
 
-        assert_eq!(adapted.at, [730, 100]);
-        assert_eq!(adapted.size, [300, 400]);
+        // Unknown scales: captured logical coordinates are preserved
+        // conservatively instead of proportionally rescaled.
+        assert_eq!(adapted.at, [100, 50]);
+        assert_eq!(adapted.size, [400, 300]);
     }
 
     #[test]
@@ -4817,6 +4826,7 @@ mod tests {
             transform: 0,
             x: None,
             y: None,
+            scale: None,
         };
         let current_monitor = HyprMonitor {
             id: 0,
@@ -4826,6 +4836,7 @@ mod tests {
             transform: 0,
             x: Some(1920),
             y: Some(0),
+            scale: None,
         };
 
         let adapted = adapt_client_geometry(&target, &[saved_monitor], Some(&current_monitor));
@@ -5443,6 +5454,7 @@ mod tests {
                 transform: 0,
                 x: Some(0),
                 y: Some(0),
+                scale: None,
             }])
         }
 

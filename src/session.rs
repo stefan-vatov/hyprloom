@@ -91,6 +91,11 @@ pub struct Monitor {
     /// Global Y origin, when available.
     #[serde(default)]
     pub y: Option<i32>,
+    /// Monitor scale factor, when the capture could observe it. Mode
+    /// dimensions are physical pixels; client geometry is logical, so
+    /// geometry adaptation needs this to compare extents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f64>,
 }
 
 /// A saved Hyprland client and the information needed to restore it.
@@ -1535,6 +1540,9 @@ pub struct HyprMonitor {
     /// Global Y origin, when reported.
     #[serde(default)]
     pub y: Option<i32>,
+    /// Monitor scale factor, when reported.
+    #[serde(default)]
+    pub scale: Option<f64>,
 }
 
 #[cfg(test)]
@@ -1555,6 +1563,7 @@ mod tests {
                 transform: 0,
                 x: None,
                 y: None,
+                scale: None,
             }],
             clients: vec![SessionClient {
                 class: "kitty".to_string(),
