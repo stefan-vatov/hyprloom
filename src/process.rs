@@ -240,6 +240,16 @@ fn read_process_start_time(pid: u32) -> Result<u64, ProcessError> {
         .ok_or(ProcessError::NotFound(pid))
 }
 
+/// Return the supported interactive shell name a command line starts with
+/// (`sh`, `bash`, `fish`, or `zsh`), so terminal captures can persist which
+/// shell produced a last-command hint.
+#[must_use]
+pub fn supported_shell_identity(cmdline: &str) -> Option<String> {
+    let command = cmdline.split_whitespace().next()?;
+    let name = Path::new(command).file_name().and_then(|name| name.to_str())?;
+    matches!(name, "zsh" | "bash" | "fish" | "sh").then(|| name.to_owned())
+}
+
 /// Whether a process command line represents an interactive shell itself,
 /// rather than a shell running a command.  This intentionally accepts paths
 /// such as `/usr/bin/zsh` and rejects `zsh -c ...`.

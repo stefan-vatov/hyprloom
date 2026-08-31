@@ -169,6 +169,11 @@ pub struct LaunchInfo {
     pub args: Vec<String>,
     /// Optional launcher hint for web apps or desktop entries.
     pub hint: Option<String>,
+    /// The supported interactive shell (sh, bash, fish, zsh) captured for
+    /// terminal last-command hints. Absent on legacy sessions saved before
+    /// shell identity was persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
 }
 
 // === Session storage ===
@@ -1533,6 +1538,7 @@ mod tests {
                     command: "kitty".to_string(),
                     args: vec![],
                     hint: None,
+                    terminal_shell: Some("zsh".to_string()),
                 },
             }],
             brave_profiles: vec![],
@@ -1598,6 +1604,7 @@ mod tests {
                     command: "kitty".to_string(),
                     args: vec![],
                     hint: None,
+                    terminal_shell: Some("zsh".to_string()),
                 },
             }],
             brave_profiles: vec![],

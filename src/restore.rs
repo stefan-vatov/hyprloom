@@ -3342,6 +3342,7 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
                         command: binary.clone(),
                         args: vec![],
                         hint: None,
+                        terminal_shell: None,
                     },
                 });
 
@@ -3846,22 +3847,25 @@ fn choose_launched_window(
 
 /// Build the argv vector used to spawn `client`'s application.
 ///
-/// For `kitty` windows that carry a `hint` (e.g. the last shell command),
-/// we append `-e zsh -c "<hint>; exec zsh"` so the terminal opens with
-/// that hint visible and then drops to an interactive shell.
+/// For `kitty` windows that carry a `hint` (e.g. the last shell command)
+/// and a captured supported shell, append `-e <shell> -c "<hint>; exec
+/// <shell>"` so the terminal opens with that hint visible and then drops to
+/// an interactive shell of the same shell the user had. Legacy sessions
+/// saved without shell identity launch the terminal without the hint
+/// rather than inventing a shell that may not exist.
 #[must_use]
 pub fn build_launch_command(client: &SessionClient) -> Vec<String> {
     let mut cmd = vec![effective_binary(client)];
     cmd.extend(client.launch.args.clone());
 
     if client.class.eq_ignore_ascii_case("kitty") {
-        if let Some(hint) = &client.launch.hint {
+        if let (Some(hint), Some(shell)) = (&client.launch.hint, client.launch.terminal_shell.as_deref()) {
             // Single-quote-escape the hint so it survives the shell invocation.
             let escaped = hint.replace('\'', "'\\''");
             cmd.push("-e".to_string());
-            cmd.push("zsh".to_string());
+            cmd.push(shell.to_string());
             cmd.push("-c".to_string());
-            cmd.push(format!("echo '{escaped}'; exec zsh"));
+            cmd.push(format!("echo '{escaped}'; exec {shell}"));
         }
     }
 
@@ -4102,6 +4106,7 @@ mod tests {
                 command: command.to_string(),
                 args,
                 hint,
+                terminal_shell: None,
             },
         }
     }
@@ -5776,14 +5781,16 @@ mod tests {
             Some("claude --continue".to_string()),
         );
 
-        let cmd = build_launch_command(&client);
+        let mut cmd_client = client;
+        cmd_client.launch.terminal_shell = Some("zsh".to_string());
+        let cmd = build_launch_command(&cmd_client);
 
         // argv[0] is the binary.
         assert_eq!(cmd[0], "kitty");
         // Existing args are preserved before the hint block.
         assert!(cmd.contains(&"--directory".to_string()), "should keep --directory arg");
         assert!(cmd.contains(&"/home/user/project".to_string()), "should keep directory value");
-        // The hint block must be present.
+        // The hint block must be present using the captured shell.
         let joined = cmd.join(" ");
         assert!(joined.contains("-e zsh -c"), "kitty hint should inject '-e zsh -c'; got: {joined}");
         assert!(
@@ -5791,6 +5798,25 @@ mod tests {
             "hint content should appear in command; got: {joined}"
         );
         assert!(joined.contains("exec zsh"), "hint block should drop to interactive zsh; got: {joined}");
+
+        // A captured non-zsh shell must be used verbatim, never substituted.
+        cmd_client.launch.terminal_shell = Some("bash".to_string());
+        let bash_cmd = build_launch_command(&cmd_client);
+        let bash_joined = bash_cmd.join(" ");
+        assert!(bash_joined.contains("-e bash -c"), "captured bash must drive the hint: {bash_joined}");
+        assert!(bash_joined.contains("exec bash"), "bash hint must drop to bash; got: {bash_joined}");
+        assert!(!bash_joined.contains("zsh"), "no zsh may be invented: {bash_joined}");
+
+        // Legacy sessions without shell metadata launch without the hint.
+        cmd_client.launch.terminal_shell = None;
+        let legacy_cmd = build_launch_command(&cmd_client);
+        let legacy_joined = legacy_cmd.join(" ");
+        assert!(!legacy_joined.contains("-e "), "legacy hint must be dropped: {legacy_joined}");
+        assert!(!legacy_joined.contains("zsh"), "legacy must not invent zsh: {legacy_joined}");
+        assert!(
+            legacy_joined.contains("claude --continue") == false,
+            "legacy hint cannot be executed safely: {legacy_joined}"
+        );
     }
 
     // ── Test: build_launch_command for a generic binary ─────────────────────

@@ -188,6 +188,7 @@ fn build_launch_info(client: &crate::hyprctl::HyprClient, app_config: Option<&Ap
 
     let mut args: Vec<String> = desktop_launch.as_ref().map(|launch| launch.args.clone()).unwrap_or_default();
     let mut hint: Option<String> = None;
+    let mut terminal_shell: Option<String> = None;
 
     let shell = (desktop_launch.is_none() && (capture_cwd || capture_last_command))
         .then(|| select_terminal_process(process_info, client.pid))
@@ -196,6 +197,7 @@ fn build_launch_info(client: &crate::hyprctl::HyprClient, app_config: Option<&Ap
         let (terminal_args, terminal_hint) = terminal_capture(client, &shell, process_info, capture_cwd, capture_last_command);
         args.extend(terminal_args);
         hint = terminal_hint;
+        terminal_shell = crate::process::supported_shell_identity(&shell.cmdline);
     }
 
     // Render hint through the app-level template when one is configured.
@@ -206,7 +208,7 @@ fn build_launch_info(client: &crate::hyprctl::HyprClient, app_config: Option<&Ap
         }
     }
 
-    LaunchInfo { command: binary, args, hint }
+    LaunchInfo { command: binary, args, hint, terminal_shell }
 }
 
 fn capture_brave_profiles(
@@ -357,6 +359,7 @@ fn find_webapp_launch_info_in_directories(class: &str, initial_class: &str, dire
     }
     let launch = unique.pop()?;
     Some(LaunchInfo {
+                terminal_shell: None,
         command: launch.command,
         args: launch.args,
         hint: None,
