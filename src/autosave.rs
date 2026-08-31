@@ -400,6 +400,71 @@ fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 /// Returns an error when the directory or one of its unit files fails the
 /// ownership and regular-file safety checks.
 pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
+    uninstall_with(systemd_dir, &RealSystemctl)
+}
+
+/// Result of one systemctl invocation: spawn and exit success plus bounded
+/// stderr for diagnostics.
+#[derive(Debug, Clone)]
+pub struct SystemctlOutcome {
+    /// Whether the command spawned and exited successfully.
+    pub success: bool,
+    /// Bounded stderr text from the command, for stage-and-unit errors.
+    pub stderr: String,
+}
+
+/// Injectable systemctl boundary so uninstall transitions can be scripted.
+pub trait SystemctlRunner {
+    /// Run one systemctl command with the given arguments.
+    fn run(&self, args: &[&str]) -> SystemctlOutcome;
+}
+
+/// Calls the real `systemctl` binary.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RealSystemctl;
+
+const SYSTEMCTL_STDERR_LIMIT: usize = 400;
+
+impl SystemctlRunner for RealSystemctl {
+    fn run(&self, args: &[&str]) -> SystemctlOutcome {
+        match std::process::Command::new("systemctl").args(args).output() {
+            Ok(output) => SystemctlOutcome {
+                success: output.status.success(),
+                stderr: bounded_stderr(&output.stderr),
+            },
+            Err(error) => SystemctlOutcome {
+                success: false,
+                stderr: bounded_stderr(error.to_string().as_bytes()),
+            },
+        }
+    }
+}
+
+fn bounded_stderr(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut bounded: String = text.chars().take(SYSTEMCTL_STDERR_LIMIT).collect();
+    if text.chars().count() > SYSTEMCTL_STDERR_LIMIT {
+        bounded.push('…');
+    }
+    bounded.trim().to_owned()
+}
+
+/// Whether the timer's unit file exists on disk as a regular file.
+fn unit_file_exists(systemd_dir: &Path, timer: &str) -> bool {
+    std::fs::symlink_metadata(systemd_dir.join(timer)).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+/// Uninstall with a confirmed transition order.
+///
+/// Both timers must disable and stop before any unit file is removed, so a
+/// refused disable never leaves a live timer without its definition.
+/// Failures retain every unit and are retryable.
+///
+/// # Errors
+///
+/// Returns an error when any required timer disable fails or is uncertain,
+/// or when a unit file cannot be removed safely.
+pub fn uninstall_with(systemd_dir: &Path, systemctl: &dyn SystemctlRunner) -> std::io::Result<()> {
     // If an earlier install was interrupted, settle that transaction before
     // deleting units.  This keeps backup files and the transaction marker from
     // being stranded by an uninstall performed during recovery.
@@ -408,7 +473,18 @@ pub fn uninstall(systemd_dir: &Path) -> std::io::Result<()> {
     }
     recover_install_transaction(systemd_dir)?;
     for timer in [TIMER_NAME, LEGACY_TIMER_NAME] {
-        disable_timer(timer);
+        // A timer whose unit file is absent locally cannot stay loaded after
+        // the removal phase, so no disable is required for it.
+        if !unit_file_exists(systemd_dir, timer) {
+            continue;
+        }
+        let outcome = systemctl.run(&["--user", "disable", "--now", timer]);
+        if !outcome.success {
+            return Err(std::io::Error::other(format!(
+                "could not disable autosave timer '{timer}' (units retained): {}",
+                outcome.stderr
+            )));
+        }
     }
 
     for unit in [SERVICE_NAME, TIMER_NAME, LEGACY_SERVICE_NAME, LEGACY_TIMER_NAME] {
@@ -503,6 +579,185 @@ fn migrate_legacy_units(systemd_dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Scripted systemctl runner: fails specific (verb, ordinal) calls.
+    struct ScriptedSystemctl {
+        failures: Vec<(String, usize)>,
+        calls: RefCell<Vec<Vec<String>>>,
+    }
+
+    impl ScriptedSystemctl {
+        fn failing(verb: &str, ordinal: usize) -> Self {
+            Self {
+                failures: vec![(verb.to_owned(), ordinal)],
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn always_succeeding() -> Self {
+            Self {
+                failures: Vec::new(),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn recorded_commands(&self) -> Vec<Vec<String>> {
+            self.calls.borrow().clone()
+        }
+
+        fn first_failure(&self, verb: &str) -> Option<(String, usize)> {
+            self.failures.iter().find(|(failed_verb, _)| failed_verb == verb).cloned()
+        }
+    }
+
+    impl SystemctlRunner for ScriptedSystemctl {
+        fn run(&self, args: &[&str]) -> SystemctlOutcome {
+            let call: Vec<String> = args.iter().map(|argument| (*argument).to_owned()).collect();
+            let verb = scripted_call_verb(&call);
+            let ordinal = self.record_verb_call(&call);
+            match self.first_failure(&verb) {
+                Some((_, target)) if target == ordinal => SystemctlOutcome {
+                    success: false,
+                    stderr: format!("fake systemctl: {verb} refused"),
+                },
+                _ => SystemctlOutcome {
+                    success: true,
+                    stderr: String::new(),
+                },
+            }
+        }
+    }
+
+    impl ScriptedSystemctl {
+        fn record_verb_call(&self, call: &[String]) -> usize {
+            let verb = scripted_call_verb(call);
+            let mut calls = self.calls.borrow_mut();
+            calls.push(call.to_owned());
+            calls.iter().filter(|recorded| scripted_call_verb(recorded) == verb).count()
+        }
+    }
+
+    fn scripted_call_verb(call: &[String]) -> String {
+        call.iter().find(|argument| !argument.starts_with('-')).cloned().unwrap_or_default()
+    }
+
+    fn seed_units(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for name in [SERVICE_NAME, TIMER_NAME, LEGACY_SERVICE_NAME, LEGACY_TIMER_NAME] {
+            std::fs::write(dir.join(name), "[Unit]\nDescription=seeded\n").unwrap();
+        }
+    }
+
+    fn unit_paths(dir: &Path) -> Vec<std::path::PathBuf> {
+        [SERVICE_NAME, TIMER_NAME, LEGACY_SERVICE_NAME, LEGACY_TIMER_NAME]
+            .iter()
+            .map(|name| dir.join(name))
+            .collect()
+    }
+
+    #[test]
+    fn uninstall_fails_and_retains_every_unit_when_current_disable_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_units(dir.path());
+        let systemctl = ScriptedSystemctl::failing("disable", 1);
+
+        let error = uninstall_with(dir.path(), &systemctl).expect_err("current disable failure must refuse");
+
+        assert!(
+            error.to_string().contains(TIMER_NAME),
+            "the stage-and-unit error must name the timer: {error}"
+        );
+        for path in unit_paths(dir.path()) {
+            assert!(path.exists(), "unit must be retained on failure: {}", path.display());
+        }
+    }
+
+    #[test]
+    fn uninstall_fails_and_retains_every_unit_when_legacy_disable_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_units(dir.path());
+        // The current timer disables fine; the legacy timer is the second call.
+        let systemctl = ScriptedSystemctl::failing("disable", 2);
+
+        let error = uninstall_with(dir.path(), &systemctl).expect_err("legacy disable failure must refuse");
+
+        assert!(
+            error.to_string().contains(LEGACY_TIMER_NAME),
+            "the stage-and-unit error must name the legacy timer: {error}"
+        );
+        for path in unit_paths(dir.path()) {
+            assert!(path.exists(), "unit must be retained on failure: {}", path.display());
+        }
+    }
+
+    #[test]
+    fn uninstall_disables_both_timers_in_order_before_removing_units() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_units(dir.path());
+        let systemctl = ScriptedSystemctl::always_succeeding();
+
+        uninstall_with(dir.path(), &systemctl).expect("confirmed disables must allow removal");
+
+        for path in unit_paths(dir.path()) {
+            assert!(!path.exists(), "every unit must be removed on success: {}", path.display());
+        }
+        let commands = systemctl.recorded_commands();
+        assert_eq!(
+            commands,
+            vec![
+                vec!["--user".to_owned(), "disable".to_owned(), "--now".to_owned(), TIMER_NAME.to_owned()],
+                vec![
+                    "--user".to_owned(),
+                    "disable".to_owned(),
+                    "--now".to_owned(),
+                    LEGACY_TIMER_NAME.to_owned()
+                ],
+            ],
+            "disable order must be current then legacy, before any deletion"
+        );
+    }
+
+    #[test]
+    fn uninstall_retries_idempotently_after_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_units(dir.path());
+        let systemctl = ScriptedSystemctl::failing("disable", 1);
+        assert!(uninstall_with(dir.path(), &systemctl).is_err());
+
+        let retry = ScriptedSystemctl::always_succeeding();
+        uninstall_with(dir.path(), &retry).expect("retry after cleared failure must succeed");
+        for path in unit_paths(dir.path()) {
+            assert!(!path.exists(), "retry must complete the removal: {}", path.display());
+        }
+    }
+
+    #[test]
+    fn uninstall_without_units_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = ScriptedSystemctl::always_succeeding();
+        uninstall_with(dir.path(), &systemctl).expect("absent install must stay a no-op");
+        assert!(systemctl.recorded_commands().is_empty(), "nothing to disable when nothing is installed");
+    }
+
+    #[test]
+    fn uninstall_refuses_non_regular_units_but_confirms_disables_first() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_units(dir.path());
+        let symlink = dir.path().join(SERVICE_NAME);
+        std::fs::remove_file(&symlink).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", &symlink).unwrap();
+        let systemctl = ScriptedSystemctl::always_succeeding();
+
+        let error = uninstall_with(dir.path(), &systemctl).expect_err("non-regular units must be refused");
+
+        assert!(
+            error.to_string().contains("non-regular"),
+            "the error must describe the unsafe unit: {error}"
+        );
+        assert_eq!(systemctl.recorded_commands().len(), 2, "disables are confirmed before the removal phase");
+        assert!(symlink.symlink_metadata().is_ok(), "the unsafe entry is retained for the operator");
+    }
 
     #[test]
     fn test_install_creates_files() {
@@ -533,8 +788,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         install(dir.path()).unwrap();
         assert!(is_installed(dir.path()));
-        uninstall(dir.path()).unwrap();
+        let systemctl = ScriptedSystemctl::always_succeeding();
+        uninstall_with(dir.path(), &systemctl).unwrap();
         assert!(!is_installed(dir.path()));
+        assert_eq!(
+            systemctl.recorded_commands().len(),
+            1,
+            "only the installed current timer requires a disable; the absent legacy timer cannot stay loaded"
+        );
     }
 
     #[test]

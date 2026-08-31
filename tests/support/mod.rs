@@ -210,6 +210,11 @@ impl Case {
         self.envs.insert(key.to_owned(), value.to_owned());
     }
 
+    /// Remove a previously recorded fixture environment variable.
+    pub fn unset_env(&mut self, key: &str) {
+        self.envs.remove(key);
+    }
+
     /// Remove a file inside the case root if it exists.
     pub fn remove_file(&self, relative: &str) {
         let _ = fs::remove_file(self.root().join(relative));

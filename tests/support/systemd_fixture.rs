@@ -64,6 +64,11 @@ pub fn script_failure(case: &mut Case, verb: &str) {
     case.set_env("FAKE_SYSTEMCTL_FAIL", verb);
 }
 
+/// Clear a previously scripted subcommand failure.
+pub fn clear_failure(case: &mut Case) {
+    case.unset_env("FAKE_SYSTEMCTL_FAIL");
+}
+
 /// Script the unit state answers: 0 active/enabled, 1 inactive/disabled.
 pub fn script_state(case: &mut Case, state_code: u8) {
     case.set_env("FAKE_SYSTEMCTL_STATE", &state_code.to_string());
@@ -106,8 +111,8 @@ fn parse_log(log: &str) -> Vec<SystemctlCall> {
 pub fn seed_legacy_units(case: &Case) -> (PathBuf, PathBuf) {
     let units = case.root().join("config/systemd/user");
     fs::create_dir_all(&units).unwrap();
-    let service = units.join("hyprloom-autosave.service");
-    let timer = units.join("hyprloom-autosave.timer");
+    let service = units.join("hyprflow-autosave.service");
+    let timer = units.join("hyprflow-autosave.timer");
     fs::write(&service, "[Unit]\nDescription=legacy\n").unwrap();
     fs::write(&timer, "[Unit]\nDescription=legacy timer\n").unwrap();
     (service, timer)

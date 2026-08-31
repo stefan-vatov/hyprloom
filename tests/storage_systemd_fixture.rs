@@ -23,7 +23,7 @@ use serde_json::json;
 use std::os::unix::fs::PermissionsExt as _;
 use std::time::Duration;
 use support::Case;
-use systemd_fixture::{install_systemctl, is_private_file, read_systemctl_log, script_failure, script_state, seed_legacy_units};
+use systemd_fixture::{clear_failure, install_systemctl, is_private_file, read_systemctl_log, script_failure, script_state, seed_legacy_units};
 
 fn empty_desktop_scenario() -> HyprlandScenario {
     HyprlandScenario {
@@ -144,30 +144,85 @@ fn autosave_status_reports_state_from_fake_systemctl() {
 }
 
 #[test]
-fn scripted_disable_failure_is_recorded_and_surfaced() {
+fn scripted_disable_failure_refuses_uninstall_and_retains_units() {
     let mut case = Case::new("disable-failure");
     install_systemctl(&mut case);
+    let install = case.run("autosave", &["autosave", "--install"]);
+    case.assert("install seeds current units", install.success(), &install.stderr_str());
     seed_legacy_units(&case);
-    script_state(&mut case, 0);
     script_failure(&mut case, "disable");
 
     let run = case.run("autosave", &["autosave", "--uninstall"]);
-    case.assert("uninstall completes", run.success(), &run.stderr_str());
+    case.assert("uninstall is refused on disable failure", run.code() == Some(1), &run.stdout_str());
     case.assert(
-        "disable failure is surfaced as a warning",
-        run.stderr_str().contains("systemctl disable"),
+        "no success text is printed",
+        !run.stdout_str().contains("Autosave timer removed."),
+        &run.stdout_str(),
+    );
+    case.assert(
+        "the stage-and-unit error names the timer",
+        run.stderr_str().contains("could not disable autosave timer"),
         &run.stderr_str(),
+    );
+    case.assert(
+        "current units are retained",
+        case.root().join("config/systemd/user/hyprloom-autosave.timer").exists(),
+        "no unit may be removed while a disable is unconfirmed",
+    );
+    case.assert(
+        "legacy units are retained",
+        case.root().join("config/systemd/user/hyprflow-autosave.timer").exists(),
+        "no unit may be removed while a disable is unconfirmed",
     );
     let verbs: Vec<String> = read_systemctl_log(&case).into_iter().map(|call| call.verb).collect();
     case.assert(
-        "both timers were disabled through the fake manager",
+        "exactly the first required disable was attempted",
+        verbs == vec!["disable".to_owned()],
+        &format!("{verbs:?}"),
+    );
+
+    // Idempotent retry once the manager cooperates again.
+    clear_failure(&mut case);
+    let retry = case.run("autosave", &["autosave", "--uninstall"]);
+    case.assert("retry succeeds", retry.success(), &retry.stderr_str());
+    case.assert(
+        "retry prints the success contract",
+        retry.stdout_str().contains("Autosave timer removed."),
+        &retry.stdout_str(),
+    );
+    case.assert(
+        "units are removed after confirmed disables",
+        !case.root().join("config/systemd/user/hyprloom-autosave.timer").exists(),
+        "confirmed disables must allow the removal phase",
+    );
+}
+
+#[test]
+fn successful_uninstall_confirms_disables_before_removal() {
+    let mut case = Case::new("uninstall-ok");
+    install_systemctl(&mut case);
+    let install = case.run("autosave", &["autosave", "--install"]);
+    case.assert("install seeds current units", install.success(), &install.stderr_str());
+    seed_legacy_units(&case);
+
+    let run = case.run("autosave", &["autosave", "--uninstall"]);
+    case.assert("uninstall succeeds", run.success(), &run.stderr_str());
+    case.assert(
+        "success text is on stdout",
+        run.stdout_str().contains("Autosave timer removed."),
+        &run.stdout_str(),
+    );
+    let verbs: Vec<String> = read_systemctl_log(&case).into_iter().map(|call| call.verb).collect();
+    case.assert(
+        "disables are confirmed for current and legacy timers in order",
         verbs == vec!["disable".to_owned(), "disable".to_owned()],
         &format!("{verbs:?}"),
     );
     case.assert(
-        "legacy units were removed",
-        !case.root().join("config/systemd/user/hyprloom-autosave.timer").exists(),
-        "uninstall must remove the unit files",
+        "all units are gone",
+        !case.root().join("config/systemd/user/hyprloom-autosave.timer").exists()
+            && !case.root().join("config/systemd/user/hyprflow-autosave.timer").exists(),
+        "confirmed uninstall removes every unit",
     );
 }
 
