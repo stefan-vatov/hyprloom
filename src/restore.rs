@@ -3573,6 +3573,8 @@ fn restore_single_client_with_launcher_and_process_info_with_address_and_binary(
     );
     let poll_interval = Duration::from_millis(100);
     let candidate_settle = Duration::from_millis(250).min(timeout);
+    let mut first_related_set: Option<String> = None;
+    let mut first_related_set_at: Option<Instant> = None;
     let start = Instant::now();
     let mut first_candidate_at = None;
     let mut first_handoff_candidate_at = None;
@@ -3685,6 +3687,30 @@ fn restore_single_client_with_launcher_and_process_info_with_address_and_binary(
         }
         if candidates.len() == 1 && !process_related && candidate_seen_at.elapsed() < candidate_settle {
             continue;
+        }
+        if launched_process.pid.is_some() {
+            // Process relation proves the launch caused a window, not which
+            // sibling is the saved target: splash and helper windows map
+            // first. Settle on a stable related candidate set before
+            // committing so a later main window can join the set.
+            let mut related_addresses: Vec<String> = candidates
+                .iter()
+                .filter(|candidate| launched_process_is_related(&launched_process, candidate.pid, process_info))
+                .map(|candidate| candidate.address.clone())
+                .collect();
+            related_addresses.sort();
+            let identity = related_addresses.join(",");
+            let settled = match (&first_related_set, first_related_set_at) {
+                (Some(seen), Some(seen_at)) if *seen == identity => seen_at.elapsed() >= candidate_settle,
+                _ => {
+                    first_related_set = Some(identity);
+                    first_related_set_at = Some(Instant::now());
+                    false
+                }
+            };
+            if !settled {
+                continue;
+            }
         }
         break choose_launched_window(client, candidates, launched_process, process_info, false)?;
     };
@@ -5933,6 +5959,52 @@ mod tests {
             .expect("the launched window may reuse the old address");
 
         assert!(mock.dispatches().iter().any(|dispatch| dispatch.contains("0xreused")));
+    }
+
+    #[test]
+    fn test_launch_correlation_settles_before_committing_a_splash_window() {
+        // A splash/loading window maps first and the main window later: the
+        // correlation must settle on the stable related set and commit the
+        // saved target, not the first related observation.
+        let mut target = make_client("kitty", 1, [10, 20], [800, 600], false, 0, "true", vec![], None);
+        target.title = "target".to_string();
+        target.monitor.clear();
+        let mut splash = make_reconcile_window("0xsplash", "kitty", "Splash", 1, 0, [5, 5], [300, 200]);
+        splash.pid = 6000;
+        splash.stable_id = Some("stable-splash".to_string());
+        let mut main = make_reconcile_window("0xmain", "kitty", "target", 1, 0, [50, 60], [700, 500]);
+        main.pid = 6000;
+        main.stable_id = Some("stable-main".to_string());
+        let mock = MockHyprctl::new(vec![vec![], vec![splash.clone()], vec![splash, main]]);
+        let launcher = RecordingLauncher {
+            pid: Some(5000),
+            ..Default::default()
+        };
+        let process_info = RelatedProcessInfo {
+            children: HashMap::from([(
+                5000,
+                vec![ChildProcess {
+                    pid: 6000,
+                    cwd: PathBuf::from("/tmp"),
+                    cmdline: "kitty".to_string(),
+                }],
+            )]),
+        };
+        let mut config = Config::default();
+        config.general.restore_delay_ms = 0;
+
+        restore_single_client_with_launcher_and_process_info(&target, &mock, &process_info, &config, &launcher, false).unwrap();
+
+        assert!(
+            mock.dispatches().iter().all(|dispatch| !dispatch.contains("0xsplash")),
+            "the splash window must never be placed: {:?}",
+            mock.dispatches()
+        );
+        assert!(
+            mock.dispatches().iter().any(|dispatch| dispatch.contains("0xmain")),
+            "the main window must be the placed target: {:?}",
+            mock.dispatches()
+        );
     }
 
     #[test]
