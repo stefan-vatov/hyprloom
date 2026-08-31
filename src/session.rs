@@ -1,4 +1,3 @@
-use crate::config::MAX_AUTOSAVE_RETAIN;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -1196,7 +1195,6 @@ pub fn list_autosave_sessions(sessions_dir: &Path) -> Result<Vec<SessionSummary>
 // idempotent deletion, hence the nested guard and match.
 #[allow(clippy::excessive_nesting)]
 pub fn rotate_autosaves(sessions_dir: &Path, retain: usize) -> Result<usize, SessionError> {
-    let retain = retain.min(MAX_AUTOSAVE_RETAIN);
     let pending_backup = pending_replace_backup(sessions_dir)?;
     let autosaves = list_autosave_sessions(sessions_dir)?;
     let mut pruned = 0;

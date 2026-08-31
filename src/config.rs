@@ -21,8 +21,6 @@ pub const MAX_RESTORE_DELAY_MS: u64 = 60_000;
 pub const MIN_WINDOW_DETECT_TIMEOUT_MS: u64 = 500;
 /// The maximum window-detection timeout accepted from configuration.
 pub const MAX_WINDOW_DETECT_TIMEOUT_MS: u64 = 120_000;
-/// The maximum number of retained autosave snapshots.
-pub const MAX_AUTOSAVE_RETAIN: usize = 1_000;
 /// The maximum number of bytes read from the configuration file.
 pub const MAX_CONFIG_FILE_BYTES: u64 = 1024 * 1024;
 /// The maximum number of configured applications.
@@ -58,7 +56,6 @@ impl Config {
             .general
             .window_detect_timeout_ms
             .clamp(MIN_WINDOW_DETECT_TIMEOUT_MS, MAX_WINDOW_DETECT_TIMEOUT_MS);
-        self.general.autosave_retain = self.general.autosave_retain.min(MAX_AUTOSAVE_RETAIN);
     }
 }
 
@@ -409,7 +406,17 @@ hint_template = "{cwd}"
 
         assert_eq!(config.general.restore_delay_ms, MAX_RESTORE_DELAY_MS);
         assert_eq!(config.general.window_detect_timeout_ms, MAX_WINDOW_DETECT_TIMEOUT_MS);
-        assert_eq!(config.general.autosave_retain, MAX_AUTOSAVE_RETAIN);
+        // Retention is a documented policy value: valid parsed values must
+        // survive normalization untouched instead of being clamped.
+        assert_eq!(config.general.autosave_retain, usize::MAX);
+
+        config.general.autosave_retain = 1001;
+        config.normalize();
+        assert_eq!(config.general.autosave_retain, 1001);
+
+        config.general.autosave_retain = 0;
+        config.normalize();
+        assert_eq!(config.general.autosave_retain, 0);
 
         config.general.window_detect_timeout_ms = 100;
         config.normalize();
