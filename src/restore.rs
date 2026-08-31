@@ -2050,6 +2050,10 @@ fn validate_replacement_targets_with_binaries(session: &Session, config: &Config
                 command: launch_command[0].clone(),
             });
         }
+        validate_launch_argv(&target.client).map_err(|diagnostic| RestoreError::UntrustedLaunch {
+            target: target.label.clone(),
+            command: diagnostic,
+        })?;
         let binary = resolve_launch_binary(&launch_command[0], &target.label).map_err(|_| RestoreError::MissingLaunchBinary {
             target: target.label.clone(),
             command: launch_command[0].clone(),
@@ -4006,6 +4010,43 @@ fn launch_command_is_trusted(client: &SessionClient, config: &Config) -> bool {
     [client.class.as_str(), client.initial_class.as_str()]
         .iter()
         .any(|identity| !identity.is_empty() && identity.eq_ignore_ascii_case(&command) && is_safe_launch_basename(&command))
+}
+
+/// Validate that the saved argv tokens are shapes our own capture adapters
+/// produce. Anything else means the session was hand-edited or written by
+/// an unknown tool, and automatic execution would turn those tokens into
+/// unproven launch behavior.
+fn validate_launch_argv(client: &SessionClient) -> Result<(), String> {
+    if is_webapp_class(client) {
+        return Ok(()); // webapp argv is validated by webapp_launch_is_trusted
+    }
+    let brave = is_brave_client(client);
+    let ghostty = is_ghostty_class(client);
+    let mut expect_value: Option<&'static str> = None;
+    for token in &client.launch.args {
+        if let Some(flag) = expect_value {
+            let _ = flag;
+            expect_value = None;
+            continue;
+        }
+        let known = if brave {
+            token.starts_with("--profile-directory=") || token == "--new-window"
+        } else if ghostty {
+            matches!(token.as_str(), "--working-directory" | "--start-session") || token.starts_with("--working-directory=")
+        } else {
+            matches!(token.as_str(), "--directory" | "--working-directory") || token.starts_with("--directory=")
+        };
+        if !known {
+            return Err(format!(
+                "argument '{token}' on class '{}' is not a recognized capture adapter shape; re-capture the session or move the value into an apps.<class> entry",
+                client.class
+            ));
+        }
+        if token == "--directory" || token == "--working-directory" {
+            expect_value = Some("--directory value");
+        }
+    }
+    Ok(())
 }
 
 /// Whether a command is a single safe path component (no directory
@@ -6717,6 +6758,34 @@ mod tests {
             "the plan must be described: {:?}",
             report.details
         );
+    }
+
+    #[test]
+    fn validate_launch_argv_accepts_capture_adapter_shapes() {
+        let mut client = make_client("kitty", 1, [0, 0], [800, 600], false, 0, "kitty", vec![], None);
+        client.launch.args = vec!["--directory".to_string(), "/home/user".to_string()];
+        assert!(validate_launch_argv(&client).is_ok());
+
+        client.class = "ghostty".to_string();
+        client.launch.args = vec!["--working-directory=/home/user".to_string()];
+        assert!(validate_launch_argv(&client).is_ok());
+
+        client.class = "brave-browser".to_string();
+        client.launch.args = vec!["--profile-directory=Profile 1".to_string(), "--new-window".to_string()];
+        assert!(validate_launch_argv(&client).is_ok());
+
+        client.launch.args = vec![];
+        assert!(validate_launch_argv(&client).is_ok(), "empty argv is always a safe legacy shape");
+    }
+
+    #[test]
+    fn validate_launch_argv_rejects_unknown_tokens_with_the_offender_named() {
+        let mut client = make_client("myapp", 1, [0, 0], [800, 600], false, 0, "myapp", vec![], None);
+        client.launch.args = vec!["--evil-flag".to_string()];
+
+        let error = validate_launch_argv(&client).expect_err("unknown argv must fail");
+        assert!(error.contains("--evil-flag"), "{error}");
+        assert!(error.contains("re-capture"), "{error}");
     }
 
     #[test]
