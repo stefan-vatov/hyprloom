@@ -3360,6 +3360,15 @@ fn build_reconcile_targets(session: &Session, config: &Config) -> Vec<ReconcileT
             client.launch.args = vec![format!("--profile-directory={}", profile.directory)];
             client.launch.hint = None;
 
+            if is_ignored_class(&client.class, &config.filters.ignore_classes)
+                || is_ignored_class(&client.initial_class, &config.filters.ignore_classes)
+            {
+                // Ignore policy applies at the effective target boundary: a
+                // profile whose class the user excluded must not be
+                // resurrected by expansion.
+                continue;
+            }
+
             targets.push(ReconcileTarget {
                 label: format!("brave profile '{}'", profile.name),
                 client,
@@ -6474,6 +6483,39 @@ mod tests {
     }
 
     // ── Test: profile without an explicit map uses default_workspace fallback
+
+    #[test]
+    fn build_reconcile_targets_drops_brave_profiles_when_the_class_is_ignored() {
+        let mut session = make_session(vec![]);
+        session.brave_profiles = vec![BraveProfile {
+            directory: "Default".to_string(),
+            name: "Credifit".to_string(),
+        }];
+        let mut config = Config::default();
+        config.filters.ignore_classes = vec!["brave-browser".to_string()];
+
+        let targets = build_reconcile_targets(&session, &config);
+
+        assert!(
+            targets.is_empty(),
+            "an ignored class must not be resurrected through profile expansion: {:?}",
+            targets.iter().map(|target| &target.label)
+        );
+    }
+
+    #[test]
+    fn build_reconcile_targets_keeps_brave_profiles_without_ignore_rules() {
+        let mut session = make_session(vec![]);
+        session.brave_profiles = vec![BraveProfile {
+            directory: "Default".to_string(),
+            name: "Credifit".to_string(),
+        }];
+        let config = Config::default();
+
+        let targets = build_reconcile_targets(&session, &config);
+
+        assert_eq!(targets.len(), 1, "without ignore rules the profile target stays");
+    }
 
     #[test]
     fn test_restore_brave_profile_uses_default_workspace() {

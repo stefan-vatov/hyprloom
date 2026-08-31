@@ -685,3 +685,30 @@ fn unknown_config_fields_stop_destructive_rotation_with_diagnostics() {
         "retain=6 over 7 snapshots must prune the oldest",
     );
 }
+
+#[test]
+fn replace_with_brave_only_target_cancelled_when_class_is_ignored() {
+    // gqg.24: profile expansion must not resurrect an ignored class; with
+    // the only profile excluded, replacement must cancel before closing.
+    let mut case = Case::new("brave-ignored-replace");
+    install_systemctl(&mut case);
+    let fake = FakeHyprland::spawn(&mut case, existing_window_scenario());
+    case.write_file(
+        "data/hyprloom/sessions/brave-only.json",
+        br#"{"name":"brave-only","created_at":"2026-01-01T00:00:00Z","hyprland_version":"fixture","monitors":[],"clients":[{"class":"brave-browser","title":"sentinel-title","address":"0xgone","stable_id":"stable-gone","initial_class":"brave-browser","initial_title":"sentinel-title","workspace":3,"workspace_name":"3","monitor":"DP-1","at":[10,20],"size":[800,600],"floating":false,"fullscreen":0,"focus_history_id":0,"launch":{"command":"brave","args":["--profile-directory=Default"],"hint":null}}],"brave_profiles":[{"directory":"Default","name":"Credifit"}]}"#,
+    );
+    case.write_file("config/hyprloom/config.toml", b"[filters]\nignore_classes = [\"brave-browser\"]\n");
+
+    let run = case.run("replace", &["replace", "brave-only"]);
+    case.assert("replace is refused", run.code() == Some(1), &run.stdout_str());
+    case.assert(
+        "stdout stays empty on the pre-close refusal",
+        run.stdout_str().is_empty(),
+        &run.stdout_str(),
+    );
+    case.assert(
+        "no close was dispatched against the live desktop",
+        fake.topology().clients.len() == 1,
+        "the existing window must survive the cancelled replacement",
+    );
+}
