@@ -1561,6 +1561,16 @@ fn restore_session_with_process_info(
                         .details
                         .push(format!("SKIP: {} already on ws={}", current.client.class, target.client.workspace));
                     report.skipped += 1;
+                } else if dry_run {
+                    // Dry-run outcomes describe intended actions and never
+                    // complete mutations (restore-reporting canon).
+                    report
+                        .details
+                        .push(format!("[dry-run] repair {} at address {}", target.client.class, current.client.address));
+                    for command in &commands {
+                        report.details.push(format!("  hyprctl dispatch {command}"));
+                    }
+                    report.restored += 1;
                 } else {
                     match dispatch_existing_repairs(&current, Some(&target.client), &commands, hyprctl, process_info) {
                         Ok(()) => {
@@ -6515,6 +6525,57 @@ mod tests {
         let targets = build_reconcile_targets(&session, &config);
 
         assert_eq!(targets.len(), 1, "without ignore rules the profile target stays");
+    }
+
+    #[test]
+    fn test_restore_brave_profile_repair_dry_run_does_not_dispatch() {
+        let mut target = make_client("brave-browser", 6, [0, 0], [800, 600], false, 0, "true", vec![], None);
+        target.profile_directory = Some("Default".to_string());
+        let mut session = make_session(vec![target]);
+        session.brave_profiles = vec![BraveProfile {
+            directory: "Default".to_string(),
+            name: "Credifit".to_string(),
+        }];
+
+        // The profile window is already open (positive identity via process
+        // discovery) but sits on the wrong workspace: the repair branch must
+        // plan only.
+        let mut current = make_reconcile_window("0xbrave", "brave-browser", "Brave", 1, 0, [0, 0], [800, 600]);
+        current.pid = 1000;
+        let mock = MockHyprctl::new(vec![vec![current]]);
+
+        let mut config = Config::default();
+        config.apps.insert(
+            "brave-browser".to_string(),
+            AppConfig {
+                binary: Some("true".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: Some(HashMap::from([("Default".to_string(), 6)])),
+                default_workspace: None,
+            },
+        );
+
+        let report = restore_session_with_process_info(
+            &session,
+            &mock,
+            &BraveProfileProcessInfo,
+            &config,
+            RestoreMode {
+                dry_run: true,
+                verbose: true,
+            },
+        )
+        .unwrap();
+
+        assert!(mock.dispatches().is_empty(), "dry run must never dispatch; got: {:?}", mock.dispatches());
+        assert_eq!(report.restored, 1, "the planned repair must be reported; details: {:?}", report.details);
+        assert!(
+            report.details.iter().any(|detail| detail.contains("[dry-run] repair")),
+            "the plan must be described: {:?}",
+            report.details
+        );
     }
 
     #[test]
