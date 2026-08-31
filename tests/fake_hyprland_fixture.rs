@@ -47,6 +47,7 @@ fn base_scenario(clients: Vec<Value>) -> HyprlandScenario {
         batch_rejection: BatchRejection::ExitNonzero,
         mapping_events: Vec::new(),
         faults: Vec::new(),
+        request_gate: None,
     }
 }
 

@@ -73,6 +73,7 @@ fn gated_mapping_scenario(gate: &str, initial: Vec<Value>) -> HyprlandScenario {
             client: mapped_client(),
         }],
         faults: Vec::new(),
+        request_gate: None,
     }
 }
 

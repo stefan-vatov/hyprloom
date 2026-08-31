@@ -104,6 +104,10 @@ pub struct HyprlandScenario {
     pub mapping_events: Vec<MappingEvent>,
     /// Scripted faults matched against logical dispatch commands.
     pub faults: Vec<Fault>,
+    /// Case-relative gate file: while it exists, every request is held
+    /// unanswered, so the calling CLI stays mid-operation (deterministic
+    /// lock-holding for contention scenarios).
+    pub request_gate: Option<String>,
 }
 
 /// One replayed reply from the fake boundary.
@@ -174,6 +178,7 @@ struct Compositor {
     focused: Option<String>,
     dispatch_count: usize,
     clients_queries: usize,
+    request_gate: Option<String>,
     pending_events: Vec<MappingEvent>,
     pending_operations: Vec<String>,
     seq: u32,
@@ -183,6 +188,7 @@ struct Compositor {
 impl Compositor {
     fn new(case_id: String, case_root: PathBuf, scenario: HyprlandScenario) -> Self {
         let pending_events = scenario.mapping_events.clone();
+        let request_gate = scenario.request_gate.clone();
         Self {
             clients: scenario.clients.clone(),
             monitors: scenario.monitors.clone(),
@@ -193,6 +199,7 @@ impl Compositor {
             scenario,
             dispatch_count: 0,
             clients_queries: 0,
+            request_gate,
             pending_events,
             pending_operations: Vec::new(),
             seq: 0,
@@ -661,6 +668,7 @@ fn pump(dir: &Path, shared: &Arc<Mutex<Compositor>>, cursor: &mut usize) -> bool
 }
 
 fn handle_request(dir: &Path, shared: &Arc<Mutex<Compositor>>, request: &Request) {
+    hold_request_gate(dir, shared);
     let kind = request.args.first().map_or("empty", String::as_str).to_owned();
     let mut state = shared.lock().unwrap();
     let before = state.identity();
@@ -670,6 +678,20 @@ fn handle_request(dir: &Path, shared: &Arc<Mutex<Compositor>>, request: &Request
     drop(state);
     write_response(dir, &request.uniq, &reply);
     append_event(dir, &event);
+}
+
+fn hold_request_gate(dir: &Path, shared: &Arc<Mutex<Compositor>>) {
+    loop {
+        let gate = {
+            let state = shared.lock().unwrap();
+            state.request_gate.clone()
+        };
+        let Some(gate) = gate else { return };
+        if !dir.parent().unwrap_or(dir).join(&gate).exists() {
+            return;
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
 }
 
 fn write_response(dir: &Path, uniq: &str, reply: &Reply) {

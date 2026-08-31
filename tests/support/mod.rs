@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs::{self, DirEntry};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,6 +40,8 @@ pub const FIXTURE_VERSION: u32 = 1;
 const MAX_CAPTURED_BYTES: usize = 8 * 1024;
 const MAX_ENV_VALUE_BYTES: usize = 200;
 const SIGNAL_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const RUN_WAIT: Duration = Duration::from_secs(30);
+const RUN_POLL: Duration = Duration::from_millis(10);
 const ROOT_TOKEN: &str = "<case-root>";
 const TRACE_RELATIVE_PATH: &str = "artifacts/trace.jsonl";
 const ARTIFACTS_DIR_NAME: &str = "artifacts";
@@ -74,6 +76,54 @@ impl Invocation {
     /// Captured stderr as lossy UTF-8.
     pub fn stderr_str(&self) -> String {
         String::from_utf8_lossy(&self.stderr).into_owned()
+    }
+}
+
+/// A CLI process spawned without waiting, for multi-process scenarios.
+#[derive(Debug)]
+pub struct RunHandle {
+    child: Option<std::process::Child>,
+    operation: String,
+    argv: Vec<String>,
+    env_keys: Vec<String>,
+    state_before: String,
+}
+
+impl RunHandle {
+    /// The spawned process's host pid, for liveness observation only.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().map_or(0, std::process::Child::id)
+    }
+
+    fn reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Whether the process is still running (causal gates only).
+    pub fn is_running(&mut self) -> bool {
+        self.child.as_mut().and_then(|child| child.try_wait().ok().flatten()).is_none()
+    }
+}
+
+fn wait_for_exit(handle: &mut RunHandle, deadline: Instant) -> Option<std::process::ExitStatus> {
+    while Instant::now() < deadline {
+        match handle.child.as_mut().expect("child lives until wait").try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => std::thread::sleep(RUN_POLL),
+            Err(error) => panic!("wait failed: {error}"),
+        }
+    }
+    // Timed out: never leak a runaway CLI process; reap kills and waits.
+    handle.reap();
+    None
+}
+
+impl Drop for RunHandle {
+    fn drop(&mut self) {
+        self.reap();
     }
 }
 
@@ -160,6 +210,11 @@ impl Case {
         self.envs.insert(key.to_owned(), value.to_owned());
     }
 
+    /// Remove a file inside the case root if it exists.
+    pub fn remove_file(&self, relative: &str) {
+        let _ = fs::remove_file(self.root().join(relative));
+    }
+
     /// Write a file inside the case root, creating parent directories.
     pub fn write_file(&mut self, relative: &str, contents: &[u8]) {
         let path = self.root().join(relative);
@@ -192,6 +247,14 @@ impl Case {
 
     /// Run the real compiled CLI with scrubbed environment and capture evidence.
     pub fn run(&mut self, operation: &str, args: &[&str]) -> Invocation {
+        let mut handle = self.spawn_run(operation, args);
+        self.wait_run(&mut handle, RUN_WAIT)
+            .expect("CLI process must finish within the wait budget")
+    }
+
+    /// Spawn the real compiled CLI without waiting, for multi-process
+    /// scenarios such as operation-lock contention.
+    pub fn spawn_run(&self, operation: &str, args: &[&str]) -> RunHandle {
         let state_before = self.state_hash();
         let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_hyprloom"));
         command.env_clear();
@@ -203,35 +266,63 @@ impl Case {
             command.env(key, value);
         }
         command.args(args);
-        let output = command.output().expect("spawn hyprloom");
-        let state_after = self.state_hash();
-
-        let invocation = Invocation {
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let child = command.spawn().expect("spawn hyprloom");
+        RunHandle {
+            child: Some(child),
+            operation: operation.to_owned(),
             argv: self.normalized_argv(args),
-            stdout: output.stdout,
-            stderr: output.stderr,
-            code: output.status.code(),
+            env_keys: allowlisted.keys().cloned().collect::<Vec<String>>(),
+            state_before,
+        }
+    }
+
+    /// Wait bounded for a spawned CLI process and record its evidence.
+    pub fn wait_run(&mut self, handle: &mut RunHandle, timeout: Duration) -> Option<Invocation> {
+        let deadline = Instant::now() + timeout;
+        let status = wait_for_exit(handle, deadline)?;
+        let mut child = handle.child.take().expect("child taken once");
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stdout.take() {
+            let _ = pipe.read_to_string(&mut stdout);
+        }
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let _ = child.wait();
+        Some(self.finish_invocation(handle, status, stdout.into_bytes(), stderr.into_bytes()))
+    }
+
+    fn finish_invocation(&mut self, handle: &RunHandle, status: std::process::ExitStatus, stdout: Vec<u8>, stderr: Vec<u8>) -> Invocation {
+        let state_after = self.state_hash();
+        let invocation = Invocation {
+            argv: handle.argv.clone(),
+            stdout,
+            stderr,
+            code: status.code(),
         };
         let outcome = match invocation.code {
             Some(0) => "success".to_owned(),
             Some(code) => format!("exit-{code}"),
             None => "signal".to_owned(),
         };
-        let (stdout, stdout_truncated) = self.bounded_text(&invocation.stdout);
-        let (stderr, stderr_truncated) = self.bounded_text(&invocation.stderr);
+        let (stdout_text, stdout_truncated) = self.bounded_text(&invocation.stdout);
+        let (stderr_text, stderr_truncated) = self.bounded_text(&invocation.stderr);
         self.emit(TraceEvent {
             component: "cli",
-            operation: operation.to_owned(),
+            operation: handle.operation.clone(),
             argv: invocation.argv.iter().map(|argument| json!(argument)).collect(),
             outcome,
             extra: json!({
-                "env_keys": allowlisted.keys().cloned().collect::<Vec<String>>(),
+                "env_keys": handle.env_keys,
                 "exit_status": invocation.code,
-                "stdout": stdout,
-                "stderr": stderr,
+                "stdout": stdout_text,
+                "stderr": stderr_text,
                 "stdout_truncated": stdout_truncated,
                 "stderr_truncated": stderr_truncated,
-                "state_hash_before": state_before,
+                "state_hash_before": handle.state_before,
                 "state_hash_after": state_after,
             }),
         });
