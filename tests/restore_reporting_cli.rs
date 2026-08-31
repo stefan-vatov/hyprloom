@@ -296,27 +296,33 @@ fn autosave_fallback_notices_do_not_corrupt_the_json_document() {
 }
 
 #[test]
-fn replace_report_remains_a_failure_after_successful_empty_desktop_recovery() {
+fn replace_with_an_empty_target_is_refused_before_any_mutation() {
+    // gqg.21: a session with nothing restorable must cancel replacement
+    // before the safety backup, markers, or close dispatches. stdout stays
+    // empty because the refusal is fatal and pre-report.
     let mut fixture = DesktopFixture::new();
-    fixture.set_clients(&json!([]));
-    let target = &mut fixture.session.clients[0];
-    target.class = "true".to_string();
-    target.initial_class = "true".to_string();
-    target.launch.command = "true".to_string();
+    fixture.session.clients.clear();
     fixture.save();
     fs::create_dir_all(fixture.root.path().join("config/hyprloom")).unwrap();
     let config = fixture.root.path().join("config/hyprloom/config.toml");
     fs::write(&config, "[general]\nwindow_detect_timeout_ms = 100\nrestore_delay_ms = 0\n").unwrap();
     fs::set_permissions(config, fs::Permissions::from_mode(0o600)).unwrap();
+    fixture.set_clients(&json!([{
+        "address": "0xlive", "stableId": "stable-live",
+        "class": "kitty", "title": "Live", "initialClass": "kitty", "initialTitle": "kitty",
+        "workspace": {"id": 1, "name": "1"}, "monitor": 0,
+        "at": [0, 0], "size": [800, 600], "floating": false,
+        "fullscreen": 0, "focusHistoryID": 0, "pid": 0
+    }]));
 
     let output = fixture.command().args(["replace", "report-fixture", "--report-json"]).output().unwrap();
 
-    assert_eq!(output.status.code(), Some(1), "{}", String::from_utf8_lossy(&output.stderr));
-    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(report["operation"], "replace");
-    assert_eq!(report["report"]["failed"], 1);
-    assert_eq!(report["report"]["launched"], 0);
-    assert_eq!(report["report"]["windows"][0]["status"], "failed");
-    assert_eq!(report["recovery"], "succeeded");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "fatal pre-close refusals leave stdout empty");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("restorable"),
+        "the refusal must be actionable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     fixture.assert_no_dispatches();
 }

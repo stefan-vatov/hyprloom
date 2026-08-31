@@ -267,6 +267,12 @@ pub struct ReplaceMarker {
     /// This protects recovery from address reuse inside one shared browser
     /// process, where PID and process start time remain unchanged.
     pub closing_stable_id: Option<String>,
+    /// Fingerprint of the expanded, config-dependent target plan that the
+    /// replacement validated at start.  Recovery recomputes it with the
+    /// current configuration: a mismatch means the plan shrank or changed
+    /// and the desktop cannot prove completion.  Older markers do not
+    /// contain this.
+    pub plan_digest: Option<String>,
     /// The session being installed.  Older markers do not contain this and
     /// therefore retain the conservative exact-recovery behavior.
     /// Target session name, when the marker records one.
@@ -664,6 +670,7 @@ pub fn mark_replace_in_progress_for_target(backup_name: &str, target_name: Optio
             closing_stable_id: None,
             target_name: target_name.map(str::to_string),
             target_digest,
+            plan_digest: None,
         },
         sessions_dir,
     )
@@ -711,6 +718,7 @@ pub fn mark_replace_closing_for_target(
             closing_stable_id: None,
             target_name: target_name.map(str::to_string),
             target_digest,
+            plan_digest: None,
         },
         sessions_dir,
     )
@@ -777,6 +785,7 @@ pub fn mark_replace_closing_for_target_with_identity_and_stable_id(
             closing_stable_id: stable_id.filter(|id| !id.is_empty()).map(str::to_string),
             target_name: target_name.map(str::to_string),
             target_digest,
+            plan_digest: None,
         },
         sessions_dir,
     )
@@ -799,7 +808,7 @@ pub fn mark_replace_prepared(backup_name: &str, sessions_dir: &std::path::Path) 
 ///
 /// Returns an error when a name or the marker path is invalid.
 pub fn mark_replace_prepared_for_target(backup_name: &str, target_name: Option<&str>, sessions_dir: &std::path::Path) -> Result<(), SessionError> {
-    mark_replace_prepared_for_target_with_digest(backup_name, target_name, None, sessions_dir)
+    mark_replace_prepared_for_target_with_digest(backup_name, target_name, None, None, sessions_dir)
 }
 
 /// Record a prepared replacement and its optional target fingerprint.
@@ -811,6 +820,7 @@ pub fn mark_replace_prepared_for_target_with_digest(
     backup_name: &str,
     target_name: Option<&str>,
     target_digest: Option<&str>,
+    plan_digest: Option<&str>,
     sessions_dir: &std::path::Path,
 ) -> Result<(), SessionError> {
     validate_session_name(backup_name)?;
@@ -819,6 +829,9 @@ pub fn mark_replace_prepared_for_target_with_digest(
     }
     if let Some(target_digest) = target_digest {
         validate_replace_digest(target_digest)?;
+    }
+    if let Some(plan_digest) = plan_digest {
+        validate_replace_digest(plan_digest)?;
     }
     ensure_sessions_dir(sessions_dir)?;
     write_replace_marker(
@@ -831,6 +844,7 @@ pub fn mark_replace_prepared_for_target_with_digest(
             closing_stable_id: None,
             target_name: target_name.map(str::to_string),
             target_digest: target_digest.map(str::to_string),
+            plan_digest: plan_digest.map(str::to_string),
         },
         sessions_dir,
     )
@@ -869,6 +883,7 @@ pub fn mark_replace_finalizing_for_target(backup_name: &str, target_name: Option
             closing_stable_id: None,
             target_name: target_name.map(str::to_string),
             target_digest,
+            plan_digest: None,
         },
         sessions_dir,
     )
@@ -896,6 +911,7 @@ pub fn mark_replace_committed_for_target(backup_name: &str, target_name: Option<
             closing_stable_id: None,
             target_name: target_name.map(str::to_string),
             target_digest,
+            plan_digest: None,
         },
         sessions_dir,
     )
@@ -951,6 +967,7 @@ pub fn replace_marker(sessions_dir: &std::path::Path) -> Result<Option<ReplaceMa
     let mut closing_pid = None;
     let mut closing_start_time = None;
     let mut closing_stable_id = None;
+    let mut plan_digest = None;
     if phase == ReplacePhase::Closing {
         // New markers add identity records between the closing address and
         // the optional target name.  Their prefixes keep the old three/four-
@@ -980,6 +997,13 @@ pub fn replace_marker(sessions_dir: &std::path::Path) -> Result<Option<ReplaceMa
                         ))
                     })?)
                 };
+                next_index += 1;
+                continue;
+            }
+            if let Some(plan) = lines.get(next_index).filter(|line| line.starts_with("plan-digest:")) {
+                let value = plan.strip_prefix("plan-digest:").unwrap_or_default();
+                validate_replace_digest(value)?;
+                plan_digest = Some(value.to_string());
                 next_index += 1;
                 continue;
             }
@@ -1032,6 +1056,7 @@ pub fn replace_marker(sessions_dir: &std::path::Path) -> Result<Option<ReplaceMa
         closing_stable_id,
         target_name,
         target_digest,
+        plan_digest,
     }))
 }
 
@@ -1096,6 +1121,11 @@ fn format_marker_content(phase: &str, marker: &ReplaceMarker, closing_address: O
         content.push('\n');
         content.push_str("target-digest:");
         content.push_str(target_digest);
+    }
+    if let Some(plan_digest) = &marker.plan_digest {
+        content.push('\n');
+        content.push_str("plan-digest:");
+        content.push_str(plan_digest);
     }
     content
 }
@@ -1964,6 +1994,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: None,
                 target_digest: None,
+                plan_digest: None,
             })
         );
         mark_replace_closing("autosave-recovery", dir.path(), "0xclosing").unwrap();
@@ -1978,6 +2009,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: None,
                 target_digest: None,
+                plan_digest: None,
             })
         );
         mark_replace_in_progress("autosave-recovery", dir.path()).unwrap();
@@ -1993,6 +2025,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: None,
                 target_digest: None,
+                plan_digest: None,
             })
         );
         mark_replace_committed("autosave-recovery", dir.path()).unwrap();
@@ -2007,6 +2040,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: None,
                 target_digest: None,
+                plan_digest: None,
             })
         );
         mark_replace_finalizing_for_target("autosave-recovery", Some("target"), dir.path()).unwrap();
@@ -2021,6 +2055,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: Some("target".to_string()),
                 target_digest: None,
+                plan_digest: None,
             })
         );
         mark_replace_prepared_for_target("autosave-recovery", Some("target"), dir.path()).unwrap();
@@ -2035,6 +2070,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: Some("target".to_string()),
                 target_digest: None,
+                plan_digest: None,
             })
         );
         clear_replace_marker(dir.path()).unwrap();
@@ -2047,7 +2083,7 @@ mod tests {
         let target = make_test_session("target");
         let digest = session_fingerprint(&target).unwrap();
 
-        mark_replace_prepared_for_target_with_digest("autosave-recovery", Some("target"), Some(&digest), dir.path()).unwrap();
+        mark_replace_prepared_for_target_with_digest("autosave-recovery", Some("target"), Some(&digest), None, dir.path()).unwrap();
         assert_eq!(
             replace_marker(dir.path()).unwrap().and_then(|marker| marker.target_digest),
             Some(digest.clone())
@@ -2079,6 +2115,7 @@ mod tests {
                 closing_stable_id: None,
                 target_name: Some("target".to_string()),
                 target_digest: None,
+                plan_digest: None,
             })
         );
     }
@@ -2108,6 +2145,7 @@ mod tests {
                 closing_stable_id: Some("18000001".to_string()),
                 target_name: Some("target".to_string()),
                 target_digest: None,
+                plan_digest: None,
             })
         );
     }

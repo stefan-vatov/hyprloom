@@ -9,8 +9,8 @@ use hyprloom::hyprctl::{HyprctlClient, RealHyprctl};
 use hyprloom::matching::MatchingStrategy;
 use hyprloom::process::{ProcessInfoProvider, RealProcessInfo};
 use hyprloom::restore::{
-    recover_session_safely, replace_session_with_marker, replacement_target_is_complete_with_backup, restore_session, validate_replacement_targets,
-    validate_safety_snapshot_with_config, ReplaceMarkerContext,
+    expanded_plan_fingerprint, recover_session_safely, replace_session_with_marker, replacement_target_is_complete_with_backup, restore_session,
+    validate_replacement_targets, validate_safety_snapshot_with_config, ReplaceMarkerContext,
 };
 use hyprloom::session::{
     autosave_name_now, clear_replace_marker, delete_session, is_revision_format, list_sessions, load_session, migrate_legacy_sessions,
@@ -402,6 +402,16 @@ fn main() {
                 cli_eprintln!("Replace cancelled: {error}");
                 std::process::exit(1);
             }
+            // Fingerprint the config-expanded plan: recovery must verify the
+            // desktop against the plan that actually started, not a plan
+            // reshaped by later configuration changes.
+            let plan_digest = match expanded_plan_fingerprint(&session, &config) {
+                Ok(digest) => digest,
+                Err(error) => {
+                    cli_eprintln!("Replace cancelled: could not fingerprint the expanded plan: {error}");
+                    std::process::exit(1);
+                }
+            };
 
             let hyprctl = RealHyprctl;
             let process_info = RealProcessInfo;
@@ -422,9 +432,13 @@ fn main() {
                 cli_eprintln!("Replace cancelled: safety backup could not be saved: {error}");
                 std::process::exit(1);
             }
-            if let Err(error) =
-                hyprloom::session::mark_replace_prepared_for_target_with_digest(&backup_name, Some(&name), Some(&target_digest), &sessions_dir)
-            {
+            if let Err(error) = hyprloom::session::mark_replace_prepared_for_target_with_digest(
+                &backup_name,
+                Some(&name),
+                Some(&target_digest),
+                Some(plan_digest.as_str()),
+                &sessions_dir,
+            ) {
                 cli_eprintln!("Replace cancelled: could not record recovery marker: {error}");
                 std::process::exit(1);
             }
@@ -793,6 +807,30 @@ fn recover_pending_replace(sessions_dir: &Path, config: &hyprloom::config::Confi
                         .target_digest
                         .as_deref()
                         .is_some_and(|expected_digest| session_fingerprint(&target).is_ok_and(|actual_digest| actual_digest == expected_digest));
+                    // gqg.23: the durable marker fingerprints the
+                    // config-expanded plan that actually started. If the plan
+                    // rebuilt with the current configuration differs, the
+                    // desktop cannot prove completion and the safety snapshot
+                    // is replayed instead.
+                    if target_matches_marker {
+                        if let Some(expected_plan) = marker.plan_digest.as_deref() {
+                            match expanded_plan_fingerprint(&target, config) {
+                                Ok(actual) if actual == expected_plan => {}
+                                Ok(actual) => {
+                                    cli_eprintln!(
+                                        "Warning: the expanded replacement plan changed since the marker was recorded (expected {expected_plan}, now {actual}); replaying the safety snapshot."
+                                    );
+                                    return false;
+                                }
+                                Err(error) => {
+                                    cli_eprintln!(
+                                        "Warning: could not fingerprint the expanded replacement plan: {error}; replaying the safety snapshot."
+                                    );
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                     if target_matches_marker {
                         match backup_for_completion
                             .as_ref()

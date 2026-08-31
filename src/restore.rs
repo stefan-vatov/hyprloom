@@ -3988,6 +3988,24 @@ pub fn nested_hint_shell(client: &SessionClient) -> Option<String> {
     client.launch.terminal_shell.clone()
 }
 
+/// Fingerprint the config-expanded reconciliation plan.
+///
+/// The durable replacement marker records this fingerprint so recovery can
+/// verify the desktop against the plan that actually started. A later
+/// configuration change that shrinks or reshapes the expanded plan produces
+/// a different fingerprint and recovery fails closed to the safety
+/// snapshot instead of declaring an incomplete replacement complete.
+///
+/// # Errors
+///
+/// Returns the textual session-fingerprint error when serialization fails.
+pub fn expanded_plan_fingerprint(session: &Session, config: &Config) -> Result<String, String> {
+    let mut plan_session = session.clone();
+    plan_session.clients = build_reconcile_targets(session, config).into_iter().map(|target| target.client).collect();
+    plan_session.brave_profiles.clone_from(&session.brave_profiles);
+    crate::session::session_fingerprint(&plan_session).map_err(|error| error.to_string())
+}
+
 fn resolve_launch_binary(command: &str, target: &str) -> Result<PathBuf, RestoreError> {
     let path = which::which(command).map_err(|_| RestoreError::MissingLaunchBinary {
         target: target.to_string(),
@@ -6011,6 +6029,41 @@ mod tests {
             .expect("the launched window may reuse the old address");
 
         assert!(mock.dispatches().iter().any(|dispatch| dispatch.contains("0xreused")));
+    }
+
+    #[test]
+    fn expanded_plan_fingerprint_detects_config_driven_plan_changes() {
+        let mut target = make_client("brave-browser", 6, [0, 0], [800, 600], false, 0, "true", vec![], None);
+        target.profile_directory = Some("Default".to_string());
+        let mut session = make_session(vec![target]);
+        session.brave_profiles = vec![BraveProfile {
+            directory: "Default".to_string(),
+            name: "Credifit".to_string(),
+        }];
+        let mut config = Config::default();
+        config.apps.insert(
+            "brave-browser".to_string(),
+            AppConfig {
+                binary: Some("true".to_string()),
+                capture_cwd: None,
+                capture_last_command: None,
+                hint_template: None,
+                profile_workspaces: Some(HashMap::from([("Default".to_string(), 6), ("Profile 1".to_string(), 7)])),
+                default_workspace: None,
+            },
+        );
+
+        let first = expanded_plan_fingerprint(&session, &config).unwrap();
+        let again = expanded_plan_fingerprint(&session, &config).unwrap();
+        assert_eq!(first, again, "the fingerprint must be stable for an unchanged config");
+
+        // The production trigger: the Default mapping is validly removed
+        // before recovery runs. The explicit map is an allowlist, so the
+        // expanded plan shrinks to nothing and the recorded fingerprint
+        // must change.
+        config.apps.get_mut("brave-browser").unwrap().profile_workspaces = Some(HashMap::new());
+        let shrunken = expanded_plan_fingerprint(&session, &config).unwrap();
+        assert_ne!(first, shrunken, "removing a profile mapping must change the expanded plan");
     }
 
     #[test]
